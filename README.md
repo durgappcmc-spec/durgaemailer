@@ -79,10 +79,10 @@ clasp create --type standalone --title "Relay Scheduler" --rootDir .
 
 ### 9) Deploy Netlify tracking
 
-Repo: [github.com/durgappcmc-spec/durgaemailer](https://github.com/durgappcmc-spec/durgaemailer)
+Repo: [github.com/durgappcmc-spec/durgaemailer](https://github.com/durgappcmc-spec/durgaemailer) (already contains this project)
 
-1. Push `tracking-netlify/` contents (or this whole repo) to that GitHub repo
-2. Connect the repo in Netlify
+1. In Netlify → Add new site → Import from Git → select `durgappcmc-spec/durgaemailer`
+2. Set **Base directory** to `tracking-netlify` (important — functions live there)
 3. Site settings → Environment variables:
    - `APPS_SCRIPT_LOG_URL` = your Apps Script Web App URL
    - `CLICK_FALLBACK_URL` = `https://karunamedia.org` (or your site)
