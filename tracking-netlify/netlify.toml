@@ -1,0 +1,18 @@
+[build]
+  functions = "netlify/functions"
+  publish = "public"
+
+[[redirects]]
+  from = "/t/o/*"
+  to = "/.netlify/functions/open?id=:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/t/c/*"
+  to = "/.netlify/functions/click?id=:splat"
+  status = 200
+  force = true
+
+[functions]
+  node_bundler = "esbuild"

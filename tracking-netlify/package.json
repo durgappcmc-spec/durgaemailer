@@ -1,0 +1,7 @@
+{
+  "name": "relay-tracking",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay open-pixel + click redirect Netlify Functions"
+}

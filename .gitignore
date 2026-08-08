@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+data/
+credentials/gmail_token.json
+credentials/*.json
+!credentials/.gitkeep
+.streamlit/secrets.toml
+node_modules/
+.DS_Store
+*.log
