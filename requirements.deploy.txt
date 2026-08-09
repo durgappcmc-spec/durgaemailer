@@ -1,0 +1,14 @@
+# Deploy deps (lighter — no Chroma/sentence-transformers for free cloud builds).
+streamlit>=1.36
+google-genai>=0.3.0
+google-api-python-client>=2.140
+google-auth-oauthlib>=1.2
+beautifulsoup4>=4.12
+requests>=2.32
+pandas>=2.2
+python-dotenv>=1.0
+pydantic>=2.8
+pypdf>=4.0
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=1.0

@@ -1,24 +1,28 @@
 # NOTE: Embedding model downloads on first use (~80MB all-MiniLM-L6-v2).
+# Cloud deploy may omit chromadb; memory then becomes a no-op.
 from __future__ import annotations
 
 import sys
 import uuid
 from typing import Any, Optional
 
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-
 from config import settings
 
-_client: Optional[chromadb.PersistentClient] = None
+_client = None
 _collection = None
+_DISABLED = False
 
 
 def _get_collection():
-    global _client, _collection
+    global _client, _collection, _DISABLED
+    if _DISABLED:
+        return None
     if _collection is not None:
         return _collection
     try:
+        import chromadb
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
         embedder = SentenceTransformerEmbeddingFunction(
             model_name="all-MiniLM-L6-v2"
         )
@@ -29,8 +33,9 @@ def _get_collection():
         )
         return _collection
     except Exception as e:
-        print(f"[memory] failed to init chroma: {e}", file=sys.stderr)
-        raise
+        print(f"[memory] disabled ({e})", file=sys.stderr)
+        _DISABLED = True
+        return None
 
 
 def add(
@@ -44,6 +49,8 @@ def add(
     if isinstance(texts, str):
         texts = [texts]
     col = _get_collection()
+    if col is None:
+        return []
     ids: list[str] = []
     metadatas: list[dict[str, Any]] = []
     for i, text in enumerate(texts):
@@ -54,7 +61,6 @@ def add(
         if title:
             meta["title"] = title
         if metadata:
-            # Chroma metadata values must be scalars
             for k, v in metadata.items():
                 if isinstance(v, (list, dict)):
                     meta[k] = str(v)
@@ -78,6 +84,8 @@ def search(
 ) -> list[dict[str, Any]]:
     """Search memory. Returns list of {id, text, metadata, distance}."""
     col = _get_collection()
+    if col is None:
+        return []
     where = {"source": source} if source and source != "all" else None
     try:
         kwargs: dict[str, Any] = {"query_texts": [query], "n_results": k}

@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.env
+data
+credentials/*.json
+!credentials/.gitkeep
+node_modules
+relay-portal/.netlify
+tracking-netlify/.netlify
+.agent-transcripts
+*.log

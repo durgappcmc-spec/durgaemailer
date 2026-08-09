@@ -54,38 +54,36 @@
     <main>
       <h1>Relay</h1>
       <p>
-        Protected entry for the Relay outreach app.
-        The app itself is deployed from GitHub on Streamlit Community Cloud
-        (Netlify cannot run Streamlit — no tunnel required).
+        Public entry for Relay. Netlify hosts this portal + tracking;
+        the live app runs from GitHub on Render (no PC tunnel).
       </p>
       <p>
-        Tracking (public pixel):
+        Tracking pixel:
         <br /><code>https://durgaemailer-tracking.netlify.app</code>
       </p>
       <a class="button" id="app-link" href="__RELAY_APP_URL__">Open Relay app</a>
       <p class="warn" id="missing" hidden style="margin-top:1rem">
-        Set Netlify env <code>RELAY_APP_URL</code> to your
-        <code>*.streamlit.app</code> URL, then redeploy this portal.
+        Set Netlify env <code>RELAY_APP_URL</code> to your Render URL
+        (e.g. <code>https://durgaemailer-relay.onrender.com</code>), then redeploy.
       </p>
       <p style="margin-top:1.25rem;font-size:.9rem">
-        Streamlit login uses <code>APP_USERNAME</code> / <code>APP_PASSWORD</code>
-        (same as this portal). Deploy app:
-        <a href="https://share.streamlit.io/" style="color:#9ec1ff">share.streamlit.io</a>
-        → New app → repo <code>durgappcmc-spec/durgaemailer</code> → <code>app.py</code>.
+        Deploy blueprint:
+        <a href="https://render.com/deploy?repo=https://github.com/durgappcmc-spec/durgaemailer" style="color:#9ec1ff">
+          Deploy on Render from Git
+        </a>
       </p>
     </main>
     <script>
       const el = document.getElementById("app-link");
       const missing = document.getElementById("missing");
-      const baked = el.getAttribute("href") || "";
       const override = localStorage.getItem("RELAY_APP_URL");
       if (override) el.href = override;
-      const href = el.href || "";
-      if (!href || href.includes("__RELAY_APP_URL__") || href.endsWith("/#")) {
+      const href = el.getAttribute("href") || "";
+      if (!href || href.includes("__RELAY_APP_URL__")) {
         missing.hidden = false;
         el.removeAttribute("href");
         el.style.opacity = "0.5";
-        el.textContent = "App URL not configured";
+        el.textContent = "App URL not configured yet";
       }
     </script>
   </body>

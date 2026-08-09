@@ -91,24 +91,23 @@ Repo: [github.com/durgappcmc-spec/durgaemailer](https://github.com/durgappcmc-sp
    - Apps Script → `TRACKING_BASE` constant
 5. Redeploy the Apps Script Web App after updating `TRACKING_BASE`
 
-### 10) Public app URL (from Git — no tunnel)
+### 10) Public app URL (from Git — no PC tunnel)
 
-**Netlify cannot run Streamlit.** Deploy the app from the same GitHub repo on
-[Streamlit Community Cloud](https://share.streamlit.io/):
+**Netlify cannot run the Python app.** Deploy from the same GitHub repo on Render:
 
-1. Open https://share.streamlit.io/ → **New app**
-2. Repository: `durgappcmc-spec/durgaemailer`, branch `main`, main file `app.py`
-3. **Advanced settings → Secrets**: paste from `.streamlit/secrets.toml.example`
-   (fill real keys; include `GMAIL_TOKEN_JSON` from your local `credentials/gmail_token.json`)
-4. Deploy → you get a stable URL like `https://durgaemailer.streamlit.app`
+1. One-click: https://render.com/deploy?repo=https://github.com/durgappcmc-spec/durgaemailer
+2. Uses `Dockerfile` + `render.yaml` → service `durgaemailer-relay`
+3. Set env vars in Render: `GEMINI_API_KEY`, sheet/tracking URLs, and for Gmail
+   `GMAIL_OAUTH_JSON` + `GMAIL_TOKEN_JSON` (paste JSON file contents)
+4. Public app URL: `https://durgaemailer-relay.onrender.com` (exact host shown in Render)
 
-Point the Netlify portal at that URL (still no tunnel):
+Wire Netlify portal (no tunnel):
 
-1. Netlify site `durgaemailer-relay` → Environment → `RELAY_APP_URL=https://….streamlit.app`
-2. Base directory `relay-portal`, build `node build.mjs`, publish `public`
-3. Redeploy portal → https://durgaemailer-relay.netlify.app opens the Streamlit app
+1. Netlify site `durgaemailer-relay` → `RELAY_APP_URL=https://….onrender.com`
+2. Redeploy portal (base dir `relay-portal`)
 
-Portal Basic Auth: `RELAY_BASIC_USER` / `RELAY_BASIC_PASS`. App login: `APP_USERNAME` / `APP_PASSWORD`.
+Portal: https://durgaemailer-relay.netlify.app · Tracking stays on Netlify.
+Free Render instances sleep after idle; first open can take ~30–60s.
 
 ## Architecture
 

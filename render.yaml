@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: durgaemailer-relay
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /
+    envVars:
+      - key: APP_REQUIRE_LOGIN
+        value: "false"
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: TRACKING_BASE_URL
+        value: https://durgaemailer-tracking.netlify.app
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: APPS_SCRIPT_TRACKING_URL
+        sync: false
+      - key: GMAIL_TOKEN_JSON
+        sync: false
+      - key: GMAIL_OAUTH_JSON
+        sync: false
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
