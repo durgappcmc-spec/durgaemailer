@@ -7,8 +7,8 @@
  */
 
 // ==== FILL THESE IN ====
-const SHEET_ID = "PASTE_YOUR_GOOGLE_SHEET_ID_HERE";
-const TRACKING_BASE = "https://PASTE_YOUR_NETLIFY_DOMAIN_HERE";
+const SHEET_ID = "1FkOrjF2h0kUA2KkAVnL21ZXo5U5SltTOdVkPDKCYSXs";
+const TRACKING_BASE = "https://durgaemailer-tracking.netlify.app";
 // =======================
 
 const SENDS_SHEET = "Sends";

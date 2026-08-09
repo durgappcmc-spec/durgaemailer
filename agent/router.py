@@ -1,16 +1,19 @@
-# NOTE: Router uses chat_fast with a single-line decision; falls back to CHAT on parse failure.
+# NOTE: Router uses chat_fast with a compact decision line. SCHEDULE_EMAIL bodies
+# are extracted separately via extract_json so long HTML cannot truncate routing.
 from __future__ import annotations
 
 import json
 import re
 import sys
+from datetime import datetime, timedelta
 from typing import Any, Generator, Optional
 
 from connectors.ingest_to_memory import prospect_to_text
 from connectors.prospects import enrich_fallthrough, search_all
 from core import memory as mem
-from core.llm import chat_fast, chat_grounded
+from core.llm import chat_fast, chat_grounded, extract_json
 from gmail_client.extract import extract_batch
+from gmail_client.send import create_draft
 from scheduling.client import schedule_email
 
 ROUTER_SYSTEM = """You are a routing classifier for Relay, a prospect research and outreach tool.
@@ -21,7 +24,8 @@ MEMORY
 PROSPECT_SEARCH:<json>
 PROSPECT_ENRICH:<json>
 GMAIL_EXTRACT:<gmail query>
-SCHEDULE_EMAIL:<json>
+DRAFT_EMAIL:<compact-json>
+SCHEDULE_EMAIL:<compact-json>
 
 Rules:
 - CHAT: general questions, research, writing help — Gemini will use Google Search.
@@ -29,14 +33,26 @@ Rules:
 - PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords (comma strings or arrays).
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
 - GMAIL_EXTRACT: pull structured data from inbox; after the colon put a Gmail search query.
-- SCHEDULE_EMAIL: schedule a send. JSON: recipient_email, subject, html_body, send_at (ISO), optional recipient_name, campaign.
+- DRAFT_EMAIL: user asks to create/save a Gmail draft (not send, not schedule).
+  Compact JSON ONLY — recipient_email, subject. Optional: recipient_name, campaign.
+  NEVER include html_body in this line.
+  Example: DRAFT_EMAIL:{"recipient_email":"a@b.com","subject":"Hello"}
+- SCHEDULE_EMAIL: user wants to schedule/queue an email for later send (not a draft).
+  Compact JSON ONLY — include recipient_email, subject, send_at (ISO if known).
+  Optional: recipient_name, campaign.
+  NEVER include html_body or the full email text in this line (it will be truncated).
+  Example: SCHEDULE_EMAIL:{"recipient_email":"a@b.com","subject":"Hello","send_at":"2026-08-10T09:30:00"}
+- Prefer DRAFT_EMAIL over SCHEDULE_EMAIL when the user says draft/compose/save draft.
+- Prefer SCHEDULE_EMAIL when they say schedule/send later/queue.
 
 Output NOTHING except the single routing line.
 """
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
 
 def _parse_json_tail(routing: str, prefix: str) -> dict[str, Any]:
-    """Parse JSON after a routing prefix; recover from markdown fences."""
+    """Parse JSON after a routing prefix; recover from markdown fences / truncation."""
     tail = routing[len(prefix) :].strip()
     if tail.startswith("```"):
         tail = re.sub(r"^```(?:json)?\s*", "", tail)
@@ -50,19 +66,136 @@ def _parse_json_tail(routing: str, prefix: str) -> dict[str, Any]:
                 return json.loads(m.group(0))
             except Exception as e:
                 print(f"[router] json tail parse failed: {e}", file=sys.stderr)
-        return {}
+        # Pull whatever scalar fields we can from a truncated object
+        partial: dict[str, Any] = {}
+        for key in (
+            "recipient_email",
+            "subject",
+            "send_at",
+            "recipient_name",
+            "campaign",
+            "source",
+        ):
+            km = re.search(
+                rf'"{key}"\s*:\s*"([^"]*)"',
+                tail,
+            )
+            if km:
+                partial[key] = km.group(1)
+        return partial
+
+
+def _extract_email_job(
+    user_msg: str,
+    history: Optional[list[dict[str, str]]] = None,
+    seed: Optional[dict[str, Any]] = None,
+    *,
+    for_schedule: bool = False,
+) -> dict[str, Any]:
+    """Recover full email payload from the user message (not the truncated route line)."""
+    seed = dict(seed or {})
+    hist_txt = ""
+    if history:
+        hist_txt = "\n".join(
+            f"{m.get('role')}: {m.get('content')}" for m in history[-6:]
+        )
+    default_send = (datetime.now() + timedelta(days=1)).replace(
+        hour=9, minute=30, second=0, microsecond=0
+    ).isoformat()
+    send_at_line = (
+        f"send_at (ISO 8601 datetime; default {default_send} if unspecified),\n"
+        if for_schedule
+        else ""
+    )
+    prompt = f"""Extract an email job from the conversation.
+
+Return JSON with keys:
+recipient_email (string, required),
+recipient_name (string),
+subject (string),
+html_body (string — convert plain text to simple HTML paragraphs if needed),
+{send_at_line}campaign (string),
+source (string)
+
+Conversation:
+{hist_txt}
+
+Latest user message:
+{user_msg}
+
+Seed fields already known (prefer newer message if conflict):
+{json.dumps(seed)}
+"""
+    try:
+        raw = extract_json(
+            prompt,
+            system="Extract email fields. Return valid JSON only.",
+            max_tokens=4000,
+        )
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            merged = {**seed, **{k: v for k, v in data.items() if v not in (None, "")}}
+            return merged
+    except Exception as e:
+        print(f"[router] email extract failed: {e}", file=sys.stderr)
+
+    if not seed.get("recipient_email"):
+        found = _EMAIL_RE.findall(user_msg)
+        if found:
+            seed["recipient_email"] = found[0]
+    if not seed.get("html_body"):
+        seed["html_body"] = f"<p>{user_msg}</p>"
+    if not seed.get("subject"):
+        seed["subject"] = "(no subject)"
+    return seed
+
+
+def _resolve_recipient(
+    job: dict[str, Any],
+    user_msg: str,
+    history: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    if job.get("recipient_email"):
+        return job
+    blob = user_msg + "\n" + "\n".join(
+        (m.get("content") or "") for m in (history or [])
+    )
+    found = _EMAIL_RE.findall(blob)
+    if found:
+        job["recipient_email"] = found[-1]
+    return job
 
 
 def route(user_msg: str, history: Optional[list[dict[str, str]]] = None) -> str:
     """Ask Gemini for a single-line routing decision."""
     messages = [{"role": "user", "content": user_msg}]
     if history:
-        # Include last few turns for context
         trimmed = history[-6:]
         messages = trimmed + messages
     try:
-        decision = chat_fast(messages, temperature=0.1, max_tokens=300, system=ROUTER_SYSTEM)
-        line = (decision or "CHAT").strip().splitlines()[0].strip()
+        # Keep max_tokens modest — schedule bodies are extracted separately.
+        decision = chat_fast(
+            messages, temperature=0.1, max_tokens=500, system=ROUTER_SYSTEM
+        )
+        text = (decision or "CHAT").strip()
+        # Keep full text for SCHEDULE_EMAIL / JSON routes (may be multi-line)
+        upper = text.upper()
+        for prefix in (
+            "DRAFT_EMAIL:",
+            "SCHEDULE_EMAIL:",
+            "PROSPECT_SEARCH:",
+            "PROSPECT_ENRICH:",
+            "GMAIL_EXTRACT:",
+        ):
+            if upper.startswith(prefix) or text.startswith(prefix):
+                # Normalize to the canonical prefix casing from the first line start
+                first = text.splitlines()[0]
+                # If model wrapped JSON onto later lines, reassemble after first prefix
+                if prefix.endswith("EMAIL:") or prefix.startswith("PROSPECT"):
+                    rest = text[len(first) :]
+                    return (first + rest).strip()
+                return first.strip()
+        line = text.splitlines()[0].strip()
         return line or "CHAT"
     except Exception as e:
         print(f"[router] route error: {e}", file=sys.stderr)
@@ -117,7 +250,14 @@ def answer(
                     sources = chunk["__meta__"].get("sources") or []
                 else:
                     yield chunk
-            sources.append({"title": "prospect_search", "url": "", "type": "prospects", "count": len(results)})
+            sources.append(
+                {
+                    "title": "prospect_search",
+                    "url": "",
+                    "type": "prospects",
+                    "count": len(results),
+                }
+            )
 
         elif routing.startswith("PROSPECT_ENRICH:"):
             ident = _parse_json_tail(routing, "PROSPECT_ENRICH:")
@@ -149,20 +289,74 @@ def answer(
                 else:
                     yield chunk
 
-        elif routing.startswith("SCHEDULE_EMAIL:"):
-            job = _parse_json_tail(routing, "SCHEDULE_EMAIL:")
+        elif routing.startswith("DRAFT_EMAIL"):
+            prefix = "DRAFT_EMAIL:"
+            seed = (
+                _parse_json_tail(routing, prefix)
+                if routing.startswith(prefix)
+                else {}
+            )
+            job = _extract_email_job(
+                user_msg, history=history, seed=seed, for_schedule=False
+            )
+            job = _resolve_recipient(job, user_msg, history)
             if not job.get("recipient_email"):
-                yield "I couldn't schedule that — missing recipient_email in the routing JSON."
+                yield (
+                    "I couldn't create a draft — no recipient email found. "
+                    "Please include an address like name@company.com."
+                )
             else:
-                from datetime import datetime, timedelta
+                html_body = (
+                    job.get("html_body") or job.get("body") or f"<p>{user_msg}</p>"
+                )
+                result = create_draft(
+                    to=str(job["recipient_email"]).strip(),
+                    subject=job.get("subject") or "(no subject)",
+                    html_body=html_body,
+                    recipient_name=job.get("recipient_name"),
+                    campaign=job.get("campaign"),
+                    source=job.get("source") or "chat_draft",
+                    track=False,
+                )
+                if result.get("error"):
+                    yield f"Draft failed: {result['error']}"
+                else:
+                    yield (
+                        f"Created Gmail draft to {job['recipient_email']} "
+                        f"(draft_id={result.get('draft_id')}). "
+                        "Open Gmail → Drafts to review and send."
+                    )
+                    yield f"\nResult: {json.dumps(result, default=str)}"
 
+        elif routing.startswith("SCHEDULE_EMAIL"):
+            # Accept truncated "SCHEDULE_EMAIL:{"recipient_email" lines.
+            prefix = "SCHEDULE_EMAIL:"
+            seed = (
+                _parse_json_tail(routing, prefix)
+                if routing.startswith(prefix)
+                else {}
+            )
+            job = _extract_email_job(
+                user_msg, history=history, seed=seed, for_schedule=True
+            )
+            job = _resolve_recipient(job, user_msg, history)
+
+            if not job.get("recipient_email"):
+                yield (
+                    "I couldn't schedule that — no recipient email found. "
+                    "Please include an address like name@company.com."
+                )
+            else:
                 send_at = job.get("send_at") or (
                     datetime.now() + timedelta(days=1)
-                ).replace(hour=9, minute=30, second=0).isoformat()
+                ).replace(hour=9, minute=30, second=0, microsecond=0).isoformat()
+                html_body = (
+                    job.get("html_body") or job.get("body") or f"<p>{user_msg}</p>"
+                )
                 result = schedule_email(
-                    recipient_email=job["recipient_email"],
+                    recipient_email=str(job["recipient_email"]).strip(),
                     subject=job.get("subject") or "(no subject)",
-                    html_body=job.get("html_body") or job.get("body") or "<p></p>",
+                    html_body=html_body,
                     send_at=send_at,
                     recipient_name=job.get("recipient_name"),
                     campaign=job.get("campaign"),

@@ -181,7 +181,7 @@ def main() -> int:
 
     print(
         """
-[bootstrap] Next — push Apps Script:
+[bootstrap] Next - push Apps Script:
 
   npm i -g @google/clasp
   clasp login
@@ -189,7 +189,7 @@ def main() -> int:
   clasp create --type standalone --title "Relay Scheduler" --rootDir .
   clasp push
   # In the Apps Script editor: run setup(), installTrigger(), installReplyWatcher()
-  # Deploy → Web App → Execute as Me, Anyone → copy URL to APPS_SCRIPT_TRACKING_URL
+  # Deploy -> Web App -> Execute as Me, Anyone -> copy URL to APPS_SCRIPT_TRACKING_URL
 
 Or paste apps_script/Code.gs manually at script.google.com (SHEET_ID already filled).
 """

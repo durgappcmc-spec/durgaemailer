@@ -13,3 +13,6 @@ credentials/*.json
 node_modules/
 .DS_Store
 *.log
+
+# Local Netlify folder
+.netlify
