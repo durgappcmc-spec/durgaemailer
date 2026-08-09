@@ -25,7 +25,12 @@ from gmail_client.extract import (
     extract_inbox_and_sent,
     filter_messages,
 )
-from gmail_client.send import create_draft, send_email
+from gmail_client.send import (
+    create_draft,
+    default_cc_emails,
+    default_from_email,
+    send_email,
+)
 from scheduling.client import schedule_email
 
 ROUTER_SYSTEM = """You are a routing classifier for Relay, a prospect research and outreach tool.
@@ -131,6 +136,35 @@ _EMAIL_ATTACH_RE = re.compile(
 
 def _wants_email_attachment(user_msg: str) -> bool:
     return bool(_EMAIL_ATTACH_RE.search(user_msg or ""))
+
+
+def _prefer_draft_over_send(user_msg: str, want_send: bool) -> bool:
+    """Prefer creating a new draft for review unless the user clearly says send now.
+
+    Even when routing says SEND_EMAIL / do_send, we draft by default so the
+    user can review From/signature/CC before anything goes out.
+    """
+    if not want_send:
+        return True
+    msg = user_msg or ""
+    # Explicit force-send phrases
+    if re.search(
+        r"\b("
+        r"send\s+now|"
+        r"actually\s+send|"
+        r"fire\s+off|"
+        r"email\s+them\s+now|"
+        r"don'?t\s+draft|"
+        r"do\s+not\s+draft|"
+        r"skip\s+(the\s+)?draft|"
+        r"send\s+immediately"
+        r")\b",
+        msg,
+        re.I,
+    ):
+        return False
+    # Soft "send" without "now" → still draft for review
+    return True
 
 
 def _wants_file_context(user_msg: str) -> bool:
@@ -424,6 +458,10 @@ def _build_draft_jobs(
             }
             if payload.get("attachments"):
                 job["attachments"] = payload["attachments"]
+            if payload.get("from_email"):
+                job["from_email"] = payload["from_email"]
+            if payload.get("cc") is not None:
+                job["cc"] = payload["cc"]
             jobs.append(job)
         if jobs:
             return jobs
@@ -441,6 +479,10 @@ def _build_draft_jobs(
             }
             if payload.get("attachments"):
                 job["attachments"] = payload["attachments"]
+            if payload.get("from_email"):
+                job["from_email"] = payload["from_email"]
+            if payload.get("cc") is not None:
+                job["cc"] = payload["cc"]
             jobs.append(job)
         if jobs:
             return jobs
@@ -494,6 +536,10 @@ def _build_draft_jobs(
         }
         if payload.get("attachments"):
             job["attachments"] = payload["attachments"]
+        if payload.get("from_email"):
+            job["from_email"] = payload["from_email"]
+        if payload.get("cc") is not None:
+            job["cc"] = payload["cc"]
         jobs.append(job)
     return jobs
 
@@ -604,17 +650,140 @@ def _gmail_attachment_payload(
     return out or None
 
 
+def _attachments_for_email(
+    user_msg: str,
+    chat_attachments: Optional[list[dict[str, Any]]],
+) -> Optional[list[dict[str, Any]]]:
+    """Only attach binary files when the user explicitly asks to include them.
+
+    Staged uploads are always available as drafting *context*; they are not
+    attached unless the user says attach/include the file.
+    """
+    if not chat_attachments:
+        return None
+    if not _wants_email_attachment(user_msg or ""):
+        return None
+    return _gmail_attachment_payload(chat_attachments)
+
+
+def _extract_cc_emails(
+    user_msg: str,
+    *,
+    seed: Optional[dict[str, Any]] = None,
+    exclude: Optional[set[str]] = None,
+) -> list[str]:
+    """Pull CC addresses from seed JSON and phrases like 'cc a@b.com'."""
+    found: list[str] = []
+    seed = seed or {}
+    for key in ("cc", "cc_emails", "cc_email"):
+        val = seed.get(key)
+        if isinstance(val, str):
+            found.extend(_EMAIL_RE.findall(val))
+        elif isinstance(val, list):
+            for item in val:
+                found.extend(_EMAIL_RE.findall(str(item)))
+
+    msg = user_msg or ""
+    for m in re.finditer(
+        r"\bcc(?:\s*[:=]|\s+to)?\s+([^\n|;]+)",
+        msg,
+        re.I,
+    ):
+        found.extend(_EMAIL_RE.findall(m.group(1)))
+    # Also: "copy alice@x.com" / "with cc alice@x.com"
+    for m in re.finditer(
+        r"\b(?:copy|carbon\s+copy)\s+([^\n|;]+)",
+        msg,
+        re.I,
+    ):
+        found.extend(_EMAIL_RE.findall(m.group(1)))
+
+    found.extend(default_cc_emails())
+    exclude = {e.lower() for e in (exclude or set())}
+    out: list[str] = []
+    seen: set[str] = set()
+    for e in found:
+        key = e.lower()
+        if key in seen or key in exclude:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+def _stamp_mail_fields(
+    job: dict[str, Any],
+    *,
+    from_email: str,
+    cc: list[str],
+    attachments: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    job = {**job}
+    job["from_email"] = from_email
+    job["cc"] = list(cc or [])
+    if attachments:
+        job["attachments"] = attachments
+    elif "attachments" in job and not attachments:
+        job.pop("attachments", None)
+    return job
+
+
+def _deliver_job(
+    job: dict[str, Any],
+    *,
+    want_send: bool,
+    user_msg: str,
+) -> tuple[dict[str, Any], bool]:
+    """Create a new draft (default) or send. Returns (result, did_send)."""
+    do_send = want_send and not _prefer_draft_over_send(user_msg, True)
+    kwargs = {
+        "to": job["recipient_email"],
+        "subject": job.get("subject") or "(no subject)",
+        "html_body": job.get("html_body") or "",
+        "recipient_name": job.get("recipient_name") or "",
+        "attachments": job.get("attachments"),
+        "campaign": job.get("campaign"),
+        "source": job.get("source"),
+        "from_email": job.get("from_email") or default_from_email(),
+        "cc": job.get("cc") or [],
+        "include_signature": True,
+    }
+    if do_send:
+        return send_email(**kwargs), True
+    return create_draft(**kwargs), False
+
+
+def _mail_headers(
+    user_msg: str,
+    *,
+    seed: Optional[dict[str, Any]] = None,
+    to_emails: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    exclude = {e.lower() for e in (to_emails or [])}
+    return {
+        "from_email": default_from_email(),
+        "cc": _extract_cc_emails(user_msg, seed=seed, exclude=exclude),
+    }
+
+
 def _attach_note(
     attachments: Optional[list[dict[str, Any]]],
     *,
     used_document_context: bool = False,
+    attached_to_email: bool = False,
 ) -> str:
     if not attachments:
         return ""
     names = ", ".join(a.get("name") or "file" for a in attachments)
-    note = f" Attachments: {names}."
-    if used_document_context:
-        note += " (PDF/text used as email context.)"
+    if attached_to_email:
+        note = f" File attachment(s) included: {names}."
+    elif used_document_context:
+        note = (
+            f" Used {names} as drafting context only "
+            f"(not attached — say “attach the file” to include it)."
+        )
+    else:
+        note = f" Files available: {names}."
     return note
 
 
@@ -691,7 +860,8 @@ def answer(
     prospects = (context or {}).get("prospects") or []
     chat_attachments = (context or {}).get("attachments") or []
     mailbox_messages = list((context or {}).get("mailbox_messages") or [])
-    gmail_atts = _gmail_attachment_payload(chat_attachments)
+    # Binary attach only when user asks; staged files still feed document context.
+    email_atts = _attachments_for_email(user_msg, chat_attachments)
     doc_context = document_context_from_attachments(chat_attachments)
     used_docs = bool(doc_context.strip())
     att_names = _attachment_names(chat_attachments)
@@ -925,12 +1095,17 @@ def answer(
             except Exception as e:
                 print(f"[router] research auto-ingest error: {e}", file=sys.stderr)
 
-            # Step 3: personalized drafts for contacts with email
+            # Step 3: personalized drafts for contacts with email (review before send)
             if (do_draft or do_send) and with_email:
+                # Always draft unless user clearly says send now
+                want_send = bool(do_send) and not _prefer_draft_over_send(
+                    user_msg, True
+                )
                 yield (
                     f"\n**Step 3/3 — "
-                    f"{'Sending' if do_send else 'Drafting'} personalized emails** "
-                    f"to {len(with_email)} contacts…\n"
+                    f"{'Sending' if want_send else 'Creating new Gmail drafts'}** "
+                    f"to {len(with_email)} contacts "
+                    f"(from **{default_from_email()}**, with your signature)…\n"
                 )
                 # Build intent-aware template via JSON extract
                 intent = extract_json(
@@ -945,7 +1120,7 @@ Return JSON:
 
 Keep it warm, specific to girls/skilling NGO partnership if relevant.
 If user mentions karunamedia.org or a brand, reference collaboration politely.
-HTML only in html_body. No markdown.
+HTML only in html_body. No markdown. Do not include a signature block.
 """,
                     system="Return JSON only for an email template.",
                     max_tokens=900,
@@ -968,15 +1143,21 @@ HTML only in html_body. No markdown.
                     "<p>Best regards</p>"
                 )
 
+                headers = _mail_headers(
+                    user_msg,
+                    to_emails=[c.get("email") for c in with_email],
+                )
                 payload = {
                     "batch": True,
                     "from_prospects": True,
                     "subject": subject,
                     "html_body": html_body,
                     "source": "research_then_zoom",
+                    "from_email": headers["from_email"],
+                    "cc": headers["cc"],
                 }
-                if chat_attachments:
-                    payload["attachments"] = chat_attachments
+                if email_atts:
+                    payload["attachments"] = email_atts
                     consumed_attachments = True
                 jobs = _build_draft_jobs(
                     payload,
@@ -987,35 +1168,38 @@ HTML only in html_body. No markdown.
                 )
                 ok_n = 0
                 for job in jobs:
+                    job = _stamp_mail_fields(
+                        job,
+                        from_email=headers["from_email"],
+                        cc=headers["cc"],
+                        attachments=email_atts,
+                    )
                     try:
-                        if do_send:
-                            out = send_email(
-                                to=job["recipient_email"],
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "",
-                                recipient_name=job.get("recipient_name") or "",
-                                attachments=job.get("attachments") or gmail_atts or None,
-                            )
-                        else:
-                            out = create_draft(
-                                to=job["recipient_email"],
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "",
-                                recipient_name=job.get("recipient_name") or "",
-                                attachments=job.get("attachments") or gmail_atts or None,
-                            )
+                        out, did_send = _deliver_job(
+                            job, want_send=want_send, user_msg=user_msg
+                        )
                         ok_n += 1
+                        cc_note = f" cc {out.get('cc')}" if out.get("cc") else ""
                         yield (
-                            f"- {'Sent' if do_send else 'Drafted'} → "
+                            f"- {'Sent' if did_send else 'Drafted'} → "
                             f"**{job.get('recipient_email')}** "
-                            f"({job.get('recipient_name') or ''})\n"
+                            f"(from {out.get('from') or headers['from_email']}{cc_note})\n"
                         )
                     except Exception as e:
                         yield f"- Failed {job.get('recipient_email')}: {e}\n"
                 yield (
                     f"\nDone: **{ok_n}** "
-                    f"{'emails sent' if do_send else 'Gmail drafts created'}.\n"
+                    f"{'emails sent' if want_send else 'new Gmail drafts created for review'}.\n"
                 )
+                if chat_attachments and not email_atts:
+                    yield (
+                        _attach_note(
+                            chat_attachments,
+                            used_document_context=used_docs,
+                            attached_to_email=False,
+                        )
+                        + "\n"
+                    )
             elif do_draft or do_send:
                 yield (
                     "\nNo ZoomInfo emails available to draft yet. "
@@ -1178,15 +1362,18 @@ HTML only in html_body. No markdown.
                     + "\n"
                 )
 
-            # Same-turn draft/send after LinkedIn enrich
+            # Same-turn draft after LinkedIn enrich (review before send)
             if (
                 wants_email_after_enrich
                 and result
                 and (result.get("email") or "").strip()
             ):
-                is_send = bool(
-                    re.search(r"\b(send|fire off|email them now)\b", user_msg or "", re.I)
-                    and not re.search(r"\bdraft\b", user_msg or "", re.I)
+                want_send = bool(
+                    re.search(
+                        r"\b(send now|email them now|fire off|actually send)\b",
+                        user_msg or "",
+                        re.I,
+                    )
                 )
                 seed = {
                     "recipient_email": result.get("email"),
@@ -1202,8 +1389,15 @@ HTML only in html_body. No markdown.
                 )
                 payload["recipient_email"] = result.get("email")
                 payload.setdefault("recipient_name", result.get("name") or "")
-                if chat_attachments:
-                    payload["attachments"] = chat_attachments
+                headers = _mail_headers(
+                    user_msg,
+                    seed=payload,
+                    to_emails=[result.get("email") or ""],
+                )
+                payload["from_email"] = headers["from_email"]
+                payload["cc"] = headers["cc"]
+                if email_atts:
+                    payload["attachments"] = email_atts
                     consumed_attachments = True
                 jobs = _build_draft_jobs(
                     payload,
@@ -1223,27 +1417,37 @@ HTML only in html_body. No markdown.
                             or f"<p>{user_msg}</p>",
                         }
                     ]
-                verb = "Sending" if is_send else "Drafting"
-                yield f"\n{verb} email to **{result.get('email')}**…\n"
+                verb = "Sending" if want_send else "Creating draft"
+                yield (
+                    f"\n{verb} to **{result.get('email')}** "
+                    f"from **{headers['from_email']}**…\n"
+                )
                 for job in jobs:
+                    job = _stamp_mail_fields(
+                        job,
+                        from_email=headers["from_email"],
+                        cc=headers["cc"],
+                        attachments=email_atts,
+                    )
                     try:
-                        if is_send:
-                            out = send_email(
-                                to=job["recipient_email"],
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "",
-                                attachments=job.get("attachments") or gmail_atts or None,
-                            )
-                        else:
-                            out = create_draft(
-                                to=job["recipient_email"],
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "",
-                                attachments=job.get("attachments") or gmail_atts or None,
-                            )
-                        yield f"- {'Sent' if is_send else 'Drafted'}: {out}\n"
+                        out, did_send = _deliver_job(
+                            job, want_send=want_send, user_msg=user_msg
+                        )
+                        yield (
+                            f"- {'Sent' if did_send else 'Drafted'}: "
+                            f"{json.dumps(out, default=str)}\n"
+                        )
                     except Exception as e:
                         yield f"- Failed for {job.get('recipient_email')}: {e}\n"
+                if chat_attachments and not email_atts:
+                    yield (
+                        _attach_note(
+                            chat_attachments,
+                            used_document_context=used_docs,
+                            attached_to_email=False,
+                        )
+                        + "\n"
+                    )
             else:
                 system = (
                     "Present this enriched prospect clearly. "
@@ -1370,8 +1574,11 @@ HTML only in html_body. No markdown.
             ):
                 if flag in seed and flag not in payload:
                     payload[flag] = seed[flag]
-            if chat_attachments:
-                payload["attachments"] = chat_attachments
+            # Attach binary files only when explicitly requested
+            if email_atts:
+                payload["attachments"] = email_atts
+            elif "attachments" in payload:
+                payload.pop("attachments", None)
             # Default personalized follow-up templates when missing
             if payload.get("from_mailbox") or payload.get("use_mailbox"):
                 if not payload.get("subject") or payload.get("subject") in (
@@ -1400,7 +1607,15 @@ HTML only in html_body. No markdown.
                 prospects=prospects,
                 mailbox_messages=mailbox_messages,
             )
-            action = "send" if is_send else "draft"
+            headers = _mail_headers(
+                user_msg,
+                seed=payload,
+                to_emails=[j.get("recipient_email") or "" for j in jobs],
+            )
+            payload["from_email"] = headers["from_email"]
+            payload["cc"] = headers["cc"]
+            want_send = is_send and not _prefer_draft_over_send(user_msg, True)
+            action = "send" if want_send else "draft"
             if not jobs and (
                 payload.get("from_mailbox") or payload.get("use_mailbox")
             ):
@@ -1414,95 +1629,61 @@ HTML only in html_body. No markdown.
                     f"I couldn't {action} — no recipient emails found. "
                     "List addresses, search prospects, or pull inbox/sent first."
                 )
-            elif len(jobs) == 1:
-                job = jobs[0]
-                atts = _gmail_attachment_payload(job.get("attachments")) or gmail_atts
-                if is_send:
-                    result = send_email(
-                        to=str(job["recipient_email"]).strip(),
-                        subject=job.get("subject") or "(no subject)",
-                        html_body=job.get("html_body") or "<p></p>",
-                        recipient_name=job.get("recipient_name"),
-                        attachments=atts,
-                        campaign=job.get("campaign"),
-                        source=job.get("source") or "chat_send",
-                    )
-                else:
-                    result = create_draft(
-                        to=str(job["recipient_email"]).strip(),
-                        subject=job.get("subject") or "(no subject)",
-                        html_body=job.get("html_body") or "<p></p>",
-                        recipient_name=job.get("recipient_name"),
-                        attachments=atts,
-                        campaign=job.get("campaign"),
-                        source=job.get("source") or "chat_draft",
-                        track=False,
-                    )
-                if result.get("error"):
-                    yield f"{action.title()} failed: {result['error']}"
-                else:
-                    consumed_attachments = bool(chat_attachments)
-                    if is_send:
-                        yield (
-                            f"Sent email to {job['recipient_email']} "
-                            f"(message_id={result.get('message_id')})."
-                            f"{_attach_note(atts, used_document_context=used_docs)}"
-                        )
-                    else:
-                        yield (
-                            f"Created Gmail draft to {job['recipient_email']} "
-                            f"(draft_id={result.get('draft_id')}). "
-                            "Open Gmail → Drafts to review and send."
-                            f"{_attach_note(atts, used_document_context=used_docs)}"
-                        )
-                    yield f"\nResult: {json.dumps(result, default=str)}"
             else:
-                yield f"{'Sending' if is_send else 'Creating'} {len(jobs)} emails…\n"
+                yield (
+                    f"{'Sending' if want_send else 'Creating new Gmail draft(s)'} "
+                    f"from **{headers['from_email']}**"
+                    + (
+                        f" (cc: {', '.join(headers['cc'])})"
+                        if headers["cc"]
+                        else ""
+                    )
+                    + " with your signature…\n"
+                )
                 results = []
                 for job in jobs:
-                    atts = _gmail_attachment_payload(job.get("attachments")) or gmail_atts
-                    if is_send:
-                        results.append(
-                            send_email(
-                                to=str(job["recipient_email"]).strip(),
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "<p></p>",
-                                recipient_name=job.get("recipient_name"),
-                                attachments=atts,
-                                campaign=job.get("campaign"),
-                                source=job.get("source") or "chat_send_batch",
-                            )
-                        )
-                    else:
-                        job = {**job, "attachments": atts}
-                        results.append(
-                            create_draft(
-                                to=str(job["recipient_email"]).strip(),
-                                subject=job.get("subject") or "(no subject)",
-                                html_body=job.get("html_body") or "<p></p>",
-                                recipient_name=job.get("recipient_name"),
-                                attachments=atts,
-                                campaign=job.get("campaign"),
-                                source=job.get("source") or "chat_draft_batch",
-                                track=False,
-                            )
-                        )
+                    job = _stamp_mail_fields(
+                        job,
+                        from_email=headers["from_email"],
+                        cc=headers["cc"],
+                        attachments=email_atts,
+                    )
+                    out, did_send = _deliver_job(
+                        job, want_send=want_send, user_msg=user_msg
+                    )
+                    results.append({**out, "_did_send": did_send})
                 ok = [r for r in results if not r.get("error")]
                 fail = [r for r in results if r.get("error")]
-                if ok:
-                    consumed_attachments = bool(chat_attachments)
+                if ok and email_atts:
+                    consumed_attachments = True
                 yield f"Done: **{len(ok)}** ok"
                 if fail:
                     yield f", **{len(fail)}** failed"
-                yield f".{_attach_note(gmail_atts, used_document_context=used_docs)}\n"
+                yield (
+                    _attach_note(
+                        chat_attachments if chat_attachments else email_atts,
+                        used_document_context=used_docs,
+                        attached_to_email=bool(email_atts),
+                    )
+                    + "\n"
+                )
                 for r in ok[:50]:
                     target = r.get("to") or r.get("recipient_email")
-                    rid = r.get("draft_id") or r.get("message_id")
-                    yield f"- {action} → {target} (id={rid})\n"
-                for r in fail[:20]:
-                    yield f"- failed → {r.get('to') or '?'}: {r.get('error')}\n"
-                if not is_send:
-                    yield "\nOpen Gmail → Drafts to review and send."
+                    did = r.get("_did_send")
+                    yield (
+                        f"- {'Sent' if did else 'Draft'} → {target}"
+                        + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                        + (
+                            f" (draft_id={r.get('draft_id')})"
+                            if r.get("draft_id")
+                            else ""
+                        )
+                        + "\n"
+                    )
+                if not want_send:
+                    yield "\nOpen Gmail → Drafts to review, then send.\n"
+                for r in fail[:10]:
+                    yield f"- Failed: {r.get('error')}\n"
 
         elif routing.startswith("SCHEDULE_EMAIL"):
             # Accept truncated "SCHEDULE_EMAIL:{"recipient_email" lines.
@@ -1541,12 +1722,20 @@ HTML only in html_body. No markdown.
                     recipient_name=job.get("recipient_name"),
                     campaign=job.get("campaign"),
                     source=job.get("source"),
-                    attachments=chat_attachments or None,
+                    attachments=email_atts or None,
                 )
                 yield f"Scheduled email to {job['recipient_email']} at {send_at}."
-                yield f"{_attach_note(chat_attachments, used_document_context=used_docs)}\n"
+                yield (
+                    _attach_note(
+                        chat_attachments if chat_attachments else email_atts,
+                        used_document_context=used_docs,
+                        attached_to_email=bool(email_atts),
+                    )
+                    + "\n"
+                )
                 yield f"Result: {json.dumps(result, default=str)}"
-                consumed_attachments = bool(chat_attachments)
+                if email_atts:
+                    consumed_attachments = True
 
         else:
             # CHAT (default) — uploaded files are context for ANY question

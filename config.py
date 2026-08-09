@@ -43,6 +43,8 @@ def _apply_streamlit_secrets() -> None:
         "GMAIL_OAUTH_JSON",
         "GMAIL_CLIENT_SECRETS",
         "GMAIL_TOKEN_PATH",
+        "GMAIL_FROM_EMAIL",
+        "GMAIL_DEFAULT_CC",
         "CHROMA_DIR",
         "AUTO_SYNC_GMAIL",
         "AUTO_SYNC_INTERVAL_MINUTES",
@@ -89,6 +91,10 @@ class Settings:
         # Optional: paste full token JSON into Streamlit secrets for cloud deploys
         self.GMAIL_TOKEN_JSON: str = os.getenv("GMAIL_TOKEN_JSON", "")
         self.GMAIL_OAUTH_JSON: str = os.getenv("GMAIL_OAUTH_JSON", "")
+        self.GMAIL_FROM_EMAIL: str = os.getenv(
+            "GMAIL_FROM_EMAIL", "csr@karunamedia.org"
+        )
+        self.GMAIL_DEFAULT_CC: str = os.getenv("GMAIL_DEFAULT_CC", "")
         self.GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
         self.TRACKING_BASE_URL: str = os.getenv("TRACKING_BASE_URL", "").rstrip("/")
         self.APPS_SCRIPT_TRACKING_URL: str = os.getenv("APPS_SCRIPT_TRACKING_URL", "")

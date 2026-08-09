@@ -29,49 +29,42 @@ default_date = tomorrow.date()
 default_time = datetime.strptime("09:30", "%H:%M").time()
 
 with tab_send:
-    st.caption("Send immediately via Gmail API, or save as a Gmail draft. Attachments supported.")
+    st.caption(
+        "Drafts/sends use csr@karunamedia.org + your Gmail signature. "
+        "Prefer Save draft so you can review in Gmail before sending."
+    )
     to = st.text_input("To (email)", key="now_to")
+    cc = st.text_input("CC (optional, comma-separated)", key="now_cc")
     name = st.text_input("Recipient name", key="now_name")
     subject = st.text_input("Subject", key="now_subject")
     campaign = st.text_input("Campaign", key="now_campaign")
     body = st.text_area("HTML body", value="<p>Hi {name},</p>", height=200, key="now_body")
     files = st.file_uploader(
-        "Attachments",
+        "Attachments (only included if you upload here)",
         accept_multiple_files=True,
         key="now_files",
     )
     c1, c2 = st.columns(2)
-    send_now = c1.button("📨 Send now", type="primary", key="now_send")
-    draft_now = c2.button("📝 Save draft", key="now_draft")
+    draft_now = c1.button("📝 Save draft", type="primary", key="now_draft")
+    send_now = c2.button("📨 Send now", key="now_send")
     if send_now or draft_now:
         html = body.replace("{name}", name or "").replace("{{name}}", name or "")
         atts = files_to_attachments(list(files) if files else [])
         gmail_atts = [{"name": a["name"], "data": a["data"]} for a in atts]
+        kwargs = dict(
+            to=to,
+            subject=subject,
+            html_body=html,
+            recipient_name=name,
+            attachments=gmail_atts or None,
+            campaign=campaign,
+            cc=cc or None,
+            include_signature=True,
+        )
         if send_now:
-            st.json(
-                send_email(
-                    to=to,
-                    subject=subject,
-                    html_body=html,
-                    recipient_name=name,
-                    attachments=gmail_atts or None,
-                    campaign=campaign,
-                    source="ui_send",
-                )
-            )
+            st.json(send_email(**kwargs, source="ui_send"))
         else:
-            st.json(
-                create_draft(
-                    to=to,
-                    subject=subject,
-                    html_body=html,
-                    recipient_name=name,
-                    attachments=gmail_atts or None,
-                    campaign=campaign,
-                    source="ui_draft",
-                    track=False,
-                )
-            )
+            st.json(create_draft(**kwargs, source="ui_draft", track=False))
 
 with tab_single:
     to = st.text_input("To (email)", key="single_to")

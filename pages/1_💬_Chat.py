@@ -19,9 +19,10 @@ sync = ensure_session_sync(st.session_state)
 
 st.title("💬 Chat")
 st.caption(
-    "Paperclip = file context/attach. "
-    "Smart NGO flow: `Find NGOs for girls 16+ skilling in Noida, look them up on ZoomInfo, and draft personalized emails`. "
-    "LinkedIn enrich: paste a profile URL. Credentials stay in .env."
+    "Paperclip = file **context** (not attached unless you say “attach the file”). "
+    "Drafts are from csr@karunamedia.org with your Gmail signature — review in Drafts before sending. "
+    "Say `cc someone@email.com` to add CC. "
+    "Smart NGO flow: find orgs → ZoomInfo → personalized drafts."
 )
 
 if "messages" not in st.session_state:

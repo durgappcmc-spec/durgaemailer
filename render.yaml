@@ -22,6 +22,10 @@ services:
         value: "30"
       - key: AUTO_SYNC_MAX_PER
         value: "75"
+      - key: GMAIL_FROM_EMAIL
+        value: csr@karunamedia.org
+      - key: GMAIL_DEFAULT_CC
+        value: ""
       - key: GEMINI_API_KEY
         sync: false
       - key: GOOGLE_SHEET_ID
