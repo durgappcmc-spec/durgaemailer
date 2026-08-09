@@ -14,6 +14,10 @@ from connectors.zoominfo import extract_linkedin_url, names_from_linkedin_url
 from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json
+from agent.research_pipeline import (
+    run_research_then_zoom,
+    wants_research_then_zoom,
+)
 from gmail_client.attachments import document_context_from_attachments
 from gmail_client.extract import (
     contacts_from_mailbox,
@@ -31,6 +35,7 @@ CHAT
 MEMORY
 PROSPECT_SEARCH:<json>
 PROSPECT_ENRICH:<json>
+RESEARCH_THEN_ZOOM:<json>
 GMAIL_EXTRACT:<gmail query>
 DRAFT_EMAIL:<compact-json>
 SEND_EMAIL:<compact-json>
@@ -39,15 +44,19 @@ SCHEDULE_EMAIL:<compact-json>
 Rules:
 - CHAT: general questions, research, writing help — Gemini will use Google Search.
 - MEMORY: user asks about saved notes/prospects already in memory.
-- PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
+- RESEARCH_THEN_ZOOM: use when the user asks for orgs matching a MISSION / demographic
+  (e.g. NGOs for girls 16+ skilling, women livelihoods) and then wants ZoomInfo contacts
+  and/or emails / drafts. Do NOT dump demographics into ZoomInfo filters.
+  Example: RESEARCH_THEN_ZOOM:{"org_limit":8,"contacts_per_org":3,"draft":true}
+  Set draft:true if they also ask to draft/write personalized emails in the same message.
+  Set send:true only if they explicitly say send now.
+- PROSPECT_SEARCH: find people when the user already knows company/title filters.
+  JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
   Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
   PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":20}
-  For NGO / nonprofit searches: put "NGO" in company_names or keywords, city in locations
-  (e.g. Noida), and country implied. Do NOT put beneficiary demographics (girls, age 16+,
-  children) into titles/keywords — ZoomInfo only has org contacts, not beneficiary lists.
-  Example: PROSPECT_SEARCH:{"company_names":["NGO"],"locations":["Noida"],"providers":["zoominfo"],"limit":20}
+  For plain NGO staff lookups without mission filters: company_names=["NGO"], locations=["Noida"].
   Never ask the user for ZoomInfo credentials.
-- After a prospect search, if the user asks to email/draft/send to that list / all of them / these prospects,
+- After a prospect / research search, if the user asks to email/draft/send to that list,
   use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
   When the user pastes a LinkedIn profile URL, ALWAYS use PROSPECT_ENRICH with linkedin_url set.
@@ -94,6 +103,9 @@ _TEMPLATE_KEYS = (
     "recipient_email",
     "prior_subject",
     "prior_summary",
+    "org_focus",
+    "org_website",
+    "why_match",
 )
 # User wants a file used as general chat/research context
 _CONTEXT_FILE_RE = re.compile(
@@ -172,6 +184,9 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
         ),
         "prior_subject": str(prospect.get("prior_subject") or ""),
         "prior_summary": str(prospect.get("prior_summary") or ""),
+        "org_focus": str(prospect.get("org_focus") or ""),
+        "org_website": str(prospect.get("org_website") or ""),
+        "why_match": str(prospect.get("why_match") or ""),
     }
     out = text
     for key in _TEMPLATE_KEYS:
@@ -635,6 +650,7 @@ def route(user_msg: str, history: Optional[list[dict[str, str]]] = None) -> str:
             "SCHEDULE_EMAIL:",
             "PROSPECT_SEARCH:",
             "PROSPECT_ENRICH:",
+            "RESEARCH_THEN_ZOOM:",
             "GMAIL_EXTRACT:",
         ):
             if upper.startswith(prefix) or text.startswith(prefix):
@@ -642,7 +658,7 @@ def route(user_msg: str, history: Optional[list[dict[str, str]]] = None) -> str:
                 lines = text.splitlines()
                 first = lines[0] if lines else text
                 # If model wrapped JSON onto later lines, reassemble after first prefix
-                if prefix.endswith("EMAIL:") or prefix.startswith("PROSPECT"):
+                if prefix.endswith("EMAIL:") or prefix.startswith("PROSPECT") or prefix.startswith("RESEARCH"):
                     rest = text[len(first) :]
                     return (first + rest).strip()
                 return first.strip()
@@ -729,6 +745,33 @@ def answer(
         routing = "PROSPECT_ENRICH:" + json.dumps(ident, ensure_ascii=False)
         meta_routing = routing
 
+    # Heuristic: mission/demographic research → web find orgs → ZoomInfo → optional draft
+    if wants_research_then_zoom(user_msg or "") and (
+        routing == "CHAT"
+        or routing.startswith("CHAT")
+        or routing.startswith("PROSPECT_SEARCH")
+        or routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL"))
+    ):
+        draft_flag = bool(
+            re.search(r"\b(draft|write|compose|personaliz)\b", user_msg or "", re.I)
+        )
+        send_flag = bool(
+            re.search(r"\b(send now|email them now|fire off)\b", user_msg or "", re.I)
+            and not re.search(r"\bdraft\b", user_msg or "", re.I)
+        )
+        routing = "RESEARCH_THEN_ZOOM:" + json.dumps(
+            {
+                "org_limit": 8,
+                "contacts_per_org": 3,
+                "draft": draft_flag or send_flag or bool(
+                    re.search(r"\b(email|outreach)\b", user_msg or "", re.I)
+                ),
+                "send": send_flag,
+            },
+            ensure_ascii=False,
+        )
+        meta_routing = routing
+
     try:
         # Email attach requested but no file staged → ask for upload (don't send yet)
         if (
@@ -789,6 +832,225 @@ def answer(
                     sources = chunk["__meta__"].get("sources") or []
                 else:
                     yield chunk
+
+        elif routing.startswith("RESEARCH_THEN_ZOOM"):
+            opts = _parse_json_tail(routing, "RESEARCH_THEN_ZOOM:") or {}
+            org_limit = int(opts.get("org_limit") or 8)
+            per_org = int(opts.get("contacts_per_org") or 3)
+            do_draft = bool(opts.get("draft"))
+            do_send = bool(opts.get("send"))
+            if re.search(r"\b(draft|write|compose|personaliz|email|outreach)\b", user_msg or "", re.I):
+                do_draft = True
+            if re.search(r"\b(send now|email them now|fire off)\b", user_msg or "", re.I) and not re.search(
+                r"\bdraft\b", user_msg or "", re.I
+            ):
+                do_send = True
+
+            yield (
+                "**Step 1/3 — Web research:** finding NGOs/orgs that match your "
+                "mission filters (not raw ZoomInfo demographics)…\n"
+            )
+            try:
+                pipeline = run_research_then_zoom(
+                    user_msg, org_limit=org_limit, contacts_per_org=per_org
+                )
+            except Exception as e:
+                print(f"[router] research pipeline error: {e}", file=sys.stderr)
+                yield f"Research pipeline failed: {e}\n"
+                pipeline = {
+                    "organizations": [],
+                    "contacts": [],
+                    "sources": [],
+                    "notes": "",
+                }
+
+            orgs = pipeline.get("organizations") or []
+            contacts = pipeline.get("contacts") or []
+            web_sources = pipeline.get("sources") or []
+            sources.extend(web_sources)
+
+            if orgs:
+                yield f"\nFound **{len(orgs)}** matching organizations:\n"
+                for i, org in enumerate(orgs, 1):
+                    yield (
+                        f"{i}. **{org.get('name')}**"
+                        + (f" — {org.get('website')}" if org.get("website") else "")
+                        + (f" · {org.get('location')}" if org.get("location") else "")
+                        + (
+                            f"\n   Focus: {org.get('focus')}"
+                            if org.get("focus")
+                            else ""
+                        )
+                        + "\n"
+                    )
+            else:
+                yield "\nNo concrete organizations extracted from web research.\n"
+
+            yield (
+                "\n**Step 2/3 — ZoomInfo + public emails:** looking up contacts "
+                "(ZoomInfo first, then public site emails if needed)…\n"
+            )
+            with_email = [c for c in contacts if (c.get("email") or "").strip()]
+            research_only = [c for c in contacts if c.get("research_only")]
+            people = [c for c in contacts if not c.get("research_only")]
+            prospect_out = people or contacts
+
+            if people:
+                yield (
+                    f"ZoomInfo returned **{len(people)}** contacts "
+                    f"(**{len(with_email)}** with email).\n\n"
+                )
+                for i, p in enumerate(people[:20], 1):
+                    yield f"{i}. {prospect_to_text(p)}\n"
+                    if p.get("org_focus"):
+                        yield f"   Program fit: {p.get('org_focus')}\n"
+            else:
+                yield "ZoomInfo had little/no contact coverage for these orgs.\n"
+            if research_only:
+                yield (
+                    f"\n_{len(research_only)} orgs saved from web research without "
+                    "ZoomInfo people (you can enrich later by LinkedIn/domain)._\n"
+                )
+
+            try:
+                auto_ingest_prospects(
+                    [c for c in prospect_out if not c.get("research_only")]
+                )
+            except Exception as e:
+                print(f"[router] research auto-ingest error: {e}", file=sys.stderr)
+
+            # Step 3: personalized drafts for contacts with email
+            if (do_draft or do_send) and with_email:
+                yield (
+                    f"\n**Step 3/3 — "
+                    f"{'Sending' if do_send else 'Drafting'} personalized emails** "
+                    f"to {len(with_email)} contacts…\n"
+                )
+                # Build intent-aware template via JSON extract
+                intent = extract_json(
+                    f"""Create a short personalized outreach email template for this request.
+
+User request:
+{user_msg}
+
+Use placeholders exactly: {{first_name}}, {{company}}, {{title}}, {{org_focus}}
+Return JSON:
+{{"subject":"...","html_body":"<p>Hi {{first_name}},</p>..."}}
+
+Keep it warm, specific to girls/skilling NGO partnership if relevant.
+If user mentions karunamedia.org or a brand, reference collaboration politely.
+HTML only in html_body. No markdown.
+""",
+                    system="Return JSON only for an email template.",
+                    max_tokens=900,
+                )
+                try:
+                    tmpl = json.loads(intent or "{}")
+                except Exception:
+                    tmpl = {}
+                subject = (
+                    tmpl.get("subject")
+                    or "Partnership idea for {company}'s girls skilling work"
+                )
+                html_body = tmpl.get("html_body") or (
+                    "<p>Hi {first_name},</p>"
+                    "<p>I came across <strong>{company}</strong> and your work "
+                    "on {org_focus}.</p>"
+                    "<p>I'd love to explore a collaboration that supports "
+                    "skilling opportunities for girls aged 16+.</p>"
+                    "<p>Would you be open to a short call next week?</p>"
+                    "<p>Best regards</p>"
+                )
+
+                payload = {
+                    "batch": True,
+                    "from_prospects": True,
+                    "subject": subject,
+                    "html_body": html_body,
+                    "source": "research_then_zoom",
+                }
+                if chat_attachments:
+                    payload["attachments"] = chat_attachments
+                    consumed_attachments = True
+                jobs = _build_draft_jobs(
+                    payload,
+                    user_msg,
+                    history=history,
+                    prospects=with_email,
+                    mailbox_messages=mailbox_messages,
+                )
+                ok_n = 0
+                for job in jobs:
+                    try:
+                        if do_send:
+                            out = send_email(
+                                to=job["recipient_email"],
+                                subject=job.get("subject") or "(no subject)",
+                                html_body=job.get("html_body") or "",
+                                recipient_name=job.get("recipient_name") or "",
+                                attachments=job.get("attachments") or gmail_atts or None,
+                            )
+                        else:
+                            out = create_draft(
+                                to=job["recipient_email"],
+                                subject=job.get("subject") or "(no subject)",
+                                html_body=job.get("html_body") or "",
+                                recipient_name=job.get("recipient_name") or "",
+                                attachments=job.get("attachments") or gmail_atts or None,
+                            )
+                        ok_n += 1
+                        yield (
+                            f"- {'Sent' if do_send else 'Drafted'} → "
+                            f"**{job.get('recipient_email')}** "
+                            f"({job.get('recipient_name') or ''})\n"
+                        )
+                    except Exception as e:
+                        yield f"- Failed {job.get('recipient_email')}: {e}\n"
+                yield (
+                    f"\nDone: **{ok_n}** "
+                    f"{'emails sent' if do_send else 'Gmail drafts created'}.\n"
+                )
+            elif do_draft or do_send:
+                yield (
+                    "\nNo ZoomInfo emails available to draft yet. "
+                    "Try enriching a LinkedIn URL, or ask me to draft once contacts "
+                    "with emails appear.\n"
+                )
+            else:
+                yield (
+                    "\nNext: `draft personalized emails to all these prospects` "
+                    "about your partnership / skilling program.\n"
+                )
+
+            system = (
+                "Summarize the research→ZoomInfo pipeline for the user. "
+                "List org names, which contacts have emails, and remind them "
+                "demographics (girls 16+) were used for WEB research only — "
+                "ZoomInfo only stores org staff contacts.\n\n"
+                f"Organizations:\n{json.dumps(orgs, default=str)[:4000]}\n\n"
+                f"Contacts:\n{json.dumps(people[:15], default=str)[:4000]}"
+            )
+            if used_docs:
+                system += "\n\nUploaded file context:\n" + doc_context
+            for chunk in chat_grounded(
+                user_msg, history=history, system=system, use_search=False
+            ):
+                if isinstance(chunk, dict) and "__meta__" in chunk:
+                    more = chunk["__meta__"].get("sources") or []
+                    if more:
+                        sources.extend(more)
+                else:
+                    yield chunk
+            sources.append(
+                {
+                    "title": "research_then_zoom",
+                    "url": "",
+                    "type": "pipeline",
+                    "orgs": len(orgs),
+                    "contacts": len(people),
+                    "with_email": len(with_email),
+                }
+            )
 
         elif routing.startswith("PROSPECT_SEARCH:"):
             q = _parse_json_tail(routing, "PROSPECT_SEARCH:")

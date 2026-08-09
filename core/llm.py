@@ -150,6 +150,25 @@ def chat_grounded(
     yield {"__meta__": {"sources": sources}}
 
 
+def grounded_collect(
+    user_msg: str,
+    *,
+    system: Optional[str] = None,
+    history: Optional[list[dict[str, str]]] = None,
+) -> tuple[str, list[dict[str, str]]]:
+    """Non-streaming Google-grounded completion. Returns (text, sources)."""
+    text_parts: list[str] = []
+    sources: list[dict[str, str]] = []
+    for chunk in chat_grounded(
+        user_msg, history=history, system=system, use_search=True, stream=False
+    ):
+        if isinstance(chunk, dict) and "__meta__" in chunk:
+            sources = chunk["__meta__"].get("sources") or []
+        else:
+            text_parts.append(str(chunk))
+    return "".join(text_parts).strip(), sources
+
+
 def chat_fast(
     messages: list[dict[str, str]],
     temperature: float = 0.2,
