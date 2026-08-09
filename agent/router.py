@@ -22,6 +22,8 @@ from agent.intent import (
     plan_summary,
 )
 from agent.research_pipeline import (
+    discover_orgs_from_web,
+    iter_enrich_orgs_on_zoominfo,
     run_research_then_zoom,
     wants_research_then_zoom,
 )
@@ -1223,26 +1225,18 @@ def answer(
                 f"({per_org} contacts/org, ≤{email_cap} emails)…\n"
             )
             try:
-                pipeline = run_research_then_zoom(
-                    user_msg, org_limit=org_limit, contacts_per_org=per_org
+                orgs, web_sources, _notes = discover_orgs_from_web(
+                    user_msg, limit=org_limit
                 )
             except Exception as e:
-                print(f"[router] research pipeline error: {e}", file=sys.stderr)
-                yield f"Research pipeline failed: {e}\n"
-                pipeline = {
-                    "organizations": [],
-                    "contacts": [],
-                    "sources": [],
-                    "notes": "",
-                }
+                print(f"[router] research discover error: {e}", file=sys.stderr)
+                yield f"Web research failed: {e}\n"
+                orgs, web_sources = [], []
 
-            orgs = pipeline.get("organizations") or []
-            contacts = pipeline.get("contacts") or []
-            web_sources = pipeline.get("sources") or []
-            sources.extend(web_sources)
+            sources.extend(web_sources or [])
             if _stop_now():
                 yield stopped_message()
-                orgs, contacts = [], []
+                orgs = []
 
             if orgs:
                 yield f"\nFound **{len(orgs)}** matching organizations:\n"
@@ -1262,32 +1256,74 @@ def answer(
                 yield "\nNo concrete organizations extracted from web research.\n"
 
             yield (
-                "\n**Step 2/3 — ZoomInfo + public emails:** looking up contacts "
-                "(ZoomInfo first, then public site emails if needed)…\n"
+                "\n**Step 2/3 — ZoomInfo one-by-one:** for each NGO, search ZoomInfo "
+                "and enrich **email + mobile**, then try public contacts if needed…\n"
             )
+            contacts: list[dict[str, Any]] = []
+            for event in iter_enrich_orgs_on_zoominfo(
+                orgs,
+                contacts_per_org=per_org,
+                web_email_fallback=True,
+                cancel_check=_stop_now,
+            ):
+                if event.get("type") == "cancelled":
+                    yield stopped_message()
+                    break
+                if event.get("type") != "org":
+                    continue
+                result = event.get("result") or {}
+                org = result.get("org") or {}
+                org_contacts = result.get("contacts") or []
+                contacts.extend(org_contacts)
+                idx = event.get("index")
+                total = event.get("total")
+                we = int(result.get("with_email") or 0)
+                wm = int(result.get("with_mobile") or 0)
+                people_n = sum(1 for c in org_contacts if not c.get("research_only"))
+                yield (
+                    f"\n**[{idx}/{total}] {org.get('name') or 'Org'}** — "
+                    f"{people_n} contact(s), **{we}** email, **{wm}** mobile"
+                )
+                note_bits = result.get("notes") or []
+                if note_bits:
+                    yield f" · _{'; '.join(note_bits)}_"
+                yield "\n"
+                for c in org_contacts:
+                    if c.get("research_only"):
+                        continue
+                    email = (c.get("email") or "").strip() or "—"
+                    mobile = (
+                        (c.get("mobile") or c.get("phone") or "").strip() or "—"
+                    )
+                    yield (
+                        f"- {c.get('name') or 'Contact'}"
+                        + (f" · {c.get('title')}" if c.get("title") else "")
+                        + f" · `{email}` · 📱 `{mobile}`\n"
+                    )
+                if _stop_now():
+                    yield stopped_message()
+                    break
+
             with_email = [c for c in contacts if (c.get("email") or "").strip()]
+            with_mobile = [
+                c
+                for c in contacts
+                if (c.get("mobile") or c.get("phone") or "").strip()
+            ]
             research_only = [c for c in contacts if c.get("research_only")]
             people = [c for c in contacts if not c.get("research_only")]
             prospect_out = people or contacts
 
-            if people:
-                yield (
-                    f"ZoomInfo returned **{len(people)}** contacts "
-                    f"(**{len(with_email)}** with email).\n\n"
-                )
-                for i, p in enumerate(people[:100], 1):
-                    yield f"{i}. {prospect_to_text(p)}\n"
-                    if p.get("org_focus"):
-                        yield f"   Program fit: {p.get('org_focus')}\n"
-                if len(people) > 100:
-                    yield f"_…and {len(people) - 100} more contacts._\n"
-            else:
-                yield "ZoomInfo had little/no contact coverage for these orgs.\n"
+            yield (
+                f"\n**ZoomInfo summary:** **{len(people)}** contacts · "
+                f"**{len(with_email)}** with email · **{len(with_mobile)}** with mobile"
+            )
             if research_only:
                 yield (
-                    f"\n_{len(research_only)} orgs saved from web research without "
-                    "ZoomInfo people (you can enrich later by LinkedIn/domain)._\n"
+                    f" · _{len(research_only)} orgs without people "
+                    f"(saved for later enrich)_"
                 )
+            yield "\n"
 
             try:
                 auto_ingest_prospects(

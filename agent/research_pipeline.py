@@ -79,6 +79,183 @@ Return JSON:
     return orgs, sources, notes
 
 
+def enrich_one_org_on_zoominfo(
+    org: dict[str, Any],
+    *,
+    contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG,
+    titles: Optional[list[str]] = None,
+    web_email_fallback: bool = True,
+) -> dict[str, Any]:
+    """ZoomInfo lookup for a single NGO: dig for email + mobile per contact.
+
+    Returns {org, contacts, with_email, with_mobile, notes}.
+    """
+    titles = titles or [
+        "Founder",
+        "Co-Founder",
+        "Director",
+        "Managing Director",
+        "CEO",
+        "President",
+        "Secretary",
+        "Trustee",
+        "Program Manager",
+        "Program Director",
+        "Head",
+        "Coordinator",
+    ]
+    name = (org.get("name") or "").strip()
+    website = (org.get("website") or "").strip()
+    domain = _domain_from_url(website)
+    notes: list[str] = []
+    matched: list[dict[str, Any]] = []
+
+    if not name and not domain:
+        return {
+            "org": org,
+            "contacts": [],
+            "with_email": 0,
+            "with_mobile": 0,
+            "notes": ["skipped - no name/domain"],
+        }
+
+    name_variants = _company_name_variants(name)
+
+    # 1) Domain
+    if domain:
+        matched = _zi_search({"company_domains": [domain]}, limit=contacts_per_org)
+        if matched:
+            notes.append(f"ZoomInfo domain hit ({domain})")
+
+    # 2) Company name variants (+ India when location known)
+    if not matched:
+        for variant in name_variants:
+            q: dict[str, Any] = {"company_names": [variant]}
+            if org.get("location"):
+                q["locations"] = ["India"]
+            matched = _zi_search(q, limit=contacts_per_org)
+            if matched:
+                notes.append(f"ZoomInfo company hit ({variant})")
+                break
+
+    # 3) Name + leadership titles
+    if not matched:
+        for variant in name_variants[:3]:
+            matched = _zi_search(
+                {"company_names": [variant], "titles": titles},
+                limit=contacts_per_org,
+            )
+            if matched:
+                notes.append(f"ZoomInfo title hit ({variant})")
+                break
+
+    # Deepen: re-enrich each row to pull email + mobilePhone when missing
+    matched = _deepen_email_and_mobile(matched)
+
+    contacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for r in matched:
+        email = (r.get("email") or "").strip().lower()
+        key = email or f"{r.get('name')}|{r.get('company')}|{r.get('source_id')}"
+        key = key.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        contacts.append(
+            {
+                **r,
+                "org_focus": org.get("focus") or "",
+                "org_website": website,
+                "why_match": org.get("why_match") or "",
+                "company": r.get("company") or name,
+            }
+        )
+
+    # Prefer people with email, then mobile
+    contacts.sort(
+        key=lambda p: (
+            0 if (p.get("email") or "").strip() else 1,
+            0 if (p.get("mobile") or p.get("phone") or "").strip() else 1,
+        )
+    )
+    contacts = contacts[:contacts_per_org]
+
+    with_email = sum(1 for c in contacts if (c.get("email") or "").strip())
+    with_mobile = sum(
+        1 for c in contacts if (c.get("mobile") or c.get("phone") or "").strip()
+    )
+
+    # Per-org public email fallback when ZoomInfo has no email
+    if web_email_fallback and with_email == 0:
+        notes.append("no ZoomInfo email — trying public web contacts")
+        for hit in _web_find_org_emails([org]):
+            email = (hit.get("email") or "").strip().lower()
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            contacts.append(hit)
+            with_email += 1
+
+    if not contacts:
+        notes.append("no ZoomInfo people — saved org stub")
+        contacts.append(
+            {
+                "name": "",
+                "first_name": "",
+                "email": "",
+                "phone": "",
+                "mobile": "",
+                "title": "",
+                "company": name,
+                "linkedin_url": "",
+                "location": org.get("location") or "",
+                "source": "web_research",
+                "source_id": domain or name,
+                "org_focus": org.get("focus") or "",
+                "org_website": website,
+                "why_match": org.get("why_match") or "",
+                "research_only": True,
+            }
+        )
+
+    return {
+        "org": org,
+        "contacts": contacts,
+        "with_email": with_email,
+        "with_mobile": with_mobile,
+        "notes": notes,
+    }
+
+
+def iter_enrich_orgs_on_zoominfo(
+    orgs: list[dict[str, Any]],
+    *,
+    contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG,
+    web_email_fallback: bool = True,
+    cancel_check: Optional[Any] = None,
+):
+    """Yield one NGO at a time after ZoomInfo email/mobile enrichment.
+
+    Each yield: dict with keys type ('org'), index, total, result.
+    """
+    total = len(orgs)
+    for i, org in enumerate(orgs, 1):
+        if callable(cancel_check) and cancel_check():
+            yield {"type": "cancelled", "index": i, "total": total}
+            return
+        result = enrich_one_org_on_zoominfo(
+            org,
+            contacts_per_org=contacts_per_org,
+            web_email_fallback=web_email_fallback,
+        )
+        yield {
+            "type": "org",
+            "index": i,
+            "total": total,
+            "result": result,
+        }
+
+
 def zoominfo_contacts_for_orgs(
     orgs: list[dict[str, Any]],
     *,
@@ -86,125 +263,92 @@ def zoominfo_contacts_for_orgs(
     titles: Optional[list[str]] = None,
     web_email_fallback: bool = True,
 ) -> list[dict[str, Any]]:
-    """Look up each discovered org in ZoomInfo; return normalized contacts."""
-    titles = titles or [
-        "Founder",
-        "Director",
-        "CEO",
-        "President",
-        "Secretary",
-        "Program Manager",
-        "Head",
-    ]
+    """Look up each discovered org in ZoomInfo one-by-one; return contacts."""
     prospects: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    missing_email_orgs: list[dict[str, Any]] = []
-
-    for org in orgs:
-        name = (org.get("name") or "").strip()
-        website = (org.get("website") or "").strip()
-        domain = _domain_from_url(website)
-        if not name and not domain:
+    for event in iter_enrich_orgs_on_zoominfo(
+        orgs,
+        contacts_per_org=contacts_per_org,
+        web_email_fallback=web_email_fallback,
+    ):
+        if event.get("type") != "org":
             continue
-
-        name_variants = _company_name_variants(name)
-        matched: list[dict[str, Any]] = []
-
-        # 1) Domain-only (most precise when ZoomInfo has the website)
-        if domain:
-            matched = _zi_search(
-                {"company_domains": [domain]}, limit=contacts_per_org
-            )
-
-        # 2) Clean company name variants (no titles — broader recall)
-        if not matched:
-            for variant in name_variants:
-                matched = _zi_search(
-                    {
-                        "company_names": [variant],
-                        **({"locations": ["India"]} if org.get("location") else {}),
-                    },
-                    limit=contacts_per_org,
-                )
-                if matched:
-                    break
-
-        # 3) Name + leadership titles
-        if not matched:
-            for variant in name_variants[:2]:
-                matched = _zi_search(
-                    {
-                        "company_names": [variant],
-                        "titles": titles,
-                    },
-                    limit=contacts_per_org,
-                )
-                if matched:
-                    break
-
-        got_email = False
-        for r in matched:
-            email = (r.get("email") or "").strip().lower()
-            key = email or f"{r.get('name')}|{r.get('company')}|{r.get('source_id')}"
-            key = key.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            if email:
-                got_email = True
-            prospects.append(
-                {
-                    **r,
-                    "org_focus": org.get("focus") or "",
-                    "org_website": website,
-                    "why_match": org.get("why_match") or "",
-                    "company": r.get("company") or name,
-                }
-            )
-
-        if not matched or not got_email:
-            missing_email_orgs.append(org)
-            if not matched:
-                stub = {
-                    "name": "",
-                    "first_name": "",
-                    "email": "",
-                    "title": "",
-                    "company": name,
-                    "linkedin_url": "",
-                    "location": org.get("location") or "",
-                    "source": "web_research",
-                    "source_id": domain or name,
-                    "org_focus": org.get("focus") or "",
-                    "org_website": website,
-                    "why_match": org.get("why_match") or "",
-                    "research_only": True,
-                }
-                key = f"org:{name.lower()}"
-                if key not in seen:
-                    seen.add(key)
-                    prospects.append(stub)
-
-    if web_email_fallback and missing_email_orgs:
-        for hit in _web_find_org_emails(missing_email_orgs[:6]):
-            email = (hit.get("email") or "").strip().lower()
-            if not email or email in seen:
-                continue
-            seen.add(email)
-            # Replace research_only stub for same company if present
-            prospects = [
-                p
-                for p in prospects
-                if not (
-                    p.get("research_only")
-                    and (p.get("company") or "").lower()
-                    == (hit.get("company") or "").lower()
-                )
-            ]
-            prospects.append(hit)
-
-    prospects.sort(key=lambda p: (0 if (p.get("email") or "").strip() else 1))
+        result = event.get("result") or {}
+        prospects.extend(result.get("contacts") or [])
+    prospects.sort(
+        key=lambda p: (
+            0 if (p.get("email") or "").strip() else 1,
+            0 if (p.get("mobile") or p.get("phone") or "").strip() else 1,
+        )
+    )
     return prospects
+
+
+def _deepen_email_and_mobile(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-enrich ZoomInfo person IDs when email or mobile is missing."""
+    if not rows:
+        return []
+    try:
+        from connectors.prospects import get_connector
+        from connectors.zoominfo import _row_to_prospect
+
+        zi = get_connector("zoominfo")
+    except Exception as e:
+        print(f"[research] zoominfo connector: {e}", file=sys.stderr)
+        return rows
+
+    need_ids: list[Any] = []
+    for r in rows:
+        pid = r.get("source_id") or r.get("id")
+        if not pid:
+            continue
+        if (r.get("email") or "").strip() and (
+            r.get("mobile") or r.get("phone") or ""
+        ).strip():
+            continue
+        need_ids.append(pid)
+    if not need_ids or not hasattr(zi, "_enrich_by_ids"):
+        return rows
+
+    enriched_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        for i in range(0, len(need_ids), 10):
+            for raw_row in zi._enrich_by_ids(need_ids[i : i + 10]):
+                if not isinstance(raw_row, dict):
+                    continue
+                prospect = _row_to_prospect(raw_row)
+                pid = str(
+                    prospect.get("source_id")
+                    or prospect.get("id")
+                    or raw_row.get("personId")
+                    or raw_row.get("id")
+                    or ""
+                )
+                if pid:
+                    enriched_by_id[pid] = prospect
+    except Exception as e:
+        print(f"[research] deepen enrich error: {e}", file=sys.stderr)
+        return rows
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        pid = str(r.get("source_id") or r.get("id") or "")
+        enr = enriched_by_id.get(pid)
+        if not enr:
+            out.append(r)
+            continue
+        merged = {**r}
+        if (enr.get("email") or "").strip():
+            merged["email"] = enr.get("email")
+        if (enr.get("mobile") or "").strip():
+            merged["mobile"] = enr.get("mobile")
+        if (enr.get("phone") or "").strip():
+            merged["phone"] = enr.get("phone")
+        if (enr.get("linkedin_url") or "").strip() and not (
+            merged.get("linkedin_url") or ""
+        ).strip():
+            merged["linkedin_url"] = enr.get("linkedin_url")
+        out.append(merged)
+    return out
 
 
 def _web_find_org_emails(orgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -215,32 +359,33 @@ def _web_find_org_emails(orgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         f"- {o.get('name')} | {o.get('website') or ''} | {o.get('location') or ''}"
         for o in orgs
     )
-    prompt = f"""Find publicly listed contact or partnership emails for these NGOs/orgs.
+    prompt = f"""Find publicly listed contact or partnership emails AND phone/mobile numbers for these NGOs/orgs.
 Prefer info@, contact@, partnerships@, or named founder/director emails from official sites.
+Also note any published mobile/phone numbers for the same contacts.
 
 Organizations:
 {listing}
 
-Return a short note with org name and email only when you are confident.
+Return a short note with org name, email, and phone/mobile only when you are confident.
 """
     notes, _sources = grounded_collect(
         prompt,
         system=(
-            "Find public contact emails for nonprofits. "
-            "Do not invent emails. If unsure, omit."
+            "Find public contact emails and phones for nonprofits. "
+            "Do not invent emails or phone numbers. If unsure, omit."
         ),
     )
     raw = extract_json(
-        f"""Extract emails from these notes.
+        f"""Extract contacts from these notes.
 
 Notes:
 {notes[:8000]}
 
 Return JSON:
-{{"contacts":[{{"company":"Org","name":"Person or empty","email":"a@b.org","title":"role or empty"}}]}}
-Only include addresses that appear in the notes.
+{{"contacts":[{{"company":"Org","name":"Person or empty","email":"a@b.org","title":"role or empty","phone":"","mobile":""}}]}}
+Only include emails/phones that appear in the notes.
 """,
-        system="Return JSON only. Never invent email addresses.",
+        system="Return JSON only. Never invent email addresses or phone numbers.",
         max_tokens=1200,
     )
     try:
@@ -253,11 +398,14 @@ Only include addresses that appear in the notes.
         if not isinstance(row, dict):
             continue
         email = (row.get("email") or "").strip()
-        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        phone = (row.get("phone") or "").strip()
+        mobile = (row.get("mobile") or "").strip()
+        if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            continue
+        if not email and not (phone or mobile):
             continue
         company = (row.get("company") or "").strip()
         org = by_name.get(company.lower()) or {}
-        # fuzzy company match
         if not org:
             for n, o in by_name.items():
                 if n and (n in company.lower() or company.lower() in n):
@@ -271,12 +419,14 @@ Only include addresses that appear in the notes.
                 "name": name or company,
                 "first_name": first if name else "",
                 "email": email,
+                "phone": phone or mobile,
+                "mobile": mobile or phone,
                 "title": (row.get("title") or "Partnerships").strip(),
                 "company": company or org.get("name") or "",
                 "linkedin_url": "",
                 "location": org.get("location") or "",
                 "source": "web_email",
-                "source_id": email.lower(),
+                "source_id": (email or f"{company}:{mobile or phone}").lower(),
                 "org_focus": org.get("focus") or "",
                 "org_website": org.get("website") or "",
                 "why_match": org.get("why_match") or "",
@@ -327,7 +477,7 @@ def run_research_then_zoom(
     org_limit: int = DEFAULT_ORGS,
     contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG,
 ) -> dict[str, Any]:
-    """Full pipeline: web org discovery → ZoomInfo contact enrichment."""
+    """Full pipeline: web org discovery → ZoomInfo contact enrichment (one org at a time)."""
     orgs, sources, notes = discover_orgs_from_web(user_msg, limit=org_limit)
     contacts = zoominfo_contacts_for_orgs(orgs, contacts_per_org=contacts_per_org)
     return {
