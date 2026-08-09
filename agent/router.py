@@ -809,7 +809,7 @@ def _deliver_job(
     }
     if do_send:
         return send_email(**kwargs), True
-    return create_draft(**kwargs), False
+    return create_draft(**kwargs, track=True), False
 
 
 def _attach_note(
@@ -1337,7 +1337,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         yield f"- Failed {job.get('recipient_email')}: {e}\n"
                 yield (
                     f"\nDone: **{ok_n}** "
-                    f"{'emails sent' if want_send else 'new Gmail drafts created for review'}.\n"
+                    f"{'emails sent' if want_send else 'new tracked Gmail drafts created for review'}.\n"
                 )
                 if chat_attachments and not email_atts:
                     yield (
@@ -1847,7 +1847,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         + "\n"
                     )
                 if not want_send:
-                    yield "\nOpen Gmail → Drafts to review, then send.\n"
+                    yield (
+                        "\nOpen Gmail → Drafts to review, then send. "
+                        "Open/click tracking is already embedded "
+                        "(visible in 📬 Tracking after send).\n"
+                    )
                 for r in fail[:10]:
                     yield f"- Failed: {r.get('error')}\n"
 

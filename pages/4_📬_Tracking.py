@@ -17,6 +17,10 @@ if not require_login():
 logout_button()
 
 st.title("📬 Tracking")
+st.caption(
+    "Opens/clicks work for emails Relay sends **and** for Relay drafts you send later from Gmail "
+    "(tracking is embedded when the draft is created)."
+)
 
 
 def _apps_post(payload: dict) -> dict:

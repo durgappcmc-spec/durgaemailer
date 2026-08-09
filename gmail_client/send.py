@@ -232,15 +232,22 @@ def create_draft(
     recipient_name: Optional[str] = None,
     attachments: Optional[list[dict[str, Any]]] = None,
     *,
-    track: bool = False,
+    track: bool = True,
     campaign: Optional[str] = None,
     source: Optional[str] = None,
     from_email: Optional[str] = None,
     cc: Optional[str | list[str]] = None,
     include_signature: bool = True,
 ) -> dict[str, Any]:
-    """Create a new Gmail draft for review (does not send)."""
+    """Create a new Gmail draft for review.
+
+    Tracking is ON by default so open/click pixels survive when you send
+    the draft from Gmail later.
+    """
     from_addr = from_email or default_from_email()
+    src = (source or "relay_draft").strip() or "relay_draft"
+    if track and "draft" not in src.lower():
+        src = f"{src}_draft"
     raw, tracking_id = _build_raw_message(
         to,
         subject,
@@ -249,7 +256,7 @@ def create_draft(
         attachments=attachments,
         instrument=track,
         campaign=campaign,
-        source=source,
+        source=src,
         from_email=from_addr,
         cc=cc,
         include_signature=include_signature,
@@ -268,6 +275,7 @@ def create_draft(
             "message_id": message.get("id"),
             "thread_id": message.get("threadId"),
             "tracking_id": tracking_id,
+            "tracked": bool(track and tracking_id),
             "from": from_addr,
             "to": to,
             "cc": _normalize_cc(cc),
@@ -278,6 +286,7 @@ def create_draft(
         return {
             "error": str(e),
             "tracking_id": tracking_id,
+            "tracked": False,
             "from": from_addr,
             "to": to,
             "cc": _normalize_cc(cc),
@@ -288,9 +297,9 @@ def create_draft(
 def create_drafts(
     jobs: list[dict[str, Any]],
     *,
-    track: bool = False,
+    track: bool = True,
 ) -> list[dict[str, Any]]:
-    """Create many Gmail drafts. Each job: to/recipient_email, subject, html_body, …"""
+    """Create many Gmail drafts (tracked by default for post-send analytics)."""
     results: list[dict[str, Any]] = []
     for job in jobs:
         to = (job.get("to") or job.get("recipient_email") or "").strip()
@@ -304,7 +313,7 @@ def create_drafts(
                 html_body=job.get("html_body") or job.get("body") or "<p></p>",
                 recipient_name=job.get("recipient_name") or job.get("name"),
                 attachments=job.get("attachments"),
-                track=track,
+                track=job.get("track", track),
                 campaign=job.get("campaign"),
                 source=job.get("source") or "chat_draft_batch",
                 from_email=job.get("from_email") or job.get("from"),

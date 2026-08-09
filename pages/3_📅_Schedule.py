@@ -64,7 +64,7 @@ with tab_send:
         if send_now:
             st.json(send_email(**kwargs, source="ui_send"))
         else:
-            st.json(create_draft(**kwargs, source="ui_draft", track=False))
+            st.json(create_draft(**kwargs, source="ui_draft", track=True))
 
 with tab_single:
     to = st.text_input("To (email)", key="single_to")

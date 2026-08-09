@@ -46,7 +46,7 @@ def instrument_html(
             a["href"] = f"{base}/t/c/{link_id}"
 
     instrumented = str(soup)
-    if track_opens and base:
+    if track_opens and base and f"{base}/t/o/" not in instrumented:
         pixel = (
             f'<img src="{base}/t/o/{email_id}.gif" width="1" height="1" '
             f'alt="" style="display:block;border:0;">'
@@ -67,6 +67,7 @@ def instrument_html(
             "subject": subject or "",
             "campaign": campaign or "",
             "prospect_source": prospect_source or "",
+            "source": prospect_source or "",
             "links": links,
         }
         try:

@@ -111,7 +111,39 @@ function handleRegister(body) {
     });
     sh.getRange(sh.getLastRow() + 1, 1, rows.length, 4).setValues(rows);
   }
-  // Also seed a Sends stub so Contact Lookup works even if scheduled path differs
+  // Seed Sends so opens/clicks from Relay drafts (sent later in Gmail) join in Tracking
+  if (body.email_id && body.recipient_email) {
+    const sends = ss.getSheetByName(SENDS_SHEET);
+    const data = sends.getDataRange().getValues();
+    const headers = data[0] || [];
+    const iEid = headers.indexOf("email_id");
+    let exists = false;
+    if (iEid >= 0) {
+      for (let r = 1; r < data.length; r++) {
+        if (String(data[r][iEid]) === String(body.email_id)) {
+          exists = true;
+          break;
+        }
+      }
+    }
+    if (!exists) {
+      const src =
+        body.source ||
+        body.prospect_source ||
+        "relay_draft";
+      sends.appendRow([
+        new Date().toISOString(),
+        body.email_id,
+        body.recipient_email || "",
+        body.recipient_name || "",
+        body.subject || "",
+        body.campaign || "",
+        src,
+        "",
+        "",
+      ]);
+    }
+  }
   return { ok: true, email_id: body.email_id, links: links.length };
 }
 
