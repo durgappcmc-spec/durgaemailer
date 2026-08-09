@@ -29,7 +29,12 @@ def normalize(raw: dict[str, Any], source: str = "", source_id: str = "") -> dic
         "first_name": first,
         "last_name": last,
         "email": raw.get("email") or raw.get("email_address") or "",
-        "phone": raw.get("phone") or raw.get("phone_number") or raw.get("mobile_phone") or "",
+        "phone": raw.get("phone")
+        or raw.get("phone_number")
+        or raw.get("mobile_phone")
+        or raw.get("mobile")
+        or "",
+        "mobile": raw.get("mobile") or raw.get("mobile_phone") or raw.get("mobilePhone") or "",
         "title": raw.get("title") or raw.get("job_title") or raw.get("jobTitle") or "",
         "company": raw.get("company") or raw.get("organization_name") or raw.get("companyName") or "",
         "linkedin_url": raw.get("linkedin_url") or raw.get("linkedinUrl") or raw.get("linkedin") or "",

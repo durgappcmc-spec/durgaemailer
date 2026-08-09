@@ -106,6 +106,9 @@ _TEMPLATE_KEYS = (
     "org_focus",
     "org_website",
     "why_match",
+    "phone",
+    "mobile",
+    "linkedin_url",
 )
 # User wants a file used as general chat/research context
 _CONTEXT_FILE_RE = re.compile(
@@ -187,6 +190,9 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
         "org_focus": str(prospect.get("org_focus") or ""),
         "org_website": str(prospect.get("org_website") or ""),
         "why_match": str(prospect.get("why_match") or ""),
+        "phone": str(prospect.get("phone") or ""),
+        "mobile": str(prospect.get("mobile") or prospect.get("phone") or ""),
+        "linkedin_url": str(prospect.get("linkedin_url") or ""),
     }
     out = text
     for key in _TEMPLATE_KEYS:

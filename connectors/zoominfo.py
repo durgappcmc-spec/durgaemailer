@@ -31,6 +31,14 @@ class ZoomInfoConnector(ProspectConnector):
         "email",
         "jobTitle",
         "companyName",
+        "phone",
+        "mobilePhone",
+        "externalUrls",
+        "city",
+        "state",
+        "country",
+        "street",
+        "zipCode",
     ]
 
     def __init__(self) -> None:
@@ -587,21 +595,67 @@ def _company_name(row: dict[str, Any]) -> str:
     return ""
 
 
+def _linkedin_from_row(row: dict[str, Any]) -> str:
+    """ZoomInfo often returns LinkedIn under externalUrls, not linkedinUrl."""
+    direct = (
+        row.get("linkedinUrl")
+        or row.get("linkedInUrl")
+        or row.get("linkedin_url")
+        or ""
+    )
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    urls = row.get("externalUrls") or row.get("externalUrl") or []
+    if isinstance(urls, dict):
+        urls = [urls]
+    if isinstance(urls, list):
+        for item in urls:
+            if not isinstance(item, dict):
+                continue
+            typ = str(item.get("type") or "").lower()
+            url = str(item.get("url") or "").strip()
+            if "linkedin" in typ or "linkedin.com" in url.lower():
+                return url
+    return ""
+
+
+def _phone_from_row(row: dict[str, Any]) -> tuple[str, str]:
+    """Return (phone, mobile) preferring non-empty values."""
+    phone = str(row.get("phone") or row.get("directPhone") or "").strip()
+    mobile = str(row.get("mobilePhone") or row.get("mobile") or "").strip()
+    return phone, mobile
+
+
 def _row_to_prospect(row: dict[str, Any]) -> dict[str, Any]:
+    phone, mobile = _phone_from_row(row)
+    linkedin = _linkedin_from_row(row)
+    street = str(row.get("street") or "").strip()
+    location = ", ".join(
+        filter(
+            None,
+            [
+                street,
+                row.get("city"),
+                row.get("state"),
+                row.get("zipCode"),
+                row.get("country"),
+            ],
+        )
+    )
     raw = {
         "id": row.get("id") or row.get("personId"),
         "first_name": row.get("firstName"),
         "last_name": row.get("lastName"),
         "email": row.get("email"),
-        "phone": row.get("phone"),
+        "phone": phone or mobile,
+        "mobile": mobile,
         "title": row.get("jobTitle"),
         "company": _company_name(row),
-        "linkedin_url": row.get("linkedinUrl"),
-        "location": ", ".join(
-            filter(None, [row.get("city"), row.get("state"), row.get("country")])
-        ),
+        "linkedin_url": linkedin,
+        "location": location,
         "seniority": row.get("managementLevel"),
         "department": row.get("department"),
+        "external_urls": row.get("externalUrls") or [],
     }
     return normalize(raw, source="zoominfo", source_id=str(raw.get("id") or ""))
 
