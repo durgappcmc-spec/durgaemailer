@@ -5,8 +5,13 @@ import streamlit as st
 
 from config import APP_NAME
 from core import memory
+from core.auth_ui import logout_button, require_login
 
 st.set_page_config(page_title=f"Memory · {APP_NAME}", page_icon="🧠", layout="wide")
+if not require_login():
+    st.stop()
+logout_button()
+
 st.title("🧠 Memory")
 
 q = st.text_input("Search memory")

@@ -43,6 +43,21 @@ def schedule_email(
         send_at_iso = send_at.isoformat()
     else:
         send_at_iso = str(send_at)
+    safe_attachments: list[dict[str, Any]] = []
+    for att in attachments or []:
+        item: dict[str, Any] = {
+            "name": att.get("name") or "file",
+            "mimeType": att.get("mimeType") or att.get("mime_type") or "application/octet-stream",
+        }
+        if att.get("driveFileId"):
+            item["driveFileId"] = att["driveFileId"]
+        if att.get("data_base64"):
+            item["data_base64"] = att["data_base64"]
+        elif isinstance(att.get("data"), (bytes, bytearray)):
+            import base64
+
+            item["data_base64"] = base64.b64encode(bytes(att["data"])).decode("ascii")
+        safe_attachments.append(item)
     return _post(
         {
             "action": "schedule",
@@ -53,19 +68,39 @@ def schedule_email(
             "send_at": send_at_iso,
             "campaign": campaign or "",
             "source": source or "",
-            "attachments": attachments or [],
+            "attachments": safe_attachments,
         }
     )
 
 
 def schedule_batch(jobs: list[dict[str, Any]]) -> dict[str, Any]:
     """Schedule multiple emails. Each job matches schedule_email kwargs."""
+    import base64
+
     normalized = []
     for job in jobs:
         send_at = job.get("send_at")
         if isinstance(send_at, datetime):
             send_at = send_at.isoformat()
-        normalized.append({**job, "send_at": send_at})
+        safe_atts: list[dict[str, Any]] = []
+        for att in job.get("attachments") or []:
+            item: dict[str, Any] = {
+                "name": att.get("name") or "file",
+                "mimeType": att.get("mimeType")
+                or att.get("mime_type")
+                or "application/octet-stream",
+            }
+            if att.get("driveFileId"):
+                item["driveFileId"] = att["driveFileId"]
+            if att.get("data_base64"):
+                item["data_base64"] = att["data_base64"]
+            elif isinstance(att.get("data"), (bytes, bytearray)):
+                item["data_base64"] = base64.b64encode(bytes(att["data"])).decode(
+                    "ascii"
+                )
+            safe_atts.append(item)
+        row = {**job, "send_at": send_at, "attachments": safe_atts}
+        normalized.append(row)
     return _post({"action": "schedule", "jobs": normalized})
 
 

@@ -143,4 +143,31 @@ def create_draft(
         }
     except Exception as e:
         print(f"[gmail] create_draft error: {e}", file=sys.stderr)
-        return {"error": str(e), "tracking_id": tracking_id}
+        return {"error": str(e), "tracking_id": tracking_id, "to": to, "subject": subject}
+
+
+def create_drafts(
+    jobs: list[dict[str, Any]],
+    *,
+    track: bool = False,
+) -> list[dict[str, Any]]:
+    """Create many Gmail drafts. Each job: to/recipient_email, subject, html_body, …"""
+    results: list[dict[str, Any]] = []
+    for job in jobs:
+        to = (job.get("to") or job.get("recipient_email") or "").strip()
+        if not to:
+            results.append({"error": "missing recipient_email", "job": job})
+            continue
+        results.append(
+            create_draft(
+                to=to,
+                subject=job.get("subject") or "(no subject)",
+                html_body=job.get("html_body") or job.get("body") or "<p></p>",
+                recipient_name=job.get("recipient_name") or job.get("name"),
+                attachments=job.get("attachments"),
+                track=track,
+                campaign=job.get("campaign"),
+                source=job.get("source") or "chat_draft_batch",
+            )
+        )
+    return results

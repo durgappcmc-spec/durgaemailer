@@ -368,6 +368,14 @@ function sendOneEmail(job) {
       if (a && a.driveFileId) {
         const file = DriveApp.getFileById(a.driveFileId);
         attachments.push(file.getBlob().setName(a.name || file.getName()));
+      } else if (a && a.data_base64) {
+        const bytes = Utilities.base64Decode(a.data_base64);
+        const blob = Utilities.newBlob(
+          bytes,
+          a.mimeType || a.mime_type || "application/octet-stream",
+          a.name || "attachment"
+        );
+        attachments.push(blob);
       }
     });
   } catch (e) {

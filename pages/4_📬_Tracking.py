@@ -9,8 +9,13 @@ import requests
 import streamlit as st
 
 from config import APP_NAME, settings
+from core.auth_ui import logout_button, require_login
 
 st.set_page_config(page_title=f"Tracking · {APP_NAME}", page_icon="📬", layout="wide")
+if not require_login():
+    st.stop()
+logout_button()
+
 st.title("📬 Tracking")
 
 

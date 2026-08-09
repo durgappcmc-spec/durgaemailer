@@ -4,10 +4,15 @@ from __future__ import annotations
 import streamlit as st
 
 from config import APP_NAME
+from core.auth_ui import logout_button, require_login
 from connectors.ingest_to_memory import ingest_prospects, prospects_to_dataframe
 from connectors.prospects import enrich_fallthrough, search_all
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
+if not require_login():
+    st.stop()
+logout_button()
+
 st.title("🎯 Prospects")
 
 tab_search, tab_enrich = st.tabs(["Search", "Enrich"])
