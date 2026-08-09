@@ -8,6 +8,7 @@ __pycache__/
 data/
 credentials/gmail_token.json
 credentials/*.json
+credentials/zoominfo.txt
 !credentials/.gitkeep
 .streamlit/secrets.toml
 node_modules/

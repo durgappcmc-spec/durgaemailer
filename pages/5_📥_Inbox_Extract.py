@@ -1,14 +1,12 @@
 # NOTE: Extraction uses Gemini JSON mode; large AI batches burn quota quickly.
 from __future__ import annotations
 
-import json
-
 import pandas as pd
 import streamlit as st
 
 from config import APP_NAME
-from core import memory
 from core.auth_ui import logout_button, require_login
+from core.auto_sync import ingest_mailbox_messages
 from gmail_client.extract import extract_batch, extract_inbox_and_sent
 
 st.set_page_config(page_title=f"Inbox Extract · {APP_NAME}", page_icon="📥", layout="wide")
@@ -17,6 +15,10 @@ if not require_login():
 logout_button()
 
 st.title("📥 Inbox & Sent Extract")
+st.caption(
+    "Gmail auto-syncs on Home/Chat open and saves emails + contacts to memory. "
+    "Use this page for a deeper/manual pull (custom query or AI extract)."
+)
 
 mode = st.radio(
     "Source",
@@ -86,16 +88,8 @@ if results:
         "text/csv",
     )
     if st.button("💾 Save all to memory"):
-        for r in results:
-            text = json.dumps(r, default=str)
-            memory.add(
-                texts=text,
-                source="gmail_extract",
-                source_id=r.get("message_id"),
-                title=r.get("subject") or "email",
-                metadata={
-                    "from": r.get("from") or "",
-                    "mailbox": r.get("mailbox") or "",
-                },
-            )
-        st.success(f"Saved {len(results)} emails to memory.")
+        counts = ingest_mailbox_messages(results)
+        st.success(
+            f"Saved {counts.get('emails', 0)} emails + "
+            f"{counts.get('contacts', 0)} contacts to memory."
+        )

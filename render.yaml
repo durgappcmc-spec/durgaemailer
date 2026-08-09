@@ -12,6 +12,16 @@ services:
         value: gemini-3.6-flash
       - key: TRACKING_BASE_URL
         value: https://durgaemailer-tracking.netlify.app
+      - key: AUTO_SYNC_GMAIL
+        value: "true"
+      - key: AUTO_INGEST_PROSPECTS
+        value: "true"
+      - key: AUTO_SYNC_INTERVAL_MINUTES
+        value: "30"
+      - key: AUTO_SYNC_GMAIL_DAYS
+        value: "30"
+      - key: AUTO_SYNC_MAX_PER
+        value: "75"
       - key: GEMINI_API_KEY
         sync: false
       - key: GOOGLE_SHEET_ID
@@ -25,4 +35,10 @@ services:
       - key: APP_USERNAME
         sync: false
       - key: APP_PASSWORD
+        sync: false
+      - key: ZOOMINFO_USERNAME
+        sync: false
+      - key: ZOOMINFO_PASSWORD
+        sync: false
+      - key: ZOOMINFO_CLIENT_ID
         sync: false

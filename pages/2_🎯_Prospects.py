@@ -4,16 +4,19 @@ from __future__ import annotations
 import streamlit as st
 
 from config import APP_NAME
-from core.auth_ui import logout_button, require_login
 from connectors.ingest_to_memory import ingest_prospects, prospects_to_dataframe
 from connectors.prospects import enrich_fallthrough, search_all
+from core.auth_ui import logout_button, require_login
+from core.auto_sync import auto_ingest_prospects, ensure_session_sync
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
 if not require_login():
     st.stop()
 logout_button()
+ensure_session_sync(st.session_state)
 
 st.title("🎯 Prospects")
+st.caption("Search results auto-save to memory. ZoomInfo is the default provider.")
 
 tab_search, tab_enrich = st.tabs(["Search", "Enrich"])
 
@@ -28,8 +31,8 @@ with tab_search:
         keywords = c2.text_input("Keywords", "")
         providers = st.multiselect(
             "Providers",
-            ["apollo", "rocketreach", "zoominfo"],
-            default=["apollo", "rocketreach"],
+            ["zoominfo", "apollo", "rocketreach"],
+            default=["zoominfo"],
         )
         limit = st.slider("Limit per provider", 5, 50, 10)
         submitted = st.form_submit_button("🔍 Search")
@@ -44,16 +47,21 @@ with tab_search:
             "keywords": keywords,
         }
         with st.spinner("Searching providers…"):
-            results = search_all(query, providers=providers or ["apollo"], limit_per_provider=limit)
+            results = search_all(
+                query, providers=providers or ["zoominfo"], limit_per_provider=limit
+            )
         st.session_state.last_prospects = results
-        st.success(f"Got {len(results)} rows (including any error stubs).")
+        saved = auto_ingest_prospects([p for p in results if not p.get("error")])
+        st.success(
+            f"Got {len(results)} rows. Auto-saved **{len(saved)}** contacts to memory."
+        )
 
     prospects = st.session_state.get("last_prospects") or []
     if prospects:
         df = prospects_to_dataframe(prospects)
         st.dataframe(df, use_container_width=True)
         b1, b2, b3 = st.columns(3)
-        if b1.button("💾 Save to memory"):
+        if b1.button("💾 Re-save to memory"):
             ids = ingest_prospects(prospects)
             st.success(f"Saved {len(ids)} docs to memory.")
         csv = df.to_csv(index=False).encode("utf-8")
@@ -93,8 +101,8 @@ with tab_enrich:
             result = enrich_fallthrough(ident, order=order or ["rocketreach", "apollo"])
         st.session_state.last_enrich = result
         st.json(result)
-        if st.button("Save this to memory") and result and not result.get("error"):
-            ingest_prospects([result])
-            st.success("Saved.")
+        if result and not result.get("error"):
+            auto_ingest_prospects([result])
+            st.caption("Auto-saved enriched contact to memory.")
     elif st.session_state.get("last_enrich"):
         st.json(st.session_state.last_enrich)

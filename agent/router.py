@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Generator, Optional
 
 from connectors.ingest_to_memory import prospect_to_text
+from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from connectors.prospects import enrich_fallthrough, search_all
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json
@@ -37,7 +38,11 @@ SCHEDULE_EMAIL:<compact-json>
 Rules:
 - CHAT: general questions, research, writing help — Gemini will use Google Search.
 - MEMORY: user asks about saved notes/prospects already in memory.
-- PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords (comma strings or arrays).
+- PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
+  Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
+  PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":20}
+- After a prospect search, if the user asks to email/draft/send to that list / all of them / these prospects,
+  use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
 - GMAIL_EXTRACT: read / list / filter the user's Gmail inbox and/or sent mail.
   After the colon put a Gmail search query (NOT prose).
@@ -660,6 +665,7 @@ def answer(
     att_names = _attachment_names(chat_attachments)
     consumed_attachments = False
     mailbox_out: list[dict[str, Any]] = []
+    prospect_out: list[dict[str, Any]] = []
 
     routing = route(_route_user_msg(user_msg, chat_attachments), history)
     sources: list[dict[str, Any]] = []
@@ -743,16 +749,56 @@ def answer(
             q = _parse_json_tail(routing, "PROSPECT_SEARCH:")
             if not q:
                 q = {"keywords": user_msg}
-            results = search_all(q, providers=("apollo", "rocketreach", "zoominfo"))
-            ctx_lines = []
-            for i, p in enumerate(results[:20], 1):
-                if p.get("error"):
-                    ctx_lines.append(f"{i}. ERROR [{p.get('source')}]: {p.get('error')}")
+            # Provider selection: ZoomInfo-first by default; honor explicit providers
+            providers = q.pop("providers", None) or q.pop("provider", None)
+            if isinstance(providers, str):
+                providers = [providers]
+            if not providers:
+                if re.search(r"\bzoom\s*info\b|\bzi\b", user_msg or "", re.I):
+                    providers = ("zoominfo",)
                 else:
-                    ctx_lines.append(f"{i}. {prospect_to_text(p)}")
+                    providers = ("zoominfo", "apollo", "rocketreach")
+            limit = int(q.pop("limit", None) or q.pop("limit_per_provider", None) or 15)
+            yield f"Searching **{', '.join(providers)}**…\n"
+            results = search_all(
+                q, providers=tuple(providers), limit_per_provider=limit
+            )
+            ok = [p for p in results if not p.get("error")]
+            errs = [p for p in results if p.get("error")]
+            prospect_out = ok
+            saved_ids: list[str] = []
+            if ok:
+                try:
+                    saved_ids = auto_ingest_prospects(ok)
+                except Exception as e:
+                    print(f"[router] auto-ingest prospects error: {e}", file=sys.stderr)
+            ctx_lines = []
+            for i, p in enumerate(ok[:25], 1):
+                ctx_lines.append(f"{i}. {prospect_to_text(p)}")
+            for e in errs[:5]:
+                ctx_lines.append(f"ERROR [{e.get('source')}]: {e.get('error')}")
+            if not ok:
+                yield (
+                    "No prospects returned. "
+                    + (f"Errors: {errs}" if errs else "Try a clearer title/company.")
+                )
+            else:
+                with_email = sum(1 for p in ok if (p.get("email") or "").strip())
+                yield (
+                    f"Found **{len(ok)}** contacts "
+                    f"(**{with_email}** with email) via {', '.join(providers)}.\n\n"
+                )
+                yield "\n".join(ctx_lines[:20])
+                if saved_ids:
+                    yield f"\n\nAuto-saved **{len(saved_ids)}** contacts to memory."
+                yield (
+                    "\n\nNext: `draft emails to all these prospects` or "
+                    "`send personalized emails to this ZoomInfo list`."
+                )
             system = (
                 "Summarize these prospect search results for the user. "
-                "Highlight emails when present, note gaps, suggest next enrich steps.\n\n"
+                "Highlight emails when present. If emails exist, remind them they can "
+                "bulk draft/send personalized emails to this list.\n\n"
                 + "\n\n".join(ctx_lines)
             )
             if used_docs:
@@ -769,7 +815,8 @@ def answer(
                     "title": "prospect_search",
                     "url": "",
                     "type": "prospects",
-                    "count": len(results),
+                    "count": len(ok),
+                    "providers": list(providers),
                 }
             )
 
@@ -834,6 +881,14 @@ def answer(
             else:
                 yield f"Found **{len(batch)}** messages:\n\n"
                 yield _format_mailbox_digest(batch)
+                try:
+                    counts = ingest_mailbox_messages(batch)
+                    yield (
+                        f"\n\nAuto-saved **{counts.get('emails', 0)}** emails + "
+                        f"**{counts.get('contacts', 0)}** contacts to memory."
+                    )
+                except Exception as e:
+                    print(f"[router] mailbox auto-ingest error: {e}", file=sys.stderr)
                 yield (
                     "\n\nNext: ask me to **draft personalized follow-ups** to these "
                     "(optionally filtered), e.g. "
@@ -864,6 +919,14 @@ def answer(
                 re.I,
             ):
                 seed = {**seed, "batch": True, "from_mailbox": True}
+            # Bulk to last ZoomInfo / prospect search
+            if prospects and re.search(
+                r"\b(these prospects|this list|all (these |the )?prospects|"
+                r"zoominfo list|everyone (we |you )?found|all of them)\b",
+                user_msg or "",
+                re.I,
+            ):
+                seed = {**seed, "batch": True, "from_prospects": True}
             payload = _extract_email_job(
                 user_msg,
                 history=history,
@@ -1097,5 +1160,6 @@ def answer(
             "consumed_attachments": consumed_attachments,
             "need_file": need_file,
             "mailbox_messages": mailbox_out or None,
+            "prospects": prospect_out or None,
         }
     }

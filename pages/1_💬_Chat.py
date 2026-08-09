@@ -7,6 +7,7 @@ import streamlit as st
 from agent.router import answer
 from config import APP_NAME
 from core.auth_ui import logout_button, require_login
+from core.auto_sync import ensure_session_sync
 from gmail_client.attachments import files_to_attachments
 
 st.set_page_config(page_title=f"Chat · {APP_NAME}", page_icon="💬", layout="wide")
@@ -14,11 +15,14 @@ if not require_login():
     st.stop()
 logout_button()
 
+sync = ensure_session_sync(st.session_state)
+
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file context/attach. "
-    "Try: `show my inbox last 7 days`, `show sent about sponsor`, "
-    "then `draft personalized follow-ups to everyone in this list`."
+    "ZoomInfo search: `find CEOs at Microsoft on ZoomInfo`. "
+    "Then: `draft personalized emails to all these prospects`. "
+    "Gmail + contacts auto-sync to memory on open."
 )
 
 if "messages" not in st.session_state:
@@ -34,8 +38,18 @@ if "last_mailbox" not in st.session_state:
 
 staged = st.session_state.staged_attachments or []
 mailbox_n = len(st.session_state.get("last_mailbox") or [])
-if mailbox_n:
+if sync.get("ok"):
+    st.caption(
+        f"Auto-synced **{sync.get('messages', 0)}** emails "
+        f"({sync.get('contacts', 0)} contacts) into memory."
+    )
+elif mailbox_n:
     st.caption(f"Mailbox context loaded: **{mailbox_n}** messages (for filters / follow-ups).")
+elif sync.get("skipped") and sync.get("messages"):
+    st.caption(
+        f"Mailbox memory ready: **{sync.get('messages', 0)}** msgs / "
+        f"**{sync.get('contacts', 0)}** contacts."
+    )
 if st.session_state.get("need_file"):
     st.info(
         "Upload a file with the **paperclip** on the chat box, then send your "
@@ -163,6 +177,15 @@ if prompt:
         if meta.get("mailbox_messages"):
             st.session_state.last_mailbox = meta["mailbox_messages"]
             st.caption(f"Saved {len(meta['mailbox_messages'])} mailbox rows for follow-ups.")
+        if meta.get("prospects"):
+            st.session_state.last_prospects = meta["prospects"]
+            with_email = sum(
+                1 for p in meta["prospects"] if (p.get("email") or "").strip()
+            )
+            st.caption(
+                f"Saved {len(meta['prospects'])} prospects "
+                f"({with_email} with email) for bulk draft/send."
+            )
 
         sources = meta.get("sources") or []
         if sources:

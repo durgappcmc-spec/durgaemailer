@@ -1,16 +1,22 @@
 # NOTE: Embedding model downloads on first use (~80MB all-MiniLM-L6-v2).
-# Cloud deploy may omit chromadb; memory then becomes a no-op.
+# Cloud deploy may omit chromadb; memory then falls back to a JSONL store.
 from __future__ import annotations
 
+import json
+import re
 import sys
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
-from config import settings
+from config import _DATA, settings
 
 _client = None
 _collection = None
 _DISABLED = False
+_FALLBACK_PATH = Path(settings.CHROMA_DIR).parent / "memory_fallback.jsonl"
+if not str(_FALLBACK_PATH).startswith(str(_DATA)):
+    _FALLBACK_PATH = _DATA / "memory_fallback.jsonl"
 
 
 def _get_collection():
@@ -33,9 +39,89 @@ def _get_collection():
         )
         return _collection
     except Exception as e:
-        print(f"[memory] disabled ({e})", file=sys.stderr)
+        print(f"[memory] chroma unavailable, using file fallback ({e})", file=sys.stderr)
         _DISABLED = True
         return None
+
+
+def _fallback_upsert(
+    ids: list[str],
+    texts: list[str],
+    metadatas: list[dict[str, Any]],
+) -> None:
+    existing: dict[str, dict[str, Any]] = {}
+    try:
+        if _FALLBACK_PATH.exists():
+            for line in _FALLBACK_PATH.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    existing[str(row.get("id"))] = row
+                except Exception:
+                    continue
+    except Exception:
+        existing = {}
+    for i, doc_id in enumerate(ids):
+        existing[doc_id] = {
+            "id": doc_id,
+            "text": texts[i],
+            "metadata": metadatas[i],
+        }
+    try:
+        _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
+            for row in existing.values():
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[memory] fallback write error: {e}", file=sys.stderr)
+
+
+def _fallback_search(
+    query: str,
+    k: int = 5,
+    source: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        if not _FALLBACK_PATH.exists():
+            return []
+        for line in _FALLBACK_PATH.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[memory] fallback read error: {e}", file=sys.stderr)
+        return []
+
+    terms = [t for t in re.split(r"\s+", (query or "").lower()) if t]
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        meta = row.get("metadata") or {}
+        if source and source != "all" and meta.get("source") != source:
+            continue
+        blob = f"{row.get('text') or ''} {json.dumps(meta, default=str)}".lower()
+        if not terms:
+            score = 1.0
+        else:
+            score = sum(1.0 for t in terms if t in blob) / len(terms)
+        if score > 0:
+            scored.append((score, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    hits: list[dict[str, Any]] = []
+    for score, row in scored[:k]:
+        hits.append(
+            {
+                "id": row.get("id"),
+                "text": row.get("text") or "",
+                "metadata": row.get("metadata") or {},
+                "distance": 1.0 - float(score),
+            }
+        )
+    return hits
 
 
 def add(
@@ -45,16 +131,15 @@ def add(
     title: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
 ) -> list[str]:
-    """Add one or more texts to the relay collection. Returns ids."""
+    """Upsert one or more texts into memory. Returns ids."""
     if isinstance(texts, str):
         texts = [texts]
-    col = _get_collection()
-    if col is None:
-        return []
     ids: list[str] = []
     metadatas: list[dict[str, Any]] = []
     for i, text in enumerate(texts):
-        doc_id = f"{source}:{source_id or uuid.uuid4().hex}:{i}"
+        # Stable id so re-sync overwrites instead of duplicating
+        stable = str(source_id or uuid.uuid4().hex)
+        doc_id = f"{source}:{stable}" if i == 0 else f"{source}:{stable}:{i}"
         meta: dict[str, Any] = {"source": source}
         if source_id:
             meta["source_id"] = str(source_id)
@@ -70,10 +155,20 @@ def add(
                     meta[k] = v
         ids.append(doc_id)
         metadatas.append(meta)
-    try:
-        col.add(documents=texts, ids=ids, metadatas=metadatas)
-    except Exception as e:
-        print(f"[memory] add error: {e}", file=sys.stderr)
+
+    col = _get_collection()
+    if col is not None:
+        try:
+            # Prefer upsert so auto-sync / re-search is idempotent
+            if hasattr(col, "upsert"):
+                col.upsert(documents=texts, ids=ids, metadatas=metadatas)
+            else:
+                col.add(documents=texts, ids=ids, metadatas=metadatas)
+            return ids
+        except Exception as e:
+            print(f"[memory] chroma upsert error, using fallback: {e}", file=sys.stderr)
+
+    _fallback_upsert(ids, texts, metadatas)
     return ids
 
 
@@ -84,33 +179,32 @@ def search(
 ) -> list[dict[str, Any]]:
     """Search memory. Returns list of {id, text, metadata, distance}."""
     col = _get_collection()
-    if col is None:
-        return []
-    where = {"source": source} if source and source != "all" else None
-    try:
-        kwargs: dict[str, Any] = {"query_texts": [query], "n_results": k}
-        if where:
-            kwargs["where"] = where
-        res = col.query(**kwargs)
-    except Exception as e:
-        print(f"[memory] search error: {e}", file=sys.stderr)
-        return []
+    if col is not None:
+        where = {"source": source} if source and source != "all" else None
+        try:
+            kwargs: dict[str, Any] = {"query_texts": [query], "n_results": k}
+            if where:
+                kwargs["where"] = where
+            res = col.query(**kwargs)
+            hits: list[dict[str, Any]] = []
+            ids = (res.get("ids") or [[]])[0]
+            docs = (res.get("documents") or [[]])[0]
+            metas = (res.get("metadatas") or [[]])[0]
+            dists = (res.get("distances") or [[]])[0]
+            for i, doc_id in enumerate(ids):
+                hits.append(
+                    {
+                        "id": doc_id,
+                        "text": docs[i] if i < len(docs) else "",
+                        "metadata": metas[i] if i < len(metas) else {},
+                        "distance": dists[i] if i < len(dists) else None,
+                    }
+                )
+            return hits
+        except Exception as e:
+            print(f"[memory] chroma search error: {e}", file=sys.stderr)
 
-    hits: list[dict[str, Any]] = []
-    ids = (res.get("ids") or [[]])[0]
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-    dists = (res.get("distances") or [[]])[0]
-    for i, doc_id in enumerate(ids):
-        hits.append(
-            {
-                "id": doc_id,
-                "text": docs[i] if i < len(docs) else "",
-                "metadata": metas[i] if i < len(metas) else {},
-                "distance": dists[i] if i < len(dists) else None,
-            }
-        )
-    return hits
+    return _fallback_search(query, k=k, source=source)
 
 
 def format_for_prompt(hits: list[dict[str, Any]]) -> str:

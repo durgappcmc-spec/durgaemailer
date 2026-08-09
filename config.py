@@ -30,6 +30,8 @@ def _apply_streamlit_secrets() -> None:
         "APOLLO_API_KEY",
         "ZOOMINFO_USERNAME",
         "ZOOMINFO_PASSWORD",
+        "ZOOMINFO_CLIENT_ID",
+        "ZOOMINFO_PRIVATE_KEY_PATH",
         "ROCKETREACH_API_KEY",
         "GOOGLE_SHEET_ID",
         "TRACKING_BASE_URL",
@@ -41,6 +43,11 @@ def _apply_streamlit_secrets() -> None:
         "GMAIL_CLIENT_SECRETS",
         "GMAIL_TOKEN_PATH",
         "CHROMA_DIR",
+        "AUTO_SYNC_GMAIL",
+        "AUTO_SYNC_INTERVAL_MINUTES",
+        "AUTO_SYNC_GMAIL_DAYS",
+        "AUTO_SYNC_MAX_PER",
+        "AUTO_INGEST_PROSPECTS",
     )
     for key in keys:
         try:
@@ -66,6 +73,10 @@ class Settings:
         self.APOLLO_API_KEY: str = os.getenv("APOLLO_API_KEY", "")
         self.ZOOMINFO_USERNAME: str = os.getenv("ZOOMINFO_USERNAME", "")
         self.ZOOMINFO_PASSWORD: str = os.getenv("ZOOMINFO_PASSWORD", "")
+        self.ZOOMINFO_CLIENT_ID: str = os.getenv("ZOOMINFO_CLIENT_ID", "")
+        self.ZOOMINFO_PRIVATE_KEY_PATH: str = os.getenv(
+            "ZOOMINFO_PRIVATE_KEY_PATH", "./credentials/zoominfo.txt"
+        )
         self.ROCKETREACH_API_KEY: str = os.getenv("ROCKETREACH_API_KEY", "")
         self.GMAIL_CLIENT_SECRETS: str = os.getenv(
             "GMAIL_CLIENT_SECRETS", "./credentials/gmail_oauth.json"
@@ -82,6 +93,14 @@ class Settings:
         self.CHROMA_DIR: str = str(_CHROMA)
         self.APP_USERNAME: str = os.getenv("APP_USERNAME", "")
         self.APP_PASSWORD: str = os.getenv("APP_PASSWORD", "")
+        # Auto-sync: Gmail → memory + ZoomInfo/prospect searches → memory
+        self.AUTO_SYNC_GMAIL: str = os.getenv("AUTO_SYNC_GMAIL", "true")
+        self.AUTO_SYNC_INTERVAL_MINUTES: int = int(
+            os.getenv("AUTO_SYNC_INTERVAL_MINUTES", "30") or 30
+        )
+        self.AUTO_SYNC_GMAIL_DAYS: int = int(os.getenv("AUTO_SYNC_GMAIL_DAYS", "30") or 30)
+        self.AUTO_SYNC_MAX_PER: int = int(os.getenv("AUTO_SYNC_MAX_PER", "75") or 75)
+        self.AUTO_INGEST_PROSPECTS: str = os.getenv("AUTO_INGEST_PROSPECTS", "true")
 
 
 settings = Settings()
