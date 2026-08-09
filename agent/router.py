@@ -42,6 +42,11 @@ Rules:
 - PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
   Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
   PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":20}
+  For NGO / nonprofit searches: put "NGO" in company_names or keywords, city in locations
+  (e.g. Noida), and country implied. Do NOT put beneficiary demographics (girls, age 16+,
+  children) into titles/keywords — ZoomInfo only has org contacts, not beneficiary lists.
+  Example: PROSPECT_SEARCH:{"company_names":["NGO"],"locations":["Noida"],"providers":["zoominfo"],"limit":20}
+  Never ask the user for ZoomInfo credentials.
 - After a prospect search, if the user asks to email/draft/send to that list / all of them / these prospects,
   use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
