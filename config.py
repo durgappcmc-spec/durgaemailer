@@ -1,6 +1,7 @@
 # NOTE: APP_NAME is a constant so the product can be renamed without hunting string literals.
 # Load .env from this file's directory (not cwd) with override=True so OS env
 # leftovers cannot pin an obsolete GEMINI_MODEL like gemini-2.0-flash.
+# On Streamlit Community Cloud, secrets from the dashboard are mirrored into os.environ.
 from __future__ import annotations
 
 import os
@@ -12,6 +13,45 @@ APP_NAME = "Relay"
 
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env", override=True)
+
+
+def _apply_streamlit_secrets() -> None:
+    """Copy Streamlit Cloud / local secrets.toml keys into os.environ."""
+    try:
+        import streamlit as st  # type: ignore
+
+        secrets = st.secrets  # type: ignore[attr-defined]
+    except Exception:
+        return
+
+    keys = (
+        "GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "APOLLO_API_KEY",
+        "ZOOMINFO_USERNAME",
+        "ZOOMINFO_PASSWORD",
+        "ROCKETREACH_API_KEY",
+        "GOOGLE_SHEET_ID",
+        "TRACKING_BASE_URL",
+        "APPS_SCRIPT_TRACKING_URL",
+        "APP_USERNAME",
+        "APP_PASSWORD",
+        "GMAIL_TOKEN_JSON",
+        "GMAIL_OAUTH_JSON",
+        "GMAIL_CLIENT_SECRETS",
+        "GMAIL_TOKEN_PATH",
+        "CHROMA_DIR",
+    )
+    for key in keys:
+        try:
+            if key in secrets and secrets[key] not in (None, ""):
+                if not os.environ.get(key):
+                    os.environ[key] = str(secrets[key])
+        except Exception:
+            continue
+
+
+_apply_streamlit_secrets()
 
 _DATA = _ROOT / "data"
 _CHROMA = Path(os.getenv("CHROMA_DIR", str(_DATA / "chroma")))
@@ -33,10 +73,15 @@ class Settings:
         self.GMAIL_TOKEN_PATH: str = os.getenv(
             "GMAIL_TOKEN_PATH", "./credentials/gmail_token.json"
         )
+        # Optional: paste full token JSON into Streamlit secrets for cloud deploys
+        self.GMAIL_TOKEN_JSON: str = os.getenv("GMAIL_TOKEN_JSON", "")
+        self.GMAIL_OAUTH_JSON: str = os.getenv("GMAIL_OAUTH_JSON", "")
         self.GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
         self.TRACKING_BASE_URL: str = os.getenv("TRACKING_BASE_URL", "").rstrip("/")
         self.APPS_SCRIPT_TRACKING_URL: str = os.getenv("APPS_SCRIPT_TRACKING_URL", "")
         self.CHROMA_DIR: str = str(_CHROMA)
+        self.APP_USERNAME: str = os.getenv("APP_USERNAME", "")
+        self.APP_PASSWORD: str = os.getenv("APP_PASSWORD", "")
 
 
 settings = Settings()
@@ -45,3 +90,15 @@ settings = Settings()
 _DATA.mkdir(parents=True, exist_ok=True)
 Path(settings.CHROMA_DIR).mkdir(parents=True, exist_ok=True)
 (_ROOT / "credentials").mkdir(parents=True, exist_ok=True)
+
+# Materialize OAuth JSON from secrets when files are absent (Streamlit Cloud).
+if settings.GMAIL_OAUTH_JSON:
+    oauth_path = Path(settings.GMAIL_CLIENT_SECRETS)
+    if not oauth_path.exists():
+        oauth_path.parent.mkdir(parents=True, exist_ok=True)
+        oauth_path.write_text(settings.GMAIL_OAUTH_JSON, encoding="utf-8")
+if settings.GMAIL_TOKEN_JSON:
+    token_path = Path(settings.GMAIL_TOKEN_PATH)
+    if not token_path.exists():
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(settings.GMAIL_TOKEN_JSON, encoding="utf-8")

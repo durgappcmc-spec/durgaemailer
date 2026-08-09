@@ -1,6 +1,8 @@
 # NOTE: First run opens a local browser for OAuth consent; token is cached thereafter.
+# On Streamlit Community Cloud, provide GMAIL_TOKEN_JSON (+ GMAIL_OAUTH_JSON) via secrets.
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -45,9 +47,26 @@ def get_credentials() -> Credentials:
             print(f"[gmail] token refresh failed: {e}", file=sys.stderr)
 
     if not secrets_path.exists():
-        raise FileNotFoundError(
-            f"Gmail OAuth secrets not found at {secrets_path}. "
-            "Download Desktop client JSON from Google Cloud Console."
+        # Last chance: secret blob may have been set after Settings init
+        oauth_blob = os.getenv("GMAIL_OAUTH_JSON", "")
+        if oauth_blob:
+            secrets_path.parent.mkdir(parents=True, exist_ok=True)
+            secrets_path.write_text(oauth_blob, encoding="utf-8")
+        else:
+            raise FileNotFoundError(
+                f"Gmail OAuth secrets not found at {secrets_path}. "
+                "On Streamlit Cloud, set GMAIL_OAUTH_JSON + GMAIL_TOKEN_JSON in Secrets. "
+                "Locally, download Desktop client JSON from Google Cloud Console."
+            )
+
+    # Headless / cloud: cannot open a local browser — require pre-baked token.
+    if os.getenv("STREAMLIT_SERVER_HEADLESS", "").lower() in ("true", "1") or os.getenv(
+        "STREAMLIT_RUNTIME_ENV"
+    ) == "cloud":
+        raise RuntimeError(
+            "Gmail needs GMAIL_TOKEN_JSON in Streamlit secrets for cloud deploys "
+            "(paste contents of credentials/gmail_token.json). "
+            "Re-auth locally once if the token expired, then update the secret."
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)

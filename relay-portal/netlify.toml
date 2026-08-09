@@ -1,0 +1,14 @@
+[build]
+  command = "node build.mjs"
+  publish = "public"
+
+[[edge_functions]]
+  function = "auth"
+  path = "/*"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Set in Netlify UI (Site settings → Environment variables):
+# RELAY_APP_URL = https://YOUR-APP.streamlit.app
+# RELAY_BASIC_USER / RELAY_BASIC_PASS = portal Basic Auth

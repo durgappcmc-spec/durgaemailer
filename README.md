@@ -91,6 +91,25 @@ Repo: [github.com/durgappcmc-spec/durgaemailer](https://github.com/durgappcmc-sp
    - Apps Script → `TRACKING_BASE` constant
 5. Redeploy the Apps Script Web App after updating `TRACKING_BASE`
 
+### 10) Public app URL (from Git — no tunnel)
+
+**Netlify cannot run Streamlit.** Deploy the app from the same GitHub repo on
+[Streamlit Community Cloud](https://share.streamlit.io/):
+
+1. Open https://share.streamlit.io/ → **New app**
+2. Repository: `durgappcmc-spec/durgaemailer`, branch `main`, main file `app.py`
+3. **Advanced settings → Secrets**: paste from `.streamlit/secrets.toml.example`
+   (fill real keys; include `GMAIL_TOKEN_JSON` from your local `credentials/gmail_token.json`)
+4. Deploy → you get a stable URL like `https://durgaemailer.streamlit.app`
+
+Point the Netlify portal at that URL (still no tunnel):
+
+1. Netlify site `durgaemailer-relay` → Environment → `RELAY_APP_URL=https://….streamlit.app`
+2. Base directory `relay-portal`, build `node build.mjs`, publish `public`
+3. Redeploy portal → https://durgaemailer-relay.netlify.app opens the Streamlit app
+
+Portal Basic Auth: `RELAY_BASIC_USER` / `RELAY_BASIC_PASS`. App login: `APP_USERNAME` / `APP_PASSWORD`.
+
 ## Architecture
 
 | Piece | Role |

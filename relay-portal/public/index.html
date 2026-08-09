@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Relay</title>
+    <style>
+      :root {
+        --bg: #0f1419;
+        --card: #1a2332;
+        --text: #e7ecf3;
+        --muted: #9aa8bc;
+        --accent: #3d8bfd;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(1200px 600px at 10% -10%, #1b3a5f 0%, transparent 55%),
+          radial-gradient(900px 500px at 100% 0%, #243b2e 0%, transparent 50%),
+          var(--bg);
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+      }
+      main {
+        width: min(520px, 100%);
+        background: color-mix(in srgb, var(--card) 92%, black);
+        border: 1px solid #2a3a4f;
+        border-radius: 16px;
+        padding: 2rem;
+        box-shadow: 0 24px 60px rgba(0,0,0,.35);
+      }
+      h1 { margin: 0 0 .4rem; font-size: 2rem; letter-spacing: -.02em; }
+      p { color: var(--muted); line-height: 1.5; }
+      a.button {
+        display: inline-block;
+        margin-top: 1rem;
+        padding: .85rem 1.2rem;
+        border-radius: 10px;
+        background: var(--accent);
+        color: white;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      code { color: #c9e1ff; word-break: break-all; }
+      .warn { color: #f0c674; font-size: .9rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Relay</h1>
+      <p>
+        Protected entry for the Relay outreach app.
+        The app itself is deployed from GitHub on Streamlit Community Cloud
+        (Netlify cannot run Streamlit — no tunnel required).
+      </p>
+      <p>
+        Tracking (public pixel):
+        <br /><code>https://durgaemailer-tracking.netlify.app</code>
+      </p>
+      <a class="button" id="app-link" href="__RELAY_APP_URL__">Open Relay app</a>
+      <p class="warn" id="missing" hidden style="margin-top:1rem">
+        Set Netlify env <code>RELAY_APP_URL</code> to your
+        <code>*.streamlit.app</code> URL, then redeploy this portal.
+      </p>
+      <p style="margin-top:1.25rem;font-size:.9rem">
+        Streamlit login uses <code>APP_USERNAME</code> / <code>APP_PASSWORD</code>
+        (same as this portal). Deploy app:
+        <a href="https://share.streamlit.io/" style="color:#9ec1ff">share.streamlit.io</a>
+        → New app → repo <code>durgappcmc-spec/durgaemailer</code> → <code>app.py</code>.
+      </p>
+    </main>
+    <script>
+      const el = document.getElementById("app-link");
+      const missing = document.getElementById("missing");
+      const baked = el.getAttribute("href") || "";
+      const override = localStorage.getItem("RELAY_APP_URL");
+      if (override) el.href = override;
+      const href = el.href || "";
+      if (!href || href.includes("__RELAY_APP_URL__") || href.endsWith("/#")) {
+        missing.hidden = false;
+        el.removeAttribute("href");
+        el.style.opacity = "0.5";
+        el.textContent = "App URL not configured";
+      }
+    </script>
+  </body>
+</html>
