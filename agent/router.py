@@ -25,6 +25,7 @@ from agent.research_pipeline import (
     run_research_then_zoom,
     wants_research_then_zoom,
 )
+from agent.run_control import is_cancelled, stopped_message
 from gmail_client.attachments import document_context_from_attachments
 from gmail_client.extract import (
     contacts_from_mailbox,
@@ -935,6 +936,25 @@ def answer(
     consumed_attachments = False
     mailbox_out: list[dict[str, Any]] = []
     prospect_out: list[dict[str, Any]] = []
+    cancelled = False
+
+    def _stop_now() -> bool:
+        nonlocal cancelled
+        if cancelled or is_cancelled(context):
+            cancelled = True
+            return True
+        return False
+
+    if _stop_now():
+        yield stopped_message()
+        yield {
+            "__meta__": {
+                "routing": "STOPPED",
+                "sources": [],
+                "cancelled": True,
+            }
+        }
+        return
 
     routing = route(_route_user_msg(user_msg, chat_attachments), history)
     sources: list[dict[str, Any]] = []
@@ -942,8 +962,16 @@ def answer(
     need_file = False
 
     # Intelligent planner: From/To/CC/ignore + which specialist agents to run
+    if _stop_now():
+        yield stopped_message()
+        yield {"__meta__": {"routing": "STOPPED", "sources": [], "cancelled": True}}
+        return
     plan = plan_request(user_msg, history)
     yield plan_summary(plan)
+    if _stop_now():
+        yield stopped_message()
+        yield {"__meta__": {"routing": "STOPPED", "sources": [], "cancelled": True}}
+        return
 
     # Map planner action onto routing when the classifier/heuristics would misfire
     action_to_prefix = {
@@ -1189,6 +1217,9 @@ def answer(
             contacts = pipeline.get("contacts") or []
             web_sources = pipeline.get("sources") or []
             sources.extend(web_sources)
+            if _stop_now():
+                yield stopped_message()
+                orgs, contacts = [], []
 
             if orgs:
                 yield f"\nFound **{len(orgs)}** matching organizations:\n"
@@ -1316,6 +1347,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 )
                 ok_n = 0
                 for job in jobs:
+                    if _stop_now():
+                        yield stopped_message()
+                        break
                     job = _stamp_mail_fields(
                         job,
                         from_email=headers["from_email"],
@@ -1574,6 +1608,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     f"from **{headers['from_email']}**…\n"
                 )
                 for job in jobs:
+                    if _stop_now():
+                        yield stopped_message()
+                        break
                     job = _stamp_mail_fields(
                         job,
                         from_email=headers["from_email"],
@@ -1808,6 +1845,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 )
                 results = []
                 for job in jobs:
+                    if _stop_now():
+                        yield stopped_message()
+                        break
                     job = _stamp_mail_fields(
                         job,
                         from_email=headers["from_email"],
@@ -1943,11 +1983,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
 
     yield {
         "__meta__": {
-            "routing": meta_routing,
+            "routing": "STOPPED" if cancelled else meta_routing,
             "sources": sources,
             "consumed_attachments": consumed_attachments,
             "need_file": need_file,
             "mailbox_messages": mailbox_out or None,
             "prospects": prospect_out or None,
+            "cancelled": cancelled,
+            "pending_user_msg": user_msg if need_file else None,
         }
     }
