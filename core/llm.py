@@ -213,3 +213,33 @@ def extract_json(
     except Exception as e:
         print(f"[gemini] extract_json error: {e}", file=sys.stderr)
         return json.dumps({"error": str(e)})
+
+
+def describe_bytes(
+    data: bytes,
+    *,
+    mime_type: str = "image/png",
+    prompt: str = "Describe this file for email drafting context.",
+) -> str:
+    """Short multimodal describe for uploaded images (and similar) used as context."""
+    client = _get_client()
+    part = types.Part.from_bytes(data=data, mime_type=mime_type)
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=1200,
+    )
+    try:
+        resp = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=prompt), part],
+                )
+            ],
+            config=config,
+        )
+        return (getattr(resp, "text", None) or "").strip()
+    except Exception as e:
+        print(f"[gemini] describe_bytes error: {e}", file=sys.stderr)
+        return ""

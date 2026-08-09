@@ -1,5 +1,5 @@
 # NOTE: Streaming UI captures __meta__ dicts separately from text chunks.
-# Chat accepts multiple file attachments for draft/send/schedule turns.
+# Files come only from st.chat_input paperclip; staged across turns until cleared/used.
 from __future__ import annotations
 
 import streamlit as st
@@ -16,20 +16,58 @@ logout_button()
 
 st.title("💬 Chat")
 st.caption(
-    "Attach PDFs or text files below (or via the paperclip). Ask to **draft** / "
-    "**send** / **schedule** an email — Relay uses the document text as context for "
-    "the email body, and also attaches the files to the message."
+    "Paperclip = file context/attach. "
+    "Try: `show my inbox last 7 days`, `show sent about sponsor`, "
+    "then `draft personalized follow-ups to everyone in this list`."
 )
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "staged_attachments" not in st.session_state:
+    st.session_state.staged_attachments = []
+if "pending_user_msg" not in st.session_state:
+    st.session_state.pending_user_msg = ""
+if "need_file" not in st.session_state:
+    st.session_state.need_file = False
+if "last_mailbox" not in st.session_state:
+    st.session_state.last_mailbox = []
+
+staged = st.session_state.staged_attachments or []
+mailbox_n = len(st.session_state.get("last_mailbox") or [])
+if mailbox_n:
+    st.caption(f"Mailbox context loaded: **{mailbox_n}** messages (for filters / follow-ups).")
+if st.session_state.get("need_file"):
+    st.info(
+        "Upload a file with the **paperclip** on the chat box, then send your "
+        "message again (or tap **Continue pending request** after attaching)."
+    )
+
+if staged:
+    names = []
+    for a in staged:
+        label = a.get("name") or "file"
+        label += " (context ready)" if a.get("has_context") else " (attach only)"
+        names.append(label)
+    c1, c2 = st.columns([5, 1])
+    c1.success("Ready: " + ", ".join(names))
+    if c2.button("Clear files", use_container_width=True):
+        st.session_state.staged_attachments = []
+        st.session_state.need_file = False
+        st.session_state.pending_user_msg = ""
+        st.rerun()
+    pending = (st.session_state.get("pending_user_msg") or "").strip()
+    if pending and st.button("Continue pending request", type="primary"):
+        st.session_state.force_prompt = pending
+        st.session_state.pending_user_msg = ""
+        st.session_state.need_file = False
+        st.rerun()
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         files = msg.get("files") or []
         if files:
-            st.caption("Attached: " + ", ".join(files))
+            st.caption("Used files: " + ", ".join(files))
         meta = msg.get("meta")
         if meta:
             sources = meta.get("sources") or []
@@ -46,36 +84,47 @@ for msg in st.session_state.messages:
             if meta.get("routing"):
                 st.caption(f"Routing: `{meta['routing']}`")
 
-# Persistent uploader (works even if chat_input file UI is cleared)
-extra_files = st.file_uploader(
-    "Files for next email (PDF/text also used as draft context)",
-    accept_multiple_files=True,
-    key="chat_file_uploader",
-)
-
 prompt = st.chat_input(
-    "Ask Relay anything… (attach files for email draft/send)",
+    "Ask anything… paperclip to add files for context / email attach",
     accept_file="multiple",
     file_type=None,
 )
 
+force = (st.session_state.pop("force_prompt", None) or "").strip()
+if force and not prompt:
+
+    class _Forced:
+        text = force
+        files = []
+
+    prompt = _Forced()
+
 if prompt:
-    # Streamlit >=1.39 may return ChatInputValue with .text / .files
     if hasattr(prompt, "text"):
         user_text = (prompt.text or "").strip()
-        chat_files = list(prompt.files or [])
+        chat_files = list(getattr(prompt, "files", None) or [])
     else:
         user_text = str(prompt).strip()
         chat_files = []
 
-    if not user_text and not chat_files and not extra_files:
+    staged = list(st.session_state.get("staged_attachments") or [])
+    paperclip = files_to_attachments(chat_files) if chat_files else []
+
+    by_name: dict = {a.get("name"): a for a in staged}
+    for a in paperclip:
+        by_name[a.get("name")] = a
+    attachments = list(by_name.values())
+
+    if paperclip:
+        st.session_state.staged_attachments = attachments
+        st.session_state.need_file = False
+
+    if not user_text and not attachments:
         st.stop()
 
     if not user_text:
         user_text = "(see attached files)"
 
-    uploaded = chat_files + list(extra_files or [])
-    attachments = files_to_attachments(uploaded)
     file_names = [a.get("name") or "file" for a in attachments]
 
     st.session_state.messages.append(
@@ -84,7 +133,7 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(user_text)
         if file_names:
-            st.caption("Attached: " + ", ".join(file_names))
+            st.caption("Using files: " + ", ".join(file_names))
 
     history = [
         {"role": m["role"], "content": m["content"]}
@@ -101,6 +150,7 @@ if prompt:
             context={
                 "prospects": st.session_state.get("last_prospects") or [],
                 "attachments": attachments,
+                "mailbox_messages": st.session_state.get("last_mailbox") or [],
             },
         ):
             if isinstance(chunk, dict) and "__meta__" in chunk:
@@ -109,6 +159,10 @@ if prompt:
                 text += str(chunk)
                 placeholder.markdown(text + "▌")
         placeholder.markdown(text or "_(no response)_")
+
+        if meta.get("mailbox_messages"):
+            st.session_state.last_mailbox = meta["mailbox_messages"]
+            st.caption(f"Saved {len(meta['mailbox_messages'])} mailbox rows for follow-ups.")
 
         sources = meta.get("sources") or []
         if sources:
@@ -127,6 +181,14 @@ if prompt:
     st.session_state.messages.append(
         {"role": "assistant", "content": text, "meta": meta}
     )
-    # Clear uploader for next turn by bumping a nonce key via session flag
-    if attachments:
-        st.session_state.pop("chat_file_uploader", None)
+
+    if meta.get("need_file"):
+        st.session_state.need_file = True
+        st.session_state.pending_user_msg = meta.get("pending_user_msg") or user_text
+        st.rerun()
+
+    if meta.get("consumed_attachments"):
+        st.session_state.staged_attachments = []
+        st.session_state.need_file = False
+        st.session_state.pending_user_msg = ""
+        st.rerun()

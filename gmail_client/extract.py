@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import email
 import json
+import re
 import sys
 from email.message import Message
 from typing import Any, Optional
@@ -15,16 +16,29 @@ from gmail_client.auth import gmail_service
 
 
 def list_messages(query: str, max_results: int = 20) -> list[dict[str, str]]:
-    """List Gmail message ids matching a search query."""
+    """List Gmail message ids matching a search query (paginated)."""
     try:
         svc = gmail_service()
-        resp = (
-            svc.users()
-            .messages()
-            .list(userId="me", q=query, maxResults=max_results)
-            .execute()
-        )
-        return resp.get("messages") or []
+        out: list[dict[str, str]] = []
+        page_token: Optional[str] = None
+        remaining = max(1, int(max_results))
+        while remaining > 0:
+            page_size = min(500, remaining)
+            kwargs: dict[str, Any] = {
+                "userId": "me",
+                "q": query,
+                "maxResults": page_size,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = svc.users().messages().list(**kwargs).execute()
+            batch = resp.get("messages") or []
+            out.extend(batch)
+            remaining -= len(batch)
+            page_token = resp.get("nextPageToken")
+            if not page_token or not batch:
+                break
+        return out[: max_results]
     except Exception as e:
         print(f"[gmail] list_messages error: {e}", file=sys.stderr)
         return []
@@ -86,6 +100,8 @@ def get_message(msg_id: str) -> dict[str, Any]:
             "thread_id": raw.get("threadId"),
             "subject": msg.get("Subject", ""),
             "from": msg.get("From", ""),
+            "to": msg.get("To", ""),
+            "cc": msg.get("Cc", ""),
             "date": msg.get("Date", ""),
             "body_text": body_text,
             "body_html": body_html,
@@ -128,8 +144,13 @@ Body:
         return {"error": str(e)}
 
 
-def extract_batch(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    """List messages, extract structured data for each."""
+def extract_batch(
+    query: str,
+    max_results: int = 10,
+    *,
+    ai_extract: bool = True,
+) -> list[dict[str, Any]]:
+    """List messages; optionally run Gemini structured extraction on each."""
     out: list[dict[str, Any]] = []
     for stub in list_messages(query, max_results=max_results):
         mid = stub.get("id")
@@ -143,18 +164,138 @@ def extract_batch(query: str, max_results: int = 10) -> list[dict[str, Any]]:
                     "subject": "",
                     "from": "",
                     "date": "",
+                    "mailbox": "",
                     "extracted": {"error": message["error"]},
                 }
             )
             continue
-        extracted = extract_structured(message)
+        if ai_extract:
+            extracted = extract_structured(message)
+        else:
+            extracted = {
+                "summary": (message.get("body_text") or "")[:280],
+                "sender_name": "",
+                "sender_company": "",
+                "phone_numbers": [],
+                "action_items": [],
+            }
         out.append(
             {
                 "message_id": mid,
+                "thread_id": message.get("thread_id", ""),
                 "subject": message.get("subject", ""),
                 "from": message.get("from", ""),
+                "to": message.get("to", ""),
+                "cc": message.get("cc", ""),
                 "date": message.get("date", ""),
+                "body_text": (message.get("body_text") or "")[:4000],
+                "mailbox": "",
                 "extracted": extracted,
             }
         )
+    return out
+
+
+def filter_messages(
+    messages: list[dict[str, Any]],
+    needle: str,
+) -> list[dict[str, Any]]:
+    """Simple keyword filter over subject/from/to/body/summary."""
+    q = (needle or "").strip().lower()
+    if not q:
+        return list(messages or [])
+    terms = [t for t in re.split(r"\s+", q) if t]
+    out: list[dict[str, Any]] = []
+    for m in messages or []:
+        ex = m.get("extracted") or {}
+        blob = " ".join(
+            [
+                str(m.get("subject") or ""),
+                str(m.get("from") or ""),
+                str(m.get("to") or ""),
+                str(m.get("mailbox") or ""),
+                str(ex.get("summary") or ""),
+                str(ex.get("sender_company") or ""),
+                str(m.get("body_text") or "")[:1500],
+            ]
+        ).lower()
+        if all(t in blob for t in terms):
+            out.append(m)
+    return out
+
+
+def contacts_from_mailbox(
+    messages: list[dict[str, Any]] | None,
+    *,
+    prefer: str = "auto",
+) -> list[dict[str, Any]]:
+    """Build personalized recipient rows from inbox/sent extract results.
+
+    prefer: 'sent' → use To addresses; 'inbox' → use From; 'auto' → by mailbox tag.
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for m in messages or []:
+        mailbox = (m.get("mailbox") or "").lower()
+        use_to = prefer == "sent" or (prefer == "auto" and mailbox == "sent")
+        header = (m.get("to") if use_to else m.get("from")) or ""
+        if not header and use_to:
+            header = m.get("from") or ""
+        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", header)
+        if not emails:
+            continue
+        email_addr = emails[0]
+        key = email_addr.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ex = m.get("extracted") or {}
+        display = (ex.get("sender_name") or "").strip()
+        if not display:
+            display = header.split("<")[0].strip().strip('"') or email_addr.split("@")[0]
+        name_parts = display.split(None, 1)
+        rows.append(
+            {
+                "email": email_addr,
+                "name": display,
+                "first_name": name_parts[0] if name_parts else "",
+                "title": ex.get("sender_title") or "",
+                "company": ex.get("sender_company") or "",
+                "prior_subject": m.get("subject") or "",
+                "prior_summary": (ex.get("summary") or m.get("body_text") or "")[:500],
+                "mailbox": mailbox or ("sent" if use_to else "inbox"),
+                "message_id": m.get("message_id") or "",
+                "thread_id": m.get("thread_id") or "",
+            }
+        )
+    return rows
+
+
+def extract_inbox_and_sent(
+    *,
+    days: int = 30,
+    max_per_mailbox: int = 100,
+    ai_extract: bool = True,
+    include_inbox: bool = True,
+    include_sent: bool = True,
+) -> list[dict[str, Any]]:
+    """Pull inbox and/or sent messages, tag mailbox, dedupe by message_id."""
+    queries: list[tuple[str, str]] = []
+    if include_inbox:
+        queries.append(("inbox", f"in:inbox newer_than:{max(1, days)}d"))
+    if include_sent:
+        queries.append(("sent", f"in:sent newer_than:{max(1, days)}d"))
+
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for mailbox, q in queries:
+        rows = extract_batch(q, max_results=max_per_mailbox, ai_extract=ai_extract)
+        for row in rows:
+            mid = row.get("message_id") or ""
+            if mid and mid in seen:
+                continue
+            if mid:
+                seen.add(mid)
+            row["mailbox"] = mailbox
+            out.append(row)
     return out

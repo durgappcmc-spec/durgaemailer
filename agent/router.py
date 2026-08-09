@@ -13,7 +13,12 @@ from connectors.prospects import enrich_fallthrough, search_all
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json
 from gmail_client.attachments import document_context_from_attachments
-from gmail_client.extract import extract_batch
+from gmail_client.extract import (
+    contacts_from_mailbox,
+    extract_batch,
+    extract_inbox_and_sent,
+    filter_messages,
+)
 from gmail_client.send import create_draft, send_email
 from scheduling.client import schedule_email
 
@@ -34,32 +39,100 @@ Rules:
 - MEMORY: user asks about saved notes/prospects already in memory.
 - PROSPECT_SEARCH: find people. JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords (comma strings or arrays).
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
-- GMAIL_EXTRACT: pull structured data from inbox; after the colon put a Gmail search query.
-- DRAFT_EMAIL: user asks to create/save one OR MANY Gmail drafts (not send, not schedule).
+- GMAIL_EXTRACT: read / list / filter the user's Gmail inbox and/or sent mail.
+  After the colon put a Gmail search query (NOT prose).
+  Examples:
+    GMAIL_EXTRACT:in:inbox newer_than:14d
+    GMAIL_EXTRACT:in:sent newer_than:30d
+    GMAIL_EXTRACT:in:inbox is:unread newer_than:7d
+    GMAIL_EXTRACT:in:sent newer_than:60d subject:sponsor
+  Prefer GMAIL_EXTRACT when user says inbox, sent, mailbox, unread, emails from/to, filter mail.
+- DRAFT_EMAIL: create/save one OR MANY Gmail drafts (not send, not schedule).
   Compact JSON ONLY — never include html_body.
   Single: {"recipient_email":"a@b.com","subject":"Hello"}
   Multi: {"batch":true,"recipient_emails":["a@b.com","b@c.com"],"subject":"Hello"}
-  Or multi from last prospect search: {"batch":true,"from_prospects":true,"subject":"Hello"}
-- SEND_EMAIL: user asks to send email(s) now (immediately). Same compact JSON shapes as DRAFT_EMAIL.
-  Prefer SEND_EMAIL when they say send/email now/fire off (not draft, not schedule later).
-- SCHEDULE_EMAIL: user wants to schedule/queue an email for later send (not a draft).
-  Compact JSON ONLY — include recipient_email, subject, send_at (ISO if known).
-  Optional: recipient_name, campaign.
-  NEVER include html_body or the full email text in this line (it will be truncated).
-  Example: SCHEDULE_EMAIL:{"recipient_email":"a@b.com","subject":"Hello","send_at":"2026-08-10T09:30:00"}
-- Prefer DRAFT_EMAIL when the user says draft/compose/save draft.
-- Prefer SEND_EMAIL when they say send now / send this email.
-- Prefer SCHEDULE_EMAIL when they say schedule/send later/queue.
-- If the user lists multiple emails or says "all prospects" / "everyone" for drafts/sends, use batch:true.
-- Chat may include file attachments (PDF/text); do not mention them in the routing line.
-  If the user asks to draft/send/schedule using an uploaded document, still choose
-  DRAFT_EMAIL / SEND_EMAIL / SCHEDULE_EMAIL (document text is applied separately).
+  From last prospect search: {"batch":true,"from_prospects":true,"subject":"Hello"}
+  Personalized follow-ups to last inbox/sent pull:
+    {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
+  Optional filter on last mailbox: {"batch":true,"from_mailbox":true,"mailbox_filter":"sponsor"}
+- SEND_EMAIL: send email(s) now. Same compact JSON shapes as DRAFT_EMAIL (including from_mailbox).
+- SCHEDULE_EMAIL: schedule/queue for later. Compact JSON with recipient_email, subject, send_at.
+  NEVER include html_body in routing lines.
+- Prefer DRAFT_EMAIL for draft/compose/save draft / follow-up drafts.
+- Prefer SEND_EMAIL for send now / fire off.
+- Prefer SCHEDULE_EMAIL for schedule/send later/queue.
+- If user wants bulk personalized follow-ups to people from inbox/sent / last mail pull, use
+  DRAFT_EMAIL (or SEND_EMAIL) with batch:true and from_mailbox:true.
+- Chat may include file attachments; do not mention them in the routing line.
+- When prefixed with [ATTACHED FILES: ...], files are already uploaded — do not ask to attach.
 
 Output NOTHING except the single routing line.
 """
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-_TEMPLATE_KEYS = ("first_name", "name", "title", "company", "email", "recipient_email")
+_TEMPLATE_KEYS = (
+    "first_name",
+    "name",
+    "title",
+    "company",
+    "email",
+    "recipient_email",
+    "prior_subject",
+    "prior_summary",
+)
+# User wants a file used as general chat/research context
+_CONTEXT_FILE_RE = re.compile(
+    r"\b(based on|using|from|read|summarize|analyse|analyze|review|look at)\b.*\b("
+    r"file|pdf|doc|document|deck|brochure|proposal|spreadsheet|excel|pptx?|image|upload"
+    r")\b|\b(this|the|my)\s+(file|pdf|doc|document|deck|upload)\b",
+    re.I,
+)
+# User wants a real email attachment on draft/send/schedule
+_EMAIL_ATTACH_RE = re.compile(
+    r"\b("
+    r"attach(\s|$)|attachment|attachments|"
+    r"with\s+(the\s+)?(file|pdf|doc|document|deck)|"
+    r"include\s+(the\s+)?(file|pdf|attachment)|"
+    r"attach(ed|ing)\b"
+    r")\b",
+    re.I,
+)
+
+
+def _wants_email_attachment(user_msg: str) -> bool:
+    return bool(_EMAIL_ATTACH_RE.search(user_msg or ""))
+
+
+def _wants_file_context(user_msg: str) -> bool:
+    return bool(_CONTEXT_FILE_RE.search(user_msg or "") or _EMAIL_ATTACH_RE.search(user_msg or ""))
+
+
+def _ask_for_upload(*, for_email_attach: bool = False) -> str:
+    if for_email_attach:
+        return (
+            "Please **upload the file** with the **paperclip** on the chat box "
+            "to attach it, then send the same draft/send/schedule request again."
+        )
+    return (
+        "Please **upload the file** with the **paperclip** on the chat box "
+        "for context, then ask your question again."
+    )
+
+
+
+def _attachment_names(attachments: Optional[list[dict[str, Any]]]) -> list[str]:
+    return [str(a.get("name") or "file") for a in (attachments or [])]
+
+
+def _route_user_msg(
+    user_msg: str,
+    attachments: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """Annotate the message for the router when files are already staged."""
+    names = _attachment_names(attachments)
+    if not names:
+        return user_msg
+    return f"[ATTACHED FILES ALREADY UPLOADED: {', '.join(names)}]\n{user_msg}"
 
 
 def _apply_template(text: str, prospect: dict[str, Any]) -> str:
@@ -82,6 +155,8 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
         "recipient_email": str(
             prospect.get("email") or prospect.get("recipient_email") or ""
         ),
+        "prior_subject": str(prospect.get("prior_subject") or ""),
+        "prior_summary": str(prospect.get("prior_summary") or ""),
     }
     out = text
     for key in _TEMPLATE_KEYS:
@@ -189,6 +264,9 @@ Rules for html_body:
   the important facts/offers/details from that document (do not dump the raw PDF).
 - Keep HTML simple (<p>, <ul>/<li>, <strong>).
 - If the user already drafted body text, prefer refining that with document facts.
+- For bulk follow-ups from inbox/sent, use placeholders
+  {{first_name}}, {{name}}, {{company}}, {{prior_subject}}, {{prior_summary}}
+  so each recipient gets a personalized message.
 
 Conversation:
 {hist_txt}
@@ -241,6 +319,7 @@ def _build_draft_jobs(
     user_msg: str,
     history: Optional[list[dict[str, str]]] = None,
     prospects: Optional[list[dict[str, Any]]] = None,
+    mailbox_messages: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Expand a draft payload into one job per recipient."""
     subject_tmpl = payload.get("subject") or "(no subject)"
@@ -260,11 +339,58 @@ def _build_draft_jobs(
             )
         )
     )
-    # Explicit from_prospects / use_prospects always wins
     if payload.get("from_prospects") or payload.get("use_prospects"):
         use_prospects = True
 
+    use_mailbox = bool(
+        payload.get("from_mailbox")
+        or payload.get("use_mailbox")
+        or payload.get("follow_up")
+        or re.search(
+            r"\b(follow[- ]?ups?|from (my )?(inbox|sent|mailbox)|last (mail|inbox|sent|extract)|everyone (i|we) (emailed|contacted))\b",
+            user_msg,
+            re.I,
+        )
+    )
+    if payload.get("from_mailbox") or payload.get("use_mailbox") or payload.get("follow_up"):
+        use_mailbox = True
+
     jobs: list[dict[str, Any]] = []
+
+    if use_mailbox:
+        msgs = list(mailbox_messages or [])
+        filt = str(payload.get("mailbox_filter") or payload.get("filter") or "").strip()
+        if not filt:
+            # Try to pull a filter phrase after "about/regarding/filter"
+            m = re.search(
+                r"\b(?:about|regarding|filter(?:ed)?(?:\s+by)?|matching|with subject)\s+(.+)$",
+                user_msg,
+                re.I,
+            )
+            if m:
+                filt = m.group(1).strip(" .")
+        if filt:
+            msgs = filter_messages(msgs, filt)
+        prefer = "auto"
+        if re.search(r"\binbox\b", user_msg, re.I) and not re.search(r"\bsent\b", user_msg, re.I):
+            prefer = "inbox"
+        elif re.search(r"\bsent\b", user_msg, re.I) and not re.search(r"\binbox\b", user_msg, re.I):
+            prefer = "sent"
+        contacts = contacts_from_mailbox(msgs, prefer=prefer)
+        for p in contacts:
+            job = {
+                "recipient_email": p.get("email"),
+                "recipient_name": p.get("name") or "",
+                "subject": _apply_template(subject_tmpl, p),
+                "html_body": _apply_template(body_tmpl, p),
+                "campaign": campaign,
+                "source": source or "chat_mailbox_followup",
+            }
+            if payload.get("attachments"):
+                job["attachments"] = payload["attachments"]
+            jobs.append(job)
+        if jobs:
+            return jobs
 
     if use_prospects:
         rows = _prospects_with_email(prospects)
@@ -291,7 +417,6 @@ def _build_draft_jobs(
     if payload.get("recipient_email"):
         emails.append(str(payload["recipient_email"]).strip())
 
-    # Also scrape all emails from the user message when batch-ish
     scraped = _EMAIL_RE.findall(user_msg)
     if len(scraped) > 1:
         for e in scraped:
@@ -300,7 +425,6 @@ def _build_draft_jobs(
     elif not emails and scraped:
         emails.extend(scraped)
 
-    # Deduplicate preserving order
     seen: set[str] = set()
     uniq: list[str] = []
     for e in emails:
@@ -310,7 +434,6 @@ def _build_draft_jobs(
         seen.add(key)
         uniq.append(e)
 
-    # Match names from prospects when available
     by_email = {
         (p.get("email") or "").lower(): p for p in _prospects_with_email(prospects)
     }
@@ -321,9 +444,10 @@ def _build_draft_jobs(
             "first_name": "",
             "title": "",
             "company": "",
+            "prior_subject": "",
+            "prior_summary": "",
         }
-        if "email" not in p:
-            p = {**p, "email": email}
+        p = {**p, "email": email, "recipient_email": email}
         job = {
             "recipient_email": email,
             "recipient_name": p.get("name") or payload.get("recipient_name") or "",
@@ -336,6 +460,93 @@ def _build_draft_jobs(
             job["attachments"] = payload["attachments"]
         jobs.append(job)
     return jobs
+
+
+def _normalize_gmail_query(user_msg: str, raw_q: str) -> tuple[str, str]:
+    """Return (gmail_query, mailbox_tag) from router tail + user wording."""
+    q = (raw_q or "").strip().strip("`").strip()
+    # Strip accidental prose prefixes
+    q = re.sub(r"^(query|gmail|search)\s*[:=]\s*", "", q, flags=re.I).strip()
+    msg = (user_msg or "").lower()
+
+    days = 14
+    m = re.search(r"\b(last|past)\s+(\d+)\s*days?\b", msg)
+    if m:
+        days = max(1, int(m.group(2)))
+    elif re.search(r"\btoday\b", msg):
+        days = 1
+    elif re.search(r"\bthis week\b", msg):
+        days = 7
+    elif re.search(r"\bthis month\b", msg):
+        days = 30
+
+    want_sent = bool(re.search(r"\bsent\b", msg)) and not re.search(
+        r"\binbox\b", msg
+    )
+    want_inbox = bool(re.search(r"\binbox\b", msg)) and not re.search(
+        r"\bsent\b", msg
+    )
+    want_both = bool(
+        re.search(r"\b(inbox\s+and\s+sent|sent\s+and\s+inbox|mailbox|all mail)\b", msg)
+    )
+    unread = bool(re.search(r"\bunread\b", msg))
+
+    # If model already gave a usable Gmail query, keep it
+    if q and any(
+        tok in q.lower()
+        for tok in ("in:", "from:", "to:", "subject:", "newer_than:", "is:", "label:")
+    ):
+        tag = "sent" if "in:sent" in q.lower() else ("inbox" if "in:inbox" in q.lower() else "custom")
+        return q, tag
+
+    # Keyword subject filter from user text
+    subj = ""
+    sm = re.search(
+        r"\b(?:about|regarding|subject|filter(?:ed)?(?:\s+by)?|matching)\s+(.+)$",
+        user_msg or "",
+        re.I,
+    )
+    if sm:
+        subj = sm.group(1).strip(" .\"'")
+        # drop trailing ask words
+        subj = re.split(r"\b(and then|then|please)\b", subj, maxsplit=1)[0].strip()
+
+    parts: list[str] = []
+    if want_both:
+        # Caller should use extract_inbox_and_sent instead; return a marker
+        return f"BOTH newer_than:{days}d", "both"
+    if want_sent:
+        parts.append("in:sent")
+        tag = "sent"
+    else:
+        parts.append("in:inbox")
+        tag = "inbox"
+        if want_inbox:
+            tag = "inbox"
+    parts.append(f"newer_than:{days}d")
+    if unread:
+        parts.append("is:unread")
+    if subj:
+        # Gmail subject operator; quote multi-word
+        if " " in subj:
+            parts.append(f'subject:"{subj}"')
+        else:
+            parts.append(f"subject:{subj}")
+    return " ".join(parts), tag
+
+
+def _format_mailbox_digest(rows: list[dict[str, Any]], *, limit: int = 25) -> str:
+    lines: list[str] = []
+    for i, r in enumerate(rows[:limit], 1):
+        box = r.get("mailbox") or "?"
+        subj = (r.get("subject") or "(no subject)")[:80]
+        who = r.get("from") if box != "sent" else (r.get("to") or r.get("from"))
+        who = (who or "")[:60]
+        date = (r.get("date") or "")[:32]
+        lines.append(f"{i}. [{box}] {date} | {who} | {subj}")
+    if len(rows) > limit:
+        lines.append(f"…and {len(rows) - limit} more.")
+    return "\n".join(lines) or "(no messages)"
 
 
 def _gmail_attachment_payload(
@@ -437,17 +648,77 @@ def answer(
 
     context may include:
       prospects: list of normalized prospects (e.g. st.session_state.last_prospects)
+      attachments: staged uploads (always available; user need not mention them)
+      mailbox_messages: last inbox/sent pull from chat (for filters + follow-ups)
     """
-    routing = route(user_msg, history)
-    sources: list[dict[str, Any]] = []
-    meta_routing = routing
     prospects = (context or {}).get("prospects") or []
     chat_attachments = (context or {}).get("attachments") or []
+    mailbox_messages = list((context or {}).get("mailbox_messages") or [])
     gmail_atts = _gmail_attachment_payload(chat_attachments)
     doc_context = document_context_from_attachments(chat_attachments)
     used_docs = bool(doc_context.strip())
+    att_names = _attachment_names(chat_attachments)
+    consumed_attachments = False
+    mailbox_out: list[dict[str, Any]] = []
+
+    routing = route(_route_user_msg(user_msg, chat_attachments), history)
+    sources: list[dict[str, Any]] = []
+    meta_routing = routing
+    need_file = False
+
+    # Heuristic: force Gmail route when user clearly asks about mailbox
+    if routing == "CHAT" or routing.startswith("CHAT"):
+        if re.search(
+            r"\b(my inbox|my sent|show (me )?(inbox|sent)|list (inbox|sent)|"
+            r"unread (emails|mail)|filter (my )?(inbox|sent|mail)|"
+            r"emails? (in|from) (my )?(inbox|sent))\b",
+            user_msg or "",
+            re.I,
+        ):
+            routing = "GMAIL_EXTRACT:auto"
+            meta_routing = routing
 
     try:
+        # Email attach requested but no file staged → ask for upload (don't send yet)
+        if (
+            not chat_attachments
+            and _wants_email_attachment(user_msg)
+            and routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL", "SCHEDULE_EMAIL"))
+        ):
+            need_file = True
+            yield _ask_for_upload(for_email_attach=True)
+            yield {
+                "__meta__": {
+                    "routing": meta_routing,
+                    "sources": [],
+                    "consumed_attachments": False,
+                    "need_file": True,
+                    "pending_user_msg": user_msg,
+                }
+            }
+            return
+
+        # General context from a file requested but nothing staged
+        if (
+            not chat_attachments
+            and _wants_file_context(user_msg)
+            and not routing.startswith(
+                ("DRAFT_EMAIL", "SEND_EMAIL", "SCHEDULE_EMAIL", "PROSPECT_", "GMAIL_")
+            )
+        ):
+            need_file = True
+            yield _ask_for_upload(for_email_attach=False)
+            yield {
+                "__meta__": {
+                    "routing": "CHAT_NEED_FILE",
+                    "sources": [],
+                    "consumed_attachments": False,
+                    "need_file": True,
+                    "pending_user_msg": user_msg,
+                }
+            }
+            return
+
         if routing.startswith("MEMORY"):
             hits = mem.search(user_msg, k=5)
             ctx = mem.format_for_prompt(hits)
@@ -455,6 +726,11 @@ def answer(
                 "Answer using ONLY the memory context below when possible. "
                 "Cite with [n] markers.\n\n" + ctx
             )
+            if used_docs:
+                system += (
+                    "\n\nAlso use this uploaded file context when relevant:\n"
+                    + doc_context
+                )
             for chunk in chat_grounded(
                 user_msg, history=history, system=system, use_search=False
             ):
@@ -479,6 +755,8 @@ def answer(
                 "Highlight emails when present, note gaps, suggest next enrich steps.\n\n"
                 + "\n\n".join(ctx_lines)
             )
+            if used_docs:
+                system += "\n\nUploaded file context:\n" + doc_context
             for chunk in chat_grounded(
                 user_msg, history=history, system=system, use_search=False
             ):
@@ -502,6 +780,8 @@ def answer(
                 "Present this enriched prospect clearly as JSON-aware prose.\n\n"
                 + json.dumps(result, default=str)[:6000]
             )
+            if used_docs:
+                system += "\n\nUploaded file context:\n" + doc_context
             for chunk in chat_grounded(
                 user_msg, history=history, system=system, use_search=False
             ):
@@ -510,20 +790,64 @@ def answer(
                 else:
                     yield chunk
 
-        elif routing.startswith("GMAIL_EXTRACT:"):
-            gmail_q = routing[len("GMAIL_EXTRACT:") :].strip() or "newer_than:7d"
-            batch = extract_batch(gmail_q, max_results=8)
-            system = (
-                "Summarize extracted inbox intelligence for the user.\n\n"
-                + json.dumps(batch, default=str)[:8000]
-            )
-            for chunk in chat_grounded(
-                user_msg, history=history, system=system, use_search=False
-            ):
-                if isinstance(chunk, dict) and "__meta__" in chunk:
-                    sources = chunk["__meta__"].get("sources") or []
+        elif routing.startswith("GMAIL_EXTRACT"):
+            raw_tail = ""
+            if ":" in routing:
+                raw_tail = routing.split(":", 1)[1].strip()
+            gmail_q, tag = _normalize_gmail_query(user_msg, raw_tail)
+            yield f"Reading Gmail (`{gmail_q}`)…\n"
+            try:
+                if tag == "both" or gmail_q.upper().startswith("BOTH"):
+                    days_m = re.search(r"newer_than:(\d+)d", gmail_q)
+                    days = int(days_m.group(1)) if days_m else 14
+                    batch = extract_inbox_and_sent(
+                        days=days,
+                        max_per_mailbox=30,
+                        ai_extract=False,
+                        include_inbox=True,
+                        include_sent=True,
+                    )
                 else:
-                    yield chunk
+                    batch = extract_batch(
+                        gmail_q, max_results=40, ai_extract=False
+                    )
+                    for row in batch:
+                        if not row.get("mailbox"):
+                            row["mailbox"] = tag if tag != "custom" else "custom"
+                filt_m = re.search(
+                    r"\b(?:filter(?:ed)?(?:\s+by)?|matching|containing)\s+(.+)$",
+                    user_msg or "",
+                    re.I,
+                )
+                if filt_m and "subject:" not in gmail_q.lower():
+                    batch = filter_messages(batch, filt_m.group(1))
+            except Exception as e:
+                yield f"Gmail read failed: {e}\n"
+                batch = []
+
+            mailbox_out = batch
+            if not batch:
+                yield (
+                    "No messages found. Try e.g. "
+                    "`show my inbox last 7 days` or `show sent about sponsor`."
+                )
+            else:
+                yield f"Found **{len(batch)}** messages:\n\n"
+                yield _format_mailbox_digest(batch)
+                yield (
+                    "\n\nNext: ask me to **draft personalized follow-ups** to these "
+                    "(optionally filtered), e.g. "
+                    "`draft follow-ups to everyone in this list about next steps`."
+                )
+            sources.append(
+                {
+                    "title": "gmail_extract",
+                    "url": "",
+                    "type": "gmail",
+                    "count": len(batch),
+                    "query": gmail_q,
+                }
+            )
 
         elif routing.startswith("DRAFT_EMAIL") or routing.startswith("SEND_EMAIL"):
             is_send = routing.startswith("SEND_EMAIL")
@@ -533,6 +857,13 @@ def answer(
                 if routing.startswith(prefix)
                 else {}
             )
+            # Prefer mailbox follow-ups when user asks and we have a prior pull
+            if mailbox_messages and re.search(
+                r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
+                user_msg or "",
+                re.I,
+            ):
+                seed = {**seed, "batch": True, "from_mailbox": True}
             payload = _extract_email_job(
                 user_msg,
                 history=history,
@@ -540,21 +871,61 @@ def answer(
                 for_schedule=False,
                 document_context=doc_context,
             )
-            for flag in ("batch", "from_prospects", "use_prospects", "recipient_emails"):
+            for flag in (
+                "batch",
+                "from_prospects",
+                "use_prospects",
+                "from_mailbox",
+                "use_mailbox",
+                "follow_up",
+                "mailbox_filter",
+                "recipient_emails",
+            ):
                 if flag in seed and flag not in payload:
                     payload[flag] = seed[flag]
             if chat_attachments:
                 payload["attachments"] = chat_attachments
+            # Default personalized follow-up templates when missing
+            if payload.get("from_mailbox") or payload.get("use_mailbox"):
+                if not payload.get("subject") or payload.get("subject") in (
+                    "(no subject)",
+                    user_msg,
+                ):
+                    payload["subject"] = "Following up: {prior_subject}"
+                body = payload.get("html_body") or ""
+                if (
+                    not body
+                    or body.strip() == f"<p>{user_msg}</p>"
+                    or "{first_name}" not in body
+                ):
+                    payload["html_body"] = (
+                        "<p>Hi {first_name},</p>"
+                        "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
+                        "<p>{prior_summary}</p>"
+                        "<p>Would you have time this week for a quick chat?</p>"
+                        "<p>Best regards</p>"
+                    )
 
             jobs = _build_draft_jobs(
-                payload, user_msg, history=history, prospects=prospects
+                payload,
+                user_msg,
+                history=history,
+                prospects=prospects,
+                mailbox_messages=mailbox_messages,
             )
             action = "send" if is_send else "draft"
-            if not jobs:
+            if not jobs and (
+                payload.get("from_mailbox") or payload.get("use_mailbox")
+            ):
+                yield (
+                    f"I couldn't {action} follow-ups — no mailbox contacts loaded yet. "
+                    "First say `show my inbox` or `show sent last 30 days`, "
+                    "optionally filter, then ask for personalized follow-ups."
+                )
+            elif not jobs:
                 yield (
                     f"I couldn't {action} — no recipient emails found. "
-                    "List addresses, or search prospects first then say "
-                    f"'{action} emails to all prospects'."
+                    "List addresses, search prospects, or pull inbox/sent first."
                 )
             elif len(jobs) == 1:
                 job = jobs[0]
@@ -583,6 +954,7 @@ def answer(
                 if result.get("error"):
                     yield f"{action.title()} failed: {result['error']}"
                 else:
+                    consumed_attachments = bool(chat_attachments)
                     if is_send:
                         yield (
                             f"Sent email to {job['recipient_email']} "
@@ -630,6 +1002,8 @@ def answer(
                         )
                 ok = [r for r in results if not r.get("error")]
                 fail = [r for r in results if r.get("error")]
+                if ok:
+                    consumed_attachments = bool(chat_attachments)
                 yield f"Done: **{len(ok)}** ok"
                 if fail:
                     yield f", **{len(fail)}** failed"
@@ -685,19 +1059,27 @@ def answer(
                 yield f"Scheduled email to {job['recipient_email']} at {send_at}."
                 yield f"{_attach_note(chat_attachments, used_document_context=used_docs)}\n"
                 yield f"Result: {json.dumps(result, default=str)}"
+                consumed_attachments = bool(chat_attachments)
 
         else:
-            # CHAT (default) — include uploaded PDF/text when present
-            system = None
-            if used_docs:
+            # CHAT (default) — uploaded files are context for ANY question
+            if att_names:
                 system = (
-                    "The user uploaded document(s). Use this extracted text when "
-                    "answering, summarizing, or helping draft email copy. Prefer "
-                    "facts from the documents over speculation.\n\n"
-                    f"{doc_context}"
+                    "The user uploaded these files for context (any topic — not only email): "
+                    f"{', '.join(att_names)}. "
+                    "Do NOT ask them to re-upload. Use the extracted content below to answer. "
+                    "If they later ask to draft/send an email and want the file attached, "
+                    "the same staged files will be attached automatically.\n\n"
+                    f"{doc_context or '(binary/attach-only file — note it exists)'}"
+                )
+            else:
+                system = (
+                    "Files can be uploaded via the chat paperclip for context. "
+                    "If they ask to attach a file to an email and none is uploaded yet, "
+                    "ask them to use the paperclip first. Do not invent file contents."
                 )
             for chunk in chat_grounded(
-                user_msg, history=history, system=system, use_search=True
+                user_msg, history=history, system=system, use_search=not bool(att_names)
             ):
                 if isinstance(chunk, dict) and "__meta__" in chunk:
                     sources = chunk["__meta__"].get("sources") or []
@@ -708,4 +1090,12 @@ def answer(
         print(f"[router] answer error: {e}", file=sys.stderr)
         yield f"[error] {e}"
 
-    yield {"__meta__": {"routing": meta_routing, "sources": sources}}
+    yield {
+        "__meta__": {
+            "routing": meta_routing,
+            "sources": sources,
+            "consumed_attachments": consumed_attachments,
+            "need_file": need_file,
+            "mailbox_messages": mailbox_out or None,
+        }
+    }
