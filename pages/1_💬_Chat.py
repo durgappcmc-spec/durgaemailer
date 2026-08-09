@@ -1,5 +1,5 @@
 # NOTE: Streaming UI captures __meta__ dicts separately from text chunks.
-# Stop interrupts the current run; Edit last lets you revise and resubmit.
+# Stop / Edit / Clear sit in the composer bar above st.chat_input.
 # Files come only from st.chat_input paperclip; staged across turns until cleared/used.
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ sync = ensure_session_sync(st.session_state)
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
-    "Use **Stop** to cancel a long run, **Edit last** to revise your prompt. "
+    "Stop / Edit / Clear sit under the chat, next to where you type. "
     "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it."
 )
 
@@ -40,102 +40,27 @@ for key, default in (
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ---- toolbar: Stop / Edit / Clear ----
-tb1, tb2, tb3, tb4 = st.columns([1, 1, 1, 4])
-with tb1:
-    stop_clicked = st.button(
-        "⏹ Stop",
-        type="primary",
-        use_container_width=True,
-        help="Cancel the current operation (works while Relay is running).",
-    )
-with tb2:
-    edit_clicked = st.button(
-        "✏️ Edit last",
-        use_container_width=True,
-        help="Edit your last message and run it again.",
-        disabled=not any(
-            m.get("role") == "user" for m in st.session_state.messages
-        ),
-    )
-with tb3:
-    clear_clicked = st.button(
-        "🗑️ Clear chat",
-        use_container_width=True,
-        help="Clear the conversation (keeps staged files).",
-    )
-
-if stop_clicked:
-    st.session_state.run_cancel = True
-    st.session_state.run_active = False
-    msgs = st.session_state.messages
-    # If a user turn was left without an assistant reply, mark it stopped
-    if msgs and msgs[-1].get("role") == "user":
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": "_(⏹ Stopped. Use **Edit last** to revise and resubmit.)_",
-                "meta": {"routing": "STOPPED", "cancelled": True},
-            }
-        )
-    elif msgs and msgs[-1].get("role") == "assistant":
-        content = msgs[-1].get("content") or ""
-        if "⏹ Stopped" not in content:
-            msgs[-1]["content"] = content + (
-                "\n\n_(⏹ Stopped by you.)_"
-            )
-            meta = dict(msgs[-1].get("meta") or {})
-            meta["cancelled"] = True
-            msgs[-1]["meta"] = meta
-    st.warning("Stopped.")
-    st.rerun()
-
-if clear_clicked:
-    st.session_state.messages = []
-    st.session_state.run_cancel = False
-    st.session_state.run_active = False
-    st.session_state.show_edit = False
-    st.session_state.edit_text = ""
-    st.rerun()
-
-if edit_clicked:
-    # Prefill from last user message; drop trailing assistant so resubmit replaces it
-    last_user = ""
-    for m in reversed(st.session_state.messages):
-        if m.get("role") == "user":
-            last_user = m.get("content") or ""
-            break
-    st.session_state.edit_text = last_user
-    st.session_state.edit_area = last_user
-    st.session_state.show_edit = True
-
-if st.session_state.get("show_edit"):
-    with st.expander("✏️ Edit last message", expanded=True):
-        edited = st.text_area(
-            "Your message",
-            height=140,
-            key="edit_area",
-        )
-        e1, e2, e3 = st.columns([1, 1, 3])
-        if e1.button("▶ Save & run", type="primary", use_container_width=True):
-            text = (edited or "").strip()
-            if text:
-                msgs = st.session_state.messages
-                # Remove last assistant (if any) then last user
-                if msgs and msgs[-1].get("role") == "assistant":
-                    msgs.pop()
-                if msgs and msgs[-1].get("role") == "user":
-                    msgs.pop()
-                st.session_state.messages = msgs
-                st.session_state.show_edit = False
-                st.session_state.edit_text = ""
-                st.session_state.run_cancel = False
-                st.session_state.force_prompt = text
-                st.rerun()
-        if e2.button("Cancel edit", use_container_width=True):
-            st.session_state.show_edit = False
-            st.session_state.edit_text = ""
-            st.rerun()
+# Keep composer controls visually tight against the bottom chat input
+st.markdown(
+    """
+<style>
+/* Composer bar: sit just above the fixed chat input */
+.relay-composer {
+  position: sticky;
+  bottom: 5.5rem;
+  z-index: 100;
+  background: var(--background-color, #0e1117);
+  padding: 0.35rem 0 0.15rem 0;
+  border-top: 1px solid rgba(128,128,128,0.25);
+  margin-top: 0.5rem;
+}
+.relay-composer .stButton > button {
+  min-height: 2.2rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 staged = st.session_state.staged_attachments or []
 mailbox_n = len(st.session_state.get("last_mailbox") or [])
@@ -165,19 +90,20 @@ if staged:
         names.append(label)
     c1, c2 = st.columns([5, 1])
     c1.success("Ready: " + ", ".join(names))
-    if c2.button("Clear files", use_container_width=True):
+    if c2.button("Clear files", use_container_width=True, key="clear_files_top"):
         st.session_state.staged_attachments = []
         st.session_state.need_file = False
         st.session_state.pending_user_msg = ""
         st.rerun()
     pending = (st.session_state.get("pending_user_msg") or "").strip()
-    if pending and st.button("Continue pending request", type="primary"):
+    if pending and st.button("Continue pending request", type="primary", key="continue_pending"):
         st.session_state.force_prompt = pending
         st.session_state.pending_user_msg = ""
         st.session_state.need_file = False
         st.rerun()
 
-for i, msg in enumerate(st.session_state.messages):
+# ---- message history ----
+for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         files = msg.get("files") or []
@@ -200,22 +126,110 @@ for i, msg in enumerate(st.session_state.messages):
                 st.caption(f"Routing: `{meta['routing']}`")
             if meta.get("cancelled"):
                 st.caption("Stopped by user")
-        # Quick edit on the latest user bubble
-        if (
-            msg.get("role") == "user"
-            and i == max(
-                (j for j, m in enumerate(st.session_state.messages) if m.get("role") == "user"),
-                default=-1,
-            )
-        ):
-            if st.button("✏️ Edit this message", key=f"edit_msg_{i}"):
-                st.session_state.edit_text = msg.get("content") or ""
-                st.session_state.edit_area = msg.get("content") or ""
-                st.session_state.show_edit = True
-                st.rerun()
+
+# ---- composer: edit panel + Stop/Edit/Clear + chat input ----
+st.markdown('<div class="relay-composer">', unsafe_allow_html=True)
+
+if st.session_state.get("show_edit"):
+    st.markdown("**✏️ Edit message**")
+    edited = st.text_area(
+        "Edit your message",
+        height=120,
+        key="edit_area",
+        label_visibility="collapsed",
+        placeholder="Revise your last message…",
+    )
+    e1, e2, _ = st.columns([1, 1, 3])
+    if e1.button("▶ Save & run", type="primary", use_container_width=True, key="edit_save"):
+        text = (edited or "").strip()
+        if text:
+            msgs = st.session_state.messages
+            if msgs and msgs[-1].get("role") == "assistant":
+                msgs.pop()
+            if msgs and msgs[-1].get("role") == "user":
+                msgs.pop()
+            st.session_state.messages = msgs
+            st.session_state.show_edit = False
+            st.session_state.edit_text = ""
+            st.session_state.run_cancel = False
+            st.session_state.force_prompt = text
+            st.rerun()
+    if e2.button("Cancel", use_container_width=True, key="edit_cancel"):
+        st.session_state.show_edit = False
+        st.session_state.edit_text = ""
+        st.rerun()
+
+has_user = any(m.get("role") == "user" for m in st.session_state.messages)
+tb1, tb2, tb3 = st.columns([1, 1, 1])
+with tb1:
+    stop_clicked = st.button(
+        "⏹ Stop",
+        type="primary",
+        use_container_width=True,
+        key="composer_stop",
+        help="Cancel the current operation.",
+    )
+with tb2:
+    edit_clicked = st.button(
+        "✏️ Edit",
+        use_container_width=True,
+        key="composer_edit",
+        help="Edit your last message and run again.",
+        disabled=not has_user,
+    )
+with tb3:
+    clear_clicked = st.button(
+        "🗑️ Clear",
+        use_container_width=True,
+        key="composer_clear",
+        help="Clear the conversation (keeps staged files).",
+    )
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+if stop_clicked:
+    st.session_state.run_cancel = True
+    st.session_state.run_active = False
+    msgs = st.session_state.messages
+    if msgs and msgs[-1].get("role") == "user":
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": "_(⏹ Stopped. Use **Edit** under the chat box to revise and resubmit.)_",
+                "meta": {"routing": "STOPPED", "cancelled": True},
+            }
+        )
+    elif msgs and msgs[-1].get("role") == "assistant":
+        content = msgs[-1].get("content") or ""
+        if "⏹ Stopped" not in content:
+            msgs[-1]["content"] = content + "\n\n_(⏹ Stopped by you.)_"
+            meta = dict(msgs[-1].get("meta") or {})
+            meta["cancelled"] = True
+            msgs[-1]["meta"] = meta
+    st.toast("Stopped")
+    st.rerun()
+
+if clear_clicked:
+    st.session_state.messages = []
+    st.session_state.run_cancel = False
+    st.session_state.run_active = False
+    st.session_state.show_edit = False
+    st.session_state.edit_text = ""
+    st.rerun()
+
+if edit_clicked:
+    last_user = ""
+    for m in reversed(st.session_state.messages):
+        if m.get("role") == "user":
+            last_user = m.get("content") or ""
+            break
+    st.session_state.edit_text = last_user
+    st.session_state.edit_area = last_user
+    st.session_state.show_edit = True
+    st.rerun()
 
 prompt = st.chat_input(
-    "Ask anything… paperclip to add files for context / email attach",
+    "Ask anything… paperclip to add files · Stop / Edit / Clear are just above",
     accept_file="multiple",
     file_type=None,
 )
@@ -278,7 +292,10 @@ if prompt:
         return bool(st.session_state.get("run_cancel"))
 
     with st.chat_message("assistant"):
-        status = st.status("Running… click **⏹ Stop** above to cancel", expanded=False)
+        status = st.status(
+            "Running… use **⏹ Stop** next to the message box to cancel",
+            expanded=False,
+        )
         placeholder = st.empty()
         text = ""
         meta: dict = {}
@@ -296,7 +313,7 @@ if prompt:
             ):
                 if _cancel_check():
                     text += (
-                        "\n\n_(⏹ Stopped by you — use **Edit last** to revise.)_"
+                        "\n\n_(⏹ Stopped by you — use **Edit** under the chat box to revise.)_"
                     )
                     stopped = True
                     meta = {**(meta or {}), "cancelled": True, "routing": "STOPPED"}
