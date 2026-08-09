@@ -20,9 +20,9 @@ sync = ensure_session_sync(st.session_state)
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file context/attach. "
-    "ZoomInfo search: `find CEOs at Microsoft on ZoomInfo`. "
-    "Then: `draft personalized emails to all these prospects`. "
-    "Gmail + contacts auto-sync to memory on open."
+    "ZoomInfo: `find CEOs at Microsoft on ZoomInfo`. "
+    "LinkedIn enrich: paste a profile URL (add `at Company` if you know it). "
+    "Then: `draft/send email to them`. Credentials stay in .env — never asked in chat."
 )
 
 if "messages" not in st.session_state:

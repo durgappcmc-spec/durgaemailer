@@ -30,6 +30,7 @@ def _apply_streamlit_secrets() -> None:
         "APOLLO_API_KEY",
         "ZOOMINFO_USERNAME",
         "ZOOMINFO_PASSWORD",
+        "ZOOMINFO_API_KEY",
         "ZOOMINFO_CLIENT_ID",
         "ZOOMINFO_PRIVATE_KEY_PATH",
         "ROCKETREACH_API_KEY",
@@ -73,6 +74,7 @@ class Settings:
         self.APOLLO_API_KEY: str = os.getenv("APOLLO_API_KEY", "")
         self.ZOOMINFO_USERNAME: str = os.getenv("ZOOMINFO_USERNAME", "")
         self.ZOOMINFO_PASSWORD: str = os.getenv("ZOOMINFO_PASSWORD", "")
+        self.ZOOMINFO_API_KEY: str = os.getenv("ZOOMINFO_API_KEY", "")
         self.ZOOMINFO_CLIENT_ID: str = os.getenv("ZOOMINFO_CLIENT_ID", "")
         self.ZOOMINFO_PRIVATE_KEY_PATH: str = os.getenv(
             "ZOOMINFO_PRIVATE_KEY_PATH", "./credentials/zoominfo.txt"

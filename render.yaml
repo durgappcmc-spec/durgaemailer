@@ -40,5 +40,7 @@ services:
         sync: false
       - key: ZOOMINFO_PASSWORD
         sync: false
+      - key: ZOOMINFO_API_KEY
+        sync: false
       - key: ZOOMINFO_CLIENT_ID
         sync: false

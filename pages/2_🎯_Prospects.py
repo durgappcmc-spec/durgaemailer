@@ -83,8 +83,8 @@ with tab_enrich:
         title = c2.text_input("Title")
         order = st.multiselect(
             "Fallthrough order",
-            ["rocketreach", "apollo", "zoominfo"],
-            default=["rocketreach", "apollo", "zoominfo"],
+            ["zoominfo", "apollo", "rocketreach"],
+            default=["zoominfo", "apollo", "rocketreach"],
         )
         go = st.form_submit_button("✨ Enrich")
 
@@ -98,7 +98,9 @@ with tab_enrich:
             "title": title,
         }
         with st.spinner("Enriching…"):
-            result = enrich_fallthrough(ident, order=order or ["rocketreach", "apollo"])
+            result = enrich_fallthrough(
+                ident, order=order or ["zoominfo", "apollo", "rocketreach"]
+            )
         st.session_state.last_enrich = result
         st.json(result)
         if result and not result.get("error"):

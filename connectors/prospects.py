@@ -69,9 +69,15 @@ def search_all(
 
 def enrich_fallthrough(
     identifier: dict[str, Any],
-    order: tuple[str, ...] | list[str] = ("rocketreach", "apollo", "zoominfo"),
+    order: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Try providers in order; return first result that has an email."""
+    if order is None:
+        # LinkedIn URLs: ZoomInfo resolves via name search; Apollo/RR accept the URL.
+        if identifier.get("linkedin_url") or identifier.get("linkedin"):
+            order = ("zoominfo", "apollo", "rocketreach")
+        else:
+            order = ("zoominfo", "apollo", "rocketreach")
     errors: list[dict[str, str]] = []
     last_without_email: Optional[dict[str, Any]] = None
     for name in order:

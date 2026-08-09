@@ -9,8 +9,9 @@ from datetime import datetime, timedelta
 from typing import Any, Generator, Optional
 
 from connectors.ingest_to_memory import prospect_to_text
-from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from connectors.prospects import enrich_fallthrough, search_all
+from connectors.zoominfo import extract_linkedin_url, names_from_linkedin_url
+from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json
 from gmail_client.attachments import document_context_from_attachments
@@ -44,6 +45,10 @@ Rules:
 - After a prospect search, if the user asks to email/draft/send to that list / all of them / these prospects,
   use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
+  When the user pastes a LinkedIn profile URL, ALWAYS use PROSPECT_ENRICH with linkedin_url set.
+  Example: PROSPECT_ENRICH:{"linkedin_url":"https://www.linkedin.com/in/jane-doe","company":"Acme"}
+  If they also ask to draft/send an email to that person in the same message, still choose PROSPECT_ENRICH
+  (the app will enrich then draft/send). Never ask the user for ZoomInfo credentials — they are already configured.
 - GMAIL_EXTRACT: read / list / filter the user's Gmail inbox and/or sent mail.
   After the colon put a Gmail search query (NOT prose).
   Examples:
@@ -684,6 +689,41 @@ def answer(
             routing = "GMAIL_EXTRACT:auto"
             meta_routing = routing
 
+    # Heuristic: LinkedIn URL → enrich (optionally continue to draft/send)
+    linkedin_url = extract_linkedin_url(user_msg or "")
+    wants_email_after_enrich = bool(
+        linkedin_url
+        and re.search(
+            r"\b(send|draft|email|mail|outreach|write (to|them|him|her))\b",
+            user_msg or "",
+            re.I,
+        )
+    )
+    if linkedin_url and (
+        routing == "CHAT"
+        or routing.startswith("CHAT")
+        or routing.startswith("PROSPECT_SEARCH")
+        or (
+            wants_email_after_enrich
+            and routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL"))
+        )
+    ):
+        first, last = names_from_linkedin_url(linkedin_url)
+        company_m = re.search(
+            r"\b(?:at|@|company)\s+([A-Za-z0-9&.\- ]{2,60})",
+            user_msg or "",
+            re.I,
+        )
+        ident: dict[str, Any] = {"linkedin_url": linkedin_url}
+        if first:
+            ident["first_name"] = first
+        if last:
+            ident["last_name"] = last
+        if company_m:
+            ident["company"] = company_m.group(1).strip(" .,")
+        routing = "PROSPECT_ENRICH:" + json.dumps(ident, ensure_ascii=False)
+        meta_routing = routing
+
     try:
         # Email attach requested but no file staged → ask for upload (don't send yet)
         if (
@@ -821,21 +861,132 @@ def answer(
             )
 
         elif routing.startswith("PROSPECT_ENRICH:"):
-            ident = _parse_json_tail(routing, "PROSPECT_ENRICH:")
-            result = enrich_fallthrough(ident or {"name": user_msg})
-            system = (
-                "Present this enriched prospect clearly as JSON-aware prose.\n\n"
-                + json.dumps(result, default=str)[:6000]
+            ident = _parse_json_tail(routing, "PROSPECT_ENRICH:") or {}
+            # Pull LinkedIn / company from the user message when JSON is sparse
+            li = (
+                ident.get("linkedin_url")
+                or ident.get("linkedin")
+                or extract_linkedin_url(user_msg or "")
             )
-            if used_docs:
-                system += "\n\nUploaded file context:\n" + doc_context
-            for chunk in chat_grounded(
-                user_msg, history=history, system=system, use_search=False
+            if li:
+                ident["linkedin_url"] = li
+                if not ident.get("first_name") or not ident.get("last_name"):
+                    f, l = names_from_linkedin_url(li)
+                    ident.setdefault("first_name", f)
+                    ident.setdefault("last_name", l)
+            if not ident.get("company"):
+                company_m = re.search(
+                    r"\b(?:at|@|company)\s+([A-Za-z0-9&.\- ]{2,60})",
+                    user_msg or "",
+                    re.I,
+                )
+                if company_m:
+                    ident["company"] = company_m.group(1).strip(" .,")
+            if not ident:
+                ident = {"name": user_msg}
+
+            yield "Enriching contact…\n"
+            result = enrich_fallthrough(ident)
+            if result and not result.get("error"):
+                prospect_out = [result]
+                try:
+                    auto_ingest_prospects([result])
+                except Exception as e:
+                    print(f"[router] enrich auto-ingest error: {e}", file=sys.stderr)
+                yield (
+                    f"Matched **{result.get('name') or 'contact'}**"
+                    + (f" · {result.get('title')}" if result.get("title") else "")
+                    + (f" @ {result.get('company')}" if result.get("company") else "")
+                    + (
+                        f"\nEmail: `{result.get('email')}`"
+                        if result.get("email")
+                        else "\n_(no email found)_"
+                    )
+                    + "\n"
+                )
+
+            # Same-turn draft/send after LinkedIn enrich
+            if (
+                wants_email_after_enrich
+                and result
+                and (result.get("email") or "").strip()
             ):
-                if isinstance(chunk, dict) and "__meta__" in chunk:
-                    sources = chunk["__meta__"].get("sources") or []
-                else:
-                    yield chunk
+                is_send = bool(
+                    re.search(r"\b(send|fire off|email them now)\b", user_msg or "", re.I)
+                    and not re.search(r"\bdraft\b", user_msg or "", re.I)
+                )
+                seed = {
+                    "recipient_email": result.get("email"),
+                    "recipient_name": result.get("name") or "",
+                    "batch": False,
+                }
+                payload = _extract_email_job(
+                    user_msg,
+                    history=history,
+                    seed=seed,
+                    for_schedule=False,
+                    document_context=doc_context,
+                )
+                payload["recipient_email"] = result.get("email")
+                payload.setdefault("recipient_name", result.get("name") or "")
+                if chat_attachments:
+                    payload["attachments"] = chat_attachments
+                    consumed_attachments = True
+                jobs = _build_draft_jobs(
+                    payload,
+                    user_msg,
+                    history=history,
+                    prospects=[result],
+                    mailbox_messages=mailbox_messages,
+                )
+                if not jobs:
+                    jobs = [
+                        {
+                            "recipient_email": result.get("email"),
+                            "recipient_name": result.get("name") or "",
+                            "subject": payload.get("subject") or "(no subject)",
+                            "html_body": payload.get("html_body")
+                            or payload.get("body")
+                            or f"<p>{user_msg}</p>",
+                        }
+                    ]
+                verb = "Sending" if is_send else "Drafting"
+                yield f"\n{verb} email to **{result.get('email')}**…\n"
+                for job in jobs:
+                    try:
+                        if is_send:
+                            out = send_email(
+                                to=job["recipient_email"],
+                                subject=job.get("subject") or "(no subject)",
+                                html_body=job.get("html_body") or "",
+                                attachments=job.get("attachments") or gmail_atts or None,
+                            )
+                        else:
+                            out = create_draft(
+                                to=job["recipient_email"],
+                                subject=job.get("subject") or "(no subject)",
+                                html_body=job.get("html_body") or "",
+                                attachments=job.get("attachments") or gmail_atts or None,
+                            )
+                        yield f"- {'Sent' if is_send else 'Drafted'}: {out}\n"
+                    except Exception as e:
+                        yield f"- Failed for {job.get('recipient_email')}: {e}\n"
+            else:
+                system = (
+                    "Present this enriched prospect clearly. "
+                    "If an email is present, remind the user they can say "
+                    "`draft email to them` or `send email to them`.\n\n"
+                    + json.dumps(result, default=str)[:6000]
+                )
+                if used_docs:
+                    system += "\n\nUploaded file context:\n" + doc_context
+                for chunk in chat_grounded(
+                    user_msg, history=history, system=system, use_search=False
+                ):
+                    if isinstance(chunk, dict) and "__meta__" in chunk:
+                        sources = chunk["__meta__"].get("sources") or []
+                    else:
+                        yield chunk
 
         elif routing.startswith("GMAIL_EXTRACT"):
             raw_tail = ""

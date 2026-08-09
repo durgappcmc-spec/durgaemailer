@@ -9,6 +9,8 @@ data/
 credentials/gmail_token.json
 credentials/*.json
 credentials/zoominfo.txt
+credentials/zoominfo_api_key.txt
+credentials/zoominfo_api.txt
 !credentials/.gitkeep
 .streamlit/secrets.toml
 node_modules/
