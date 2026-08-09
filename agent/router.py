@@ -14,6 +14,13 @@ from connectors.zoominfo import extract_linkedin_url, names_from_linkedin_url
 from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json
+from agent.intent import (
+    IntentPlan,
+    classify_email_roles,
+    filter_recipient_emails,
+    plan_request,
+    plan_summary,
+)
 from agent.research_pipeline import (
     run_research_then_zoom,
     wants_research_then_zoom,
@@ -33,7 +40,7 @@ from gmail_client.send import (
 )
 from scheduling.client import schedule_email
 
-ROUTER_SYSTEM = """You are a routing classifier for Relay, a prospect research and outreach tool.
+ROUTER_SYSTEM = """You are a routing classifier for Relay, a CSR outreach tool (Karuna Media).
 Given the user message, output EXACTLY ONE line choosing one of:
 
 CHAT
@@ -49,9 +56,10 @@ SCHEDULE_EMAIL:<compact-json>
 Rules:
 - CHAT: general questions, research, writing help — Gemini will use Google Search.
 - MEMORY: user asks about saved notes/prospects already in memory.
-- RESEARCH_THEN_ZOOM: use when the user asks for orgs matching a MISSION / demographic
-  (e.g. NGOs for girls 16+ skilling, women livelihoods) and then wants ZoomInfo contacts
-  and/or emails / drafts. Do NOT dump demographics into ZoomInfo filters.
+- RESEARCH_THEN_ZOOM: ONLY when the user asks to FIND/DISCOVER orgs matching a MISSION
+  (e.g. "find NGOs for girls 16+ skilling in Noida") then ZoomInfo contacts and/or drafts.
+  Do NOT choose this just because they say CSR, csr@karunamedia.org, Karuna, partnership,
+  or "from CSR" — that means the SENDER identity for drafts, not org discovery.
   Example: RESEARCH_THEN_ZOOM:{"org_limit":8,"contacts_per_org":3,"draft":true}
   Set draft:true if they also ask to draft/write personalized emails in the same message.
   Set send:true only if they explicitly say send now.
@@ -59,39 +67,27 @@ Rules:
   JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
   Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
   PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":20}
-  For plain NGO staff lookups without mission filters: company_names=["NGO"], locations=["Noida"].
   Never ask the user for ZoomInfo credentials.
 - After a prospect / research search, if the user asks to email/draft/send to that list,
   use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
 - PROSPECT_ENRICH: enrich one person. JSON keys: first_name, last_name, email, company, linkedin_url, title.
   When the user pastes a LinkedIn profile URL, ALWAYS use PROSPECT_ENRICH with linkedin_url set.
-  Example: PROSPECT_ENRICH:{"linkedin_url":"https://www.linkedin.com/in/jane-doe","company":"Acme"}
-  If they also ask to draft/send an email to that person in the same message, still choose PROSPECT_ENRICH
-  (the app will enrich then draft/send). Never ask the user for ZoomInfo credentials — they are already configured.
-- GMAIL_EXTRACT: read / list / filter the user's Gmail inbox and/or sent mail.
-  After the colon put a Gmail search query (NOT prose).
-  Examples:
-    GMAIL_EXTRACT:in:inbox newer_than:14d
-    GMAIL_EXTRACT:in:sent newer_than:30d
-    GMAIL_EXTRACT:in:inbox is:unread newer_than:7d
-    GMAIL_EXTRACT:in:sent newer_than:60d subject:sponsor
-  Prefer GMAIL_EXTRACT when user says inbox, sent, mailbox, unread, emails from/to, filter mail.
-- DRAFT_EMAIL: create/save one OR MANY Gmail drafts (not send, not schedule).
-  Compact JSON ONLY — never include html_body.
-  Single: {"recipient_email":"a@b.com","subject":"Hello"}
-  Multi: {"batch":true,"recipient_emails":["a@b.com","b@c.com"],"subject":"Hello"}
-  From last prospect search: {"batch":true,"from_prospects":true,"subject":"Hello"}
-  Personalized follow-ups to last inbox/sent pull:
-    {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
-  Optional filter on last mailbox: {"batch":true,"from_mailbox":true,"mailbox_filter":"sponsor"}
-- SEND_EMAIL: send email(s) now. Same compact JSON shapes as DRAFT_EMAIL (including from_mailbox).
-- SCHEDULE_EMAIL: schedule/queue for later. Compact JSON with recipient_email, subject, send_at.
+  If they also ask to draft/send in the same message, still choose PROSPECT_ENRICH.
+- GMAIL_EXTRACT: read / list / filter Gmail. After the colon put a Gmail search query (NOT prose).
+- DRAFT_EMAIL: create Gmail drafts for review (default for outreach). Compact JSON ONLY — never html_body.
+  Single: {"recipient_email":"a@b.com","subject":"Hello","cc":["x@y.com","z@y.com"]}
+  Multi: {"batch":true,"recipient_emails":["a@b.com"],"cc":["x@y.com","z@y.com"]}
+  From last prospects: {"batch":true,"from_prospects":true,"subject":"Hello"}
+  From mailbox: {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
+  Include ALL cc addresses the user listed. Put ignored emails in "ignore_emails".
+  Never put csr@karunamedia.org or CC addresses in recipient_email(s).
+- SEND_EMAIL: send now only. Same compact JSON shapes as DRAFT_EMAIL.
+- SCHEDULE_EMAIL: schedule later. Compact JSON with recipient_email, subject, send_at.
   NEVER include html_body in routing lines.
-- Prefer DRAFT_EMAIL for draft/compose/save draft / follow-up drafts.
-- Prefer SEND_EMAIL for send now / fire off.
+- Prefer DRAFT_EMAIL for draft/compose / CSR outreach from csr@.
+- Prefer SEND_EMAIL only for send now / fire off.
 - Prefer SCHEDULE_EMAIL for schedule/send later/queue.
-- If user wants bulk personalized follow-ups to people from inbox/sent / last mail pull, use
-  DRAFT_EMAIL (or SEND_EMAIL) with batch:true and from_mailbox:true.
+- If user says ignore/skip/don't use an email, never route it as a recipient.
 - Chat may include file attachments; do not mention them in the routing line.
 - When prefixed with [ATTACHED FILES: ...], files are already uploaded — do not ask to attach.
 
@@ -320,14 +316,23 @@ Uploaded document text (use this as source material for the email):
     prompt = f"""Extract an email job from the conversation.
 
 Return JSON with keys:
-recipient_email (string),
-recipient_emails (array of strings — when multiple recipients),
+recipient_email (string — To only; never put CC or from/CSR here),
+recipient_emails (array — To only when multiple),
+cc (array of ALL CC addresses the user listed — never drop any),
+ignore_emails (array — addresses user said to ignore/skip/don't use),
+from_email (string — usually csr@karunamedia.org),
 recipient_name (string),
 subject (string — may include {{first_name}} {{name}} {{title}} {{company}} templates),
 html_body (string — HTML email body; may include the same {{placeholders}}),
 use_prospects (boolean — true if user wants drafts for last searched prospects),
 {send_at_line}campaign (string),
 source (string)
+
+Rules for recipients:
+- csr@karunamedia.org is From, never To.
+- Addresses after "cc" go ONLY in cc (include every one).
+- Addresses after ignore/skip/don't use go ONLY in ignore_emails.
+- Do not invent NGO lists; extract the email job only.
 
 Rules for html_body:
 - If uploaded document text is provided, write a clear professional email that uses
@@ -365,11 +370,18 @@ Seed fields already known (prefer newer message if conflict):
         print(f"[router] email extract failed: {e}", file=sys.stderr)
 
     if not seed.get("recipient_email") and not seed.get("recipient_emails"):
-        found = _EMAIL_RE.findall(user_msg)
-        if len(found) == 1:
-            seed["recipient_email"] = found[0]
-        elif len(found) > 1:
-            seed["recipient_emails"] = found
+        roles = classify_email_roles(user_msg)
+        if roles.to:
+            if len(roles.to) == 1:
+                seed["recipient_email"] = roles.to[0]
+            else:
+                seed["recipient_emails"] = roles.to
+        if roles.cc and not seed.get("cc"):
+            seed["cc"] = roles.cc
+        if roles.ignore and not seed.get("ignore_emails"):
+            seed["ignore_emails"] = roles.ignore
+        if roles.from_email and not seed.get("from_email"):
+            seed["from_email"] = roles.from_email
     if not seed.get("html_body"):
         if document_context.strip():
             seed["html_body"] = (
@@ -390,48 +402,51 @@ def _build_draft_jobs(
     history: Optional[list[dict[str, str]]] = None,
     prospects: Optional[list[dict[str, Any]]] = None,
     mailbox_messages: Optional[list[dict[str, Any]]] = None,
+    *,
+    plan: Optional[IntentPlan] = None,
 ) -> list[dict[str, Any]]:
     """Expand a draft payload into one job per recipient."""
     subject_tmpl = payload.get("subject") or "(no subject)"
     body_tmpl = payload.get("html_body") or payload.get("body") or f"<p>{user_msg}</p>"
     campaign = payload.get("campaign") or ""
     source = payload.get("source") or "chat_draft"
+    plan = plan or IntentPlan(
+        from_email=payload.get("from_email") or default_from_email(),
+        cc=list(payload.get("cc") or []),
+        ignore_emails=list(payload.get("ignore_emails") or []),
+    )
+    block = plan.non_recipient_emails()
 
-    use_prospects = bool(
+    jobs: list[dict[str, Any]] = []
+
+    # Mailbox / prospect batch paths
+    from_mailbox = bool(
+        payload.get("from_mailbox")
+        or payload.get("use_mailbox")
+        or payload.get("follow_up")
+        or re.search(
+            r"\b(follow[- ]?ups?|from (my )?(inbox|sent|mailbox)|last (mail|inbox|sent|extract)|everyone (i|we) (emailed|contacted))\b",
+            user_msg or "",
+            re.I,
+        )
+    )
+    from_prospects = bool(
         payload.get("from_prospects")
         or payload.get("use_prospects")
         or (
             payload.get("batch")
             and re.search(
                 r"\b(all prospects|these prospects|last search|everyone we found)\b",
-                user_msg,
+                user_msg or "",
                 re.I,
             )
         )
     )
-    if payload.get("from_prospects") or payload.get("use_prospects"):
-        use_prospects = True
 
-    use_mailbox = bool(
-        payload.get("from_mailbox")
-        or payload.get("use_mailbox")
-        or payload.get("follow_up")
-        or re.search(
-            r"\b(follow[- ]?ups?|from (my )?(inbox|sent|mailbox)|last (mail|inbox|sent|extract)|everyone (i|we) (emailed|contacted))\b",
-            user_msg,
-            re.I,
-        )
-    )
-    if payload.get("from_mailbox") or payload.get("use_mailbox") or payload.get("follow_up"):
-        use_mailbox = True
-
-    jobs: list[dict[str, Any]] = []
-
-    if use_mailbox:
+    if from_mailbox and mailbox_messages:
         msgs = list(mailbox_messages or [])
         filt = str(payload.get("mailbox_filter") or payload.get("filter") or "").strip()
         if not filt:
-            # Try to pull a filter phrase after "about/regarding/filter"
             m = re.search(
                 r"\b(?:about|regarding|filter(?:ed)?(?:\s+by)?|matching|with subject)\s+(.+)$",
                 user_msg,
@@ -442,14 +457,22 @@ def _build_draft_jobs(
         if filt:
             msgs = filter_messages(msgs, filt)
         prefer = "auto"
-        if re.search(r"\binbox\b", user_msg, re.I) and not re.search(r"\bsent\b", user_msg, re.I):
+        if re.search(r"\binbox\b", user_msg, re.I) and not re.search(
+            r"\bsent\b", user_msg, re.I
+        ):
             prefer = "inbox"
-        elif re.search(r"\bsent\b", user_msg, re.I) and not re.search(r"\binbox\b", user_msg, re.I):
+        elif re.search(r"\bsent\b", user_msg, re.I) and not re.search(
+            r"\binbox\b", user_msg, re.I
+        ):
             prefer = "sent"
         contacts = contacts_from_mailbox(msgs, prefer=prefer)
         for p in contacts:
+            email = (p.get("email") or "").strip()
+            if not email or email.lower() in block:
+                continue
+            p = {**p, "email": email, "recipient_email": email}
             job = {
-                "recipient_email": p.get("email"),
+                "recipient_email": email,
                 "recipient_name": p.get("name") or "",
                 "subject": _apply_template(subject_tmpl, p),
                 "html_body": _apply_template(body_tmpl, p),
@@ -466,16 +489,19 @@ def _build_draft_jobs(
         if jobs:
             return jobs
 
-    if use_prospects:
-        rows = _prospects_with_email(prospects)
-        for p in rows:
+    if from_prospects:
+        for p in _prospects_with_email(prospects):
+            email = (p.get("email") or "").strip()
+            if not email or email.lower() in block:
+                continue
+            p = {**p, "email": email, "recipient_email": email}
             job = {
-                "recipient_email": p.get("email"),
+                "recipient_email": email,
                 "recipient_name": p.get("name") or "",
                 "subject": _apply_template(subject_tmpl, p),
                 "html_body": _apply_template(body_tmpl, p),
                 "campaign": campaign,
-                "source": source,
+                "source": source or "prospect_batch",
             }
             if payload.get("attachments"):
                 job["attachments"] = payload["attachments"]
@@ -494,20 +520,22 @@ def _build_draft_jobs(
         )
     if payload.get("recipient_email"):
         emails.append(str(payload["recipient_email"]).strip())
+    if plan.to_emails:
+        emails.extend(plan.to_emails)
 
-    scraped = _EMAIL_RE.findall(user_msg)
-    if len(scraped) > 1:
-        for e in scraped:
-            if e not in emails:
-                emails.append(e)
-    elif not emails and scraped:
-        emails.extend(scraped)
+    # Never treat From / CC / ignored addresses as To (old bug: scraped all emails).
+    emails = filter_recipient_emails(emails, plan=plan)
+
+    # Only use explicit To roles if we still have no recipients
+    if not emails:
+        roles = classify_email_roles(user_msg)
+        emails = filter_recipient_emails(roles.to, plan=plan)
 
     seen: set[str] = set()
     uniq: list[str] = []
     for e in emails:
         key = e.lower()
-        if key in seen:
+        if key in seen or key in block:
             continue
         seen.add(key)
         uniq.append(e)
@@ -671,8 +699,9 @@ def _extract_cc_emails(
     *,
     seed: Optional[dict[str, Any]] = None,
     exclude: Optional[set[str]] = None,
+    plan: Optional[IntentPlan] = None,
 ) -> list[str]:
-    """Pull CC addresses from seed JSON and phrases like 'cc a@b.com'."""
+    """Pull ALL CC addresses from seed, planner, and phrases like 'cc a@b.com and c@d.com'."""
     found: list[str] = []
     seed = seed or {}
     for key in ("cc", "cc_emails", "cc_email"):
@@ -683,23 +712,21 @@ def _extract_cc_emails(
             for item in val:
                 found.extend(_EMAIL_RE.findall(str(item)))
 
-    msg = user_msg or ""
-    for m in re.finditer(
-        r"\bcc(?:\s*[:=]|\s+to)?\s+([^\n|;]+)",
-        msg,
-        re.I,
-    ):
-        found.extend(_EMAIL_RE.findall(m.group(1)))
-    # Also: "copy alice@x.com" / "with cc alice@x.com"
-    for m in re.finditer(
-        r"\b(?:copy|carbon\s+copy)\s+([^\n|;]+)",
-        msg,
-        re.I,
-    ):
-        found.extend(_EMAIL_RE.findall(m.group(1)))
+    if plan and plan.cc:
+        found.extend(plan.cc)
 
+    roles = classify_email_roles(user_msg or "")
+    found.extend(roles.cc)
     found.extend(default_cc_emails())
+
     exclude = {e.lower() for e in (exclude or set())}
+    if plan:
+        exclude |= {e.lower() for e in plan.ignore_emails}
+        fe = (plan.from_email or default_from_email()).lower()
+        if fe:
+            exclude.add(fe)
+    exclude.add("csr@karunamedia.org")
+
     out: list[str] = []
     seen: set[str] = set()
     for e in found:
@@ -709,6 +736,38 @@ def _extract_cc_emails(
         seen.add(key)
         out.append(e)
     return out
+
+
+def _mail_headers(
+    user_msg: str,
+    *,
+    seed: Optional[dict[str, Any]] = None,
+    to_emails: Optional[list[str]] = None,
+    plan: Optional[IntentPlan] = None,
+) -> dict[str, Any]:
+    exclude = {e.lower() for e in (to_emails or [])}
+    if plan:
+        exclude |= {e.lower() for e in plan.ignore_emails}
+    from_email = (
+        (plan.from_email if plan and plan.from_email else None)
+        or (seed or {}).get("from_email")
+        or default_from_email()
+    )
+    cc = _extract_cc_emails(
+        user_msg, seed=seed, exclude=exclude | {from_email.lower()}, plan=plan
+    )
+    # Ensure planner CCs are never dropped (even if a To scrape conflicted earlier)
+    if plan and plan.cc:
+        seen = {c.lower() for c in cc}
+        for e in plan.cc:
+            if (
+                e.lower() not in seen
+                and e.lower() not in exclude
+                and e.lower() != from_email.lower()
+            ):
+                cc.append(e)
+                seen.add(e.lower())
+    return {"from_email": from_email, "cc": cc}
 
 
 def _stamp_mail_fields(
@@ -753,19 +812,6 @@ def _deliver_job(
     return create_draft(**kwargs), False
 
 
-def _mail_headers(
-    user_msg: str,
-    *,
-    seed: Optional[dict[str, Any]] = None,
-    to_emails: Optional[list[str]] = None,
-) -> dict[str, Any]:
-    exclude = {e.lower() for e in (to_emails or [])}
-    return {
-        "from_email": default_from_email(),
-        "cc": _extract_cc_emails(user_msg, seed=seed, exclude=exclude),
-    }
-
-
 def _attach_note(
     attachments: Optional[list[dict[str, Any]]],
     *,
@@ -791,15 +837,36 @@ def _resolve_recipient(
     job: dict[str, Any],
     user_msg: str,
     history: Optional[list[dict[str, str]]] = None,
+    *,
+    plan: Optional[IntentPlan] = None,
 ) -> dict[str, Any]:
     if job.get("recipient_email"):
+        email = str(job["recipient_email"]).strip()
+        if plan and email.lower() in plan.non_recipient_emails():
+            job.pop("recipient_email", None)
+        else:
+            return job
+    roles = classify_email_roles(user_msg or "")
+    if roles.to:
+        job["recipient_email"] = roles.to[0]
+        return job
+    if plan and plan.to_emails:
+        job["recipient_email"] = plan.to_emails[0]
         return job
     blob = user_msg + "\n" + "\n".join(
         (m.get("content") or "") for m in (history or [])
     )
     found = _EMAIL_RE.findall(blob)
-    if found:
-        job["recipient_email"] = found[-1]
+    block = plan.non_recipient_emails() if plan else {
+        default_from_email().lower(),
+        "csr@karunamedia.org",
+        *[e.lower() for e in classify_email_roles(user_msg or "").cc],
+        *[e.lower() for e in classify_email_roles(user_msg or "").ignore],
+    }
+    for e in reversed(found):
+        if e.lower() not in block:
+            job["recipient_email"] = e
+            break
     return job
 
 
@@ -874,6 +941,63 @@ def answer(
     meta_routing = routing
     need_file = False
 
+    # Intelligent planner: From/To/CC/ignore + which specialist agents to run
+    plan = plan_request(user_msg, history)
+    yield plan_summary(plan)
+
+    # Map planner action onto routing when the classifier/heuristics would misfire
+    action_to_prefix = {
+        "research_then_zoom": "RESEARCH_THEN_ZOOM",
+        "prospect_search": "PROSPECT_SEARCH",
+        "prospect_enrich": "PROSPECT_ENRICH",
+        "gmail_extract": "GMAIL_EXTRACT",
+        "draft_email": "DRAFT_EMAIL",
+        "send_email": "SEND_EMAIL",
+        "schedule_email": "SCHEDULE_EMAIL",
+        "memory": "MEMORY",
+        "chat": "CHAT",
+    }
+    planned_prefix = action_to_prefix.get(plan.action, "CHAT")
+    # Prefer planner over RESEARCH_THEN_ZOOM false positives (CSR-as-sender → NGO list)
+    if planned_prefix == "DRAFT_EMAIL" and (
+        routing.startswith("RESEARCH_THEN_ZOOM")
+        or routing.startswith("PROSPECT_SEARCH")
+        or routing == "CHAT"
+        or routing.startswith("CHAT")
+    ):
+        seed_json: dict[str, Any] = {"batch": bool(plan.to_emails and len(plan.to_emails) > 1)}
+        if len(plan.to_emails) == 1:
+            seed_json["recipient_email"] = plan.to_emails[0]
+        elif plan.to_emails:
+            seed_json["recipient_emails"] = plan.to_emails
+        if plan.cc:
+            seed_json["cc"] = plan.cc
+        if plan.ignore_emails:
+            seed_json["ignore_emails"] = plan.ignore_emails
+        routing = "DRAFT_EMAIL:" + json.dumps(seed_json, ensure_ascii=False)
+        meta_routing = routing
+    elif planned_prefix == "RESEARCH_THEN_ZOOM" and (
+        routing == "CHAT"
+        or routing.startswith("CHAT")
+        or routing.startswith("PROSPECT_SEARCH")
+        or routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL"))
+    ):
+        routing = "RESEARCH_THEN_ZOOM:" + json.dumps(
+            {
+                "org_limit": plan.org_limit,
+                "contacts_per_org": plan.contacts_per_org,
+                "draft": plan.draft or plan.send,
+                "send": plan.send,
+            },
+            ensure_ascii=False,
+        )
+        meta_routing = routing
+    elif planned_prefix == "GMAIL_EXTRACT" and (
+        routing == "CHAT" or routing.startswith("CHAT")
+    ):
+        routing = "GMAIL_EXTRACT:auto"
+        meta_routing = routing
+
     # Heuristic: force Gmail route when user clearly asks about mailbox
     if routing == "CHAT" or routing.startswith("CHAT"):
         if re.search(
@@ -921,33 +1045,54 @@ def answer(
         routing = "PROSPECT_ENRICH:" + json.dumps(ident, ensure_ascii=False)
         meta_routing = routing
 
-    # Heuristic: mission/demographic research → web find orgs → ZoomInfo → optional draft
-    if wants_research_then_zoom(user_msg or "") and (
-        routing == "CHAT"
-        or routing.startswith("CHAT")
-        or routing.startswith("PROSPECT_SEARCH")
-        or routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL"))
+    # Heuristic: mission org discovery → web → ZoomInfo → optional draft
+    # Skipped when planner already chose draft/CSR-as-sender
+    if (
+        plan.action == "research_then_zoom"
+        and wants_research_then_zoom(user_msg or "")
+        and (
+            routing == "CHAT"
+            or routing.startswith("CHAT")
+            or routing.startswith("PROSPECT_SEARCH")
+            or routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL"))
+        )
     ):
-        draft_flag = bool(
-            re.search(r"\b(draft|write|compose|personaliz)\b", user_msg or "", re.I)
-        )
-        send_flag = bool(
-            re.search(r"\b(send now|email them now|fire off)\b", user_msg or "", re.I)
-            and not re.search(r"\bdraft\b", user_msg or "", re.I)
-        )
         routing = "RESEARCH_THEN_ZOOM:" + json.dumps(
             {
-                "org_limit": 8,
-                "contacts_per_org": 3,
-                "draft": draft_flag or send_flag or bool(
-                    re.search(r"\b(email|outreach)\b", user_msg or "", re.I)
+                "org_limit": plan.org_limit,
+                "contacts_per_org": plan.contacts_per_org,
+                "draft": plan.draft
+                or bool(
+                    re.search(r"\b(draft|write|compose|personaliz|email|outreach)\b", user_msg or "", re.I)
                 ),
-                "send": send_flag,
+                "send": plan.send,
             },
             ensure_ascii=False,
         )
         meta_routing = routing
 
+    # Guard: never run RESEARCH_THEN_ZOOM for CSR-as-sender drafts
+    if routing.startswith("RESEARCH_THEN_ZOOM") and plan.action in (
+        "draft_email",
+        "send_email",
+        "schedule_email",
+        "chat",
+    ):
+        if not wants_research_then_zoom(user_msg or ""):
+            seed_json = {}
+            if plan.to_emails:
+                if len(plan.to_emails) == 1:
+                    seed_json["recipient_email"] = plan.to_emails[0]
+                else:
+                    seed_json["recipient_emails"] = plan.to_emails
+                    seed_json["batch"] = True
+            if plan.cc:
+                seed_json["cc"] = plan.cc
+            routing = (
+                ("SEND_EMAIL:" if plan.send and not plan.draft else "DRAFT_EMAIL:")
+                + json.dumps(seed_json or {"batch": True, "from_prospects": True}, ensure_ascii=False)
+            )
+            meta_routing = routing
     try:
         # Email attach requested but no file staged → ask for upload (don't send yet)
         if (
@@ -1146,6 +1291,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 headers = _mail_headers(
                     user_msg,
                     to_emails=[c.get("email") for c in with_email],
+                    plan=plan,
                 )
                 payload = {
                     "batch": True,
@@ -1155,6 +1301,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     "source": "research_then_zoom",
                     "from_email": headers["from_email"],
                     "cc": headers["cc"],
+                    "ignore_emails": plan.ignore_emails,
                 }
                 if email_atts:
                     payload["attachments"] = email_atts
@@ -1165,6 +1312,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     history=history,
                     prospects=with_email,
                     mailbox_messages=mailbox_messages,
+                    plan=plan,
                 )
                 ok_n = 0
                 for job in jobs:
@@ -1393,9 +1541,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     user_msg,
                     seed=payload,
                     to_emails=[result.get("email") or ""],
+                    plan=plan,
                 )
                 payload["from_email"] = headers["from_email"]
                 payload["cc"] = headers["cc"]
+                payload["ignore_emails"] = plan.ignore_emails
                 if email_atts:
                     payload["attachments"] = email_atts
                     consumed_attachments = True
@@ -1405,6 +1555,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     history=history,
                     prospects=[result],
                     mailbox_messages=mailbox_messages,
+                    plan=plan,
                 )
                 if not jobs:
                     jobs = [
@@ -1600,17 +1751,32 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         "<p>Best regards</p>"
                     )
 
+            if plan.cc and not payload.get("cc"):
+                payload["cc"] = plan.cc
+            if plan.ignore_emails:
+                payload["ignore_emails"] = plan.ignore_emails
+            if plan.to_emails and not payload.get("recipient_email") and not payload.get(
+                "recipient_emails"
+            ):
+                if len(plan.to_emails) == 1:
+                    payload["recipient_email"] = plan.to_emails[0]
+                else:
+                    payload["recipient_emails"] = plan.to_emails
+                    payload["batch"] = True
+
             jobs = _build_draft_jobs(
                 payload,
                 user_msg,
                 history=history,
                 prospects=prospects,
                 mailbox_messages=mailbox_messages,
+                plan=plan,
             )
             headers = _mail_headers(
                 user_msg,
                 seed=payload,
                 to_emails=[j.get("recipient_email") or "" for j in jobs],
+                plan=plan,
             )
             payload["from_email"] = headers["from_email"]
             payload["cc"] = headers["cc"]
@@ -1700,7 +1866,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 for_schedule=True,
                 document_context=doc_context,
             )
-            job = _resolve_recipient(job, user_msg, history)
+            job = _resolve_recipient(job, user_msg, history, plan=plan)
+            if plan.cc:
+                job["cc"] = plan.cc
+            if plan.ignore_emails:
+                job["ignore_emails"] = plan.ignore_emails
+            job["from_email"] = plan.from_email or default_from_email()
 
             if not job.get("recipient_email"):
                 yield (

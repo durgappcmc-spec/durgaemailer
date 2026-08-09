@@ -334,35 +334,10 @@ def run_research_then_zoom(
 
 
 def wants_research_then_zoom(user_msg: str) -> bool:
-    """Heuristic: mission/demographic web research that should then hit ZoomInfo."""
-    msg = user_msg or ""
-    has_mission = bool(
-        re.search(
-            r"\b(ngo|ngos|non[\s-]?profit|foundation|trust|skilling|vocational|"
-            r"livelihood|girls?|women|16\+|above\s*16|teen\w*|underprivileged|"
-            r"education program|empower\w*)\b",
-            msg,
-            re.I,
-        )
-    )
-    wants_zi = bool(
-        re.search(
-            r"\b(zoom\s*info|zoominfo|\bzi\b|then (search|find|look).*(zoom|contact|email)|"
-            r"put (them|it|this) (in|into|on) zoom|enrich|find (emails?|contacts?))\b",
-            msg,
-            re.I,
-        )
-    )
-    # Also trigger when user asks for NGO mission fit AND emails/contacts without
-    # a pure title+company ZoomInfo query
-    wants_contacts = bool(
-        re.search(r"\b(email|emails|contact|contacts|outreach|draft)\b", msg, re.I)
-    )
-    vague_zi_only = bool(
-        re.search(r"\bsearch (for )?ngo\b", msg, re.I)
-        and re.search(r"\b(girl|skill|16)\b", msg, re.I)
-    )
-    return has_mission and (wants_zi or (wants_contacts and vague_zi_only) or vague_zi_only)
+    """True only for mission-fit org discovery → ZoomInfo (not CSR-as-sender drafts)."""
+    from agent.intent import looks_like_mission_org_discovery
+
+    return looks_like_mission_org_discovery(user_msg or "")
 
 
 def _parse_orgs(raw: str) -> list[dict[str, Any]]:

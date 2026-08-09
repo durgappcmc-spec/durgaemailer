@@ -20,9 +20,9 @@ sync = ensure_session_sync(st.session_state)
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
-    "Drafts are from csr@karunamedia.org with your Gmail signature — review in Drafts before sending. "
-    "Say `cc someone@email.com` to add CC. "
-    "Smart NGO flow: find orgs → ZoomInfo → personalized drafts."
+    "Planner picks ZoomInfo / Gmail / web-research agents from your wording. "
+    "Drafts from csr@karunamedia.org with signature — say `cc a@x.com and b@y.com`; "
+    "`ignore addr@x.com` skips that address. Review drafts in Gmail before sending."
 )
 
 if "messages" not in st.session_state:
