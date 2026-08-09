@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from connectors.prospects import search_all
 from core.llm import extract_json, grounded_collect
+from agent.limits import DEFAULT_CONTACTS_PER_ORG, DEFAULT_ORGS
 
 _ORG_EXTRACT_SYSTEM = (
     "Extract organizations from research notes. Return JSON only matching the schema. "
@@ -20,7 +21,7 @@ _ORG_EXTRACT_SYSTEM = (
 def discover_orgs_from_web(
     user_msg: str,
     *,
-    limit: int = 8,
+    limit: int = DEFAULT_ORGS,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], str]:
     """Google-grounded discovery of orgs, then structured extraction.
 
@@ -37,8 +38,8 @@ Rules:
 - If the user mentions girls / women 16+ / skilling / vocational training / livelihoods,
   prioritize orgs that actually run those programs (not generic "NGO" directories).
 - Include city/region when known (e.g. Noida, Delhi NCR, India).
-- Prefer 5–{limit} strong matches over a long weak list.
-- Write a short bullet list with: Organization name — website — location — what they do for girls/skilling.
+- Aim for up to {limit} strong matches (do not stop early at 5–10 if more fit).
+- Write a bullet list with: Organization name — website — location — what they do for girls/skilling.
 """
     notes, sources = grounded_collect(
         research_prompt,
@@ -69,7 +70,11 @@ Return JSON:
   ]
 }}
 """
-    raw = extract_json(extract_prompt, system=_ORG_EXTRACT_SYSTEM, max_tokens=2500)
+    raw = extract_json(
+        extract_prompt,
+        system=_ORG_EXTRACT_SYSTEM,
+        max_tokens=min(8000, 800 + limit * 100),
+    )
     orgs = _parse_orgs(raw)[:limit]
     return orgs, sources, notes
 
@@ -77,7 +82,7 @@ Return JSON:
 def zoominfo_contacts_for_orgs(
     orgs: list[dict[str, Any]],
     *,
-    contacts_per_org: int = 3,
+    contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG,
     titles: Optional[list[str]] = None,
     web_email_fallback: bool = True,
 ) -> list[dict[str, Any]]:
@@ -319,8 +324,8 @@ def _company_name_variants(name: str) -> list[str]:
 def run_research_then_zoom(
     user_msg: str,
     *,
-    org_limit: int = 8,
-    contacts_per_org: int = 3,
+    org_limit: int = DEFAULT_ORGS,
+    contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG,
 ) -> dict[str, Any]:
     """Full pipeline: web org discovery → ZoomInfo contact enrichment."""
     orgs, sources, notes = discover_orgs_from_web(user_msg, limit=org_limit)

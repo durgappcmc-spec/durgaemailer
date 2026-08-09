@@ -42,7 +42,7 @@ def _dedupe_key(p: dict[str, Any]) -> str:
 def search_all(
     query: dict[str, Any],
     providers: tuple[str, ...] | list[str] = ("apollo", "zoominfo", "rocketreach"),
-    limit_per_provider: int = 10,
+    limit_per_provider: int = 50,
 ) -> list[dict[str, Any]]:
     """Fan out search across providers and dedupe results."""
     results: list[dict[str, Any]] = []

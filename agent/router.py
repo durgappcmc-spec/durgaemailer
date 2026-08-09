@@ -26,6 +26,12 @@ from agent.research_pipeline import (
     wants_research_then_zoom,
 )
 from agent.run_control import is_cancelled, stopped_message
+from agent.limits import (
+    DEFAULT_SEARCH_LIMIT,
+    MAX_EMAILS,
+    apply_email_cap,
+    parse_research_limits,
+)
 from gmail_client.attachments import document_context_from_attachments
 from gmail_client.extract import (
     contacts_from_mailbox,
@@ -61,13 +67,15 @@ Rules:
   (e.g. "find NGOs for girls 16+ skilling in Noida") then ZoomInfo contacts and/or drafts.
   Do NOT choose this just because they say CSR, csr@karunamedia.org, Karuna, partnership,
   or "from CSR" — that means the SENDER identity for drafts, not org discovery.
-  Example: RESEARCH_THEN_ZOOM:{"org_limit":8,"contacts_per_org":3,"draft":true}
+  Example: RESEARCH_THEN_ZOOM:{"org_limit":25,"contacts_per_org":5,"draft":true}
   Set draft:true if they also ask to draft/write personalized emails in the same message.
   Set send:true only if they explicitly say send now.
+  Honor user volumes up to 100 (e.g. "40 NGOs", "100 emails", "as many as needed").
 - PROSPECT_SEARCH: find people when the user already knows company/title filters.
   JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
   Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
-  PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":20}
+  PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":50}
+  Default limit 50; allow up to 100 when the user asks for a large list.
   Never ask the user for ZoomInfo credentials.
 - After a prospect / research search, if the user asks to email/draft/send to that list,
   use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
@@ -1014,6 +1022,7 @@ def answer(
             {
                 "org_limit": plan.org_limit,
                 "contacts_per_org": plan.contacts_per_org,
+                "email_limit": plan.email_limit,
                 "draft": plan.draft or plan.send,
                 "send": plan.send,
             },
@@ -1184,8 +1193,21 @@ def answer(
 
         elif routing.startswith("RESEARCH_THEN_ZOOM"):
             opts = _parse_json_tail(routing, "RESEARCH_THEN_ZOOM:") or {}
-            org_limit = int(opts.get("org_limit") or 8)
-            per_org = int(opts.get("contacts_per_org") or 3)
+            vol = parse_research_limits(user_msg)
+            org_limit = int(
+                opts.get("org_limit") or plan.org_limit or vol["org_limit"]
+            )
+            per_org = int(
+                opts.get("contacts_per_org")
+                or plan.contacts_per_org
+                or vol["contacts_per_org"]
+            )
+            email_cap = int(
+                opts.get("email_limit") or plan.email_limit or vol["email_limit"] or MAX_EMAILS
+            )
+            org_limit = max(org_limit, vol["org_limit"])
+            per_org = max(per_org, vol["contacts_per_org"])
+            email_cap = min(max(email_cap, vol["email_limit"]), MAX_EMAILS)
             do_draft = bool(opts.get("draft"))
             do_send = bool(opts.get("send"))
             if re.search(r"\b(draft|write|compose|personaliz|email|outreach)\b", user_msg or "", re.I):
@@ -1196,8 +1218,9 @@ def answer(
                 do_send = True
 
             yield (
-                "**Step 1/3 — Web research:** finding NGOs/orgs that match your "
-                "mission filters (not raw ZoomInfo demographics)…\n"
+                f"**Step 1/3 — Web research:** finding up to **{org_limit}** NGOs/orgs "
+                f"that match your mission filters "
+                f"({per_org} contacts/org, ≤{email_cap} emails)…\n"
             )
             try:
                 pipeline = run_research_then_zoom(
@@ -1252,10 +1275,12 @@ def answer(
                     f"ZoomInfo returned **{len(people)}** contacts "
                     f"(**{len(with_email)}** with email).\n\n"
                 )
-                for i, p in enumerate(people[:20], 1):
+                for i, p in enumerate(people[:100], 1):
                     yield f"{i}. {prospect_to_text(p)}\n"
                     if p.get("org_focus"):
                         yield f"   Program fit: {p.get('org_focus')}\n"
+                if len(people) > 100:
+                    yield f"_…and {len(people) - 100} more contacts._\n"
             else:
                 yield "ZoomInfo had little/no contact coverage for these orgs.\n"
             if research_only:
@@ -1345,6 +1370,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     mailbox_messages=mailbox_messages,
                     plan=plan,
                 )
+                if len(jobs) > email_cap:
+                    yield (
+                        f"\n_Capping at **{email_cap}** emails "
+                        f"(found {len(jobs)}; say a higher number up to 100 if needed)._\n"
+                    )
+                    jobs = apply_email_cap(jobs, email_limit=email_cap)
                 ok_n = 0
                 for job in jobs:
                     if _stop_now():
@@ -1400,7 +1431,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 "demographics (girls 16+) were used for WEB research only — "
                 "ZoomInfo only stores org staff contacts.\n\n"
                 f"Organizations:\n{json.dumps(orgs, default=str)[:4000]}\n\n"
-                f"Contacts:\n{json.dumps(people[:15], default=str)[:4000]}"
+                f"Contacts:\n{json.dumps(people[:40], default=str)[:8000]}"
             )
             if used_docs:
                 system += "\n\nUploaded file context:\n" + doc_context
@@ -1437,8 +1468,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     providers = ("zoominfo",)
                 else:
                     providers = ("zoominfo", "apollo", "rocketreach")
-            limit = int(q.pop("limit", None) or q.pop("limit_per_provider", None) or 15)
-            yield f"Searching **{', '.join(providers)}**…\n"
+            vol = parse_research_limits(user_msg)
+            limit = int(
+                q.pop("limit", None)
+                or q.pop("limit_per_provider", None)
+                or plan.search_limit
+                or vol["search_limit"]
+                or DEFAULT_SEARCH_LIMIT
+            )
+            limit = max(limit, vol["search_limit"])
+            limit = min(max(limit, 1), 100)
+            yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
             results = search_all(
                 q, providers=tuple(providers), limit_per_provider=limit
             )
@@ -1452,8 +1492,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 except Exception as e:
                     print(f"[router] auto-ingest prospects error: {e}", file=sys.stderr)
             ctx_lines = []
-            for i, p in enumerate(ok[:25], 1):
+            for i, p in enumerate(ok[:100], 1):
                 ctx_lines.append(f"{i}. {prospect_to_text(p)}")
+            if len(ok) > 100:
+                ctx_lines.append(f"…and {len(ok) - 100} more.")
             for e in errs[:5]:
                 ctx_lines.append(f"ERROR [{e.get('source')}]: {e.get('error')}")
             if not ok:
@@ -1467,7 +1509,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     f"Found **{len(ok)}** contacts "
                     f"(**{with_email}** with email) via {', '.join(providers)}.\n\n"
                 )
-                yield "\n".join(ctx_lines[:20])
+                yield "\n".join(ctx_lines)
                 if saved_ids:
                     yield f"\n\nAuto-saved **{len(saved_ids)}** contacts to memory."
                 yield (
@@ -1809,6 +1851,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 mailbox_messages=mailbox_messages,
                 plan=plan,
             )
+            email_cap = min(max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS)
+            if len(jobs) > email_cap:
+                yield (
+                    f"_Capping at **{email_cap}** emails "
+                    f"(found {len(jobs)}; ask for up to 100 if you need more)._\n"
+                )
+                jobs = apply_email_cap(jobs, email_limit=email_cap)
             headers = _mail_headers(
                 user_msg,
                 seed=payload,
@@ -1873,7 +1922,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     )
                     + "\n"
                 )
-                for r in ok[:50]:
+                for r in ok[:100]:
                     target = r.get("to") or r.get("recipient_email")
                     did = r.get("_did_send")
                     yield (
@@ -1886,6 +1935,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         )
                         + "\n"
                     )
+                if len(ok) > 100:
+                    yield f"_…and {len(ok) - 100} more._\n"
                 if not want_send:
                     yield (
                         "\nOpen Gmail → Drafts to review, then send. "

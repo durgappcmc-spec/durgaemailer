@@ -166,7 +166,7 @@ class ZoomInfoConnector(ProspectConnector):
         # NGO / nonprofit geo searches: company-first, then direct contact search.
         # (Free-text location/city fields 400 on this ZoomInfo tenant.)
         if _is_nonprofit_query(query):
-            company_hits = self._search_companies(query, limit=min(limit, 15))
+            company_hits = self._search_companies(query, limit=min(limit, 100))
             if company_hits:
                 results.extend(self._contacts_for_companies(company_hits, limit=limit))
 
@@ -255,7 +255,7 @@ class ZoomInfoConnector(ProspectConnector):
     def _search_companies(
         self, query: dict[str, Any], limit: int = 10
     ) -> list[dict[str, Any]]:
-        body: dict[str, Any] = {"rpp": min(max(int(limit), 1), 25), "page": 1}
+        body: dict[str, Any] = {"rpp": min(max(int(limit), 1), 100), "page": 1}
         names = _join(query.get("company_names") or "")
         keywords = _join(query.get("keywords") or "")
         blob = f"{names} {keywords}".lower()

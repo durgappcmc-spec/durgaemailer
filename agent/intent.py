@@ -7,6 +7,13 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from agent.limits import (
+    DEFAULT_CONTACTS_PER_ORG,
+    DEFAULT_ORGS,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_EMAILS,
+    parse_research_limits,
+)
 from core.llm import extract_json
 from gmail_client.send import default_cc_emails, default_from_email
 
@@ -73,6 +80,8 @@ Critical:
 - Put ignored addresses in ignore_emails when they say ignore/skip/don't use/except.
 - from_email defaults to csr@karunamedia.org for outreach.
 - Prefer draft over send unless they say send now.
+- Honor requested volumes: org_limit / contacts / emails up to 100 when the user asks
+  (e.g. "100 emails", "40 NGOs", "as many as needed"). Do not default to tiny 8–10 lists.
 """
 
 
@@ -95,8 +104,10 @@ class IntentPlan:
     draft: bool = False
     send: bool = False
     reason: str = ""
-    org_limit: int = 8
-    contacts_per_org: int = 3
+    org_limit: int = DEFAULT_ORGS
+    contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG
+    search_limit: int = DEFAULT_SEARCH_LIMIT
+    email_limit: int = MAX_EMAILS
     raw: dict[str, Any] = field(default_factory=dict)
 
     def non_recipient_emails(self) -> set[str]:
@@ -232,6 +243,7 @@ def looks_like_mission_org_discovery(user_msg: str) -> bool:
 
 def _heuristic_plan(user_msg: str) -> IntentPlan:
     roles = classify_email_roles(user_msg)
+    vol = parse_research_limits(user_msg)
     msg = user_msg or ""
     agents: list[str] = []
     action = "chat"
@@ -286,6 +298,10 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         draft=draft,
         send=send,
         reason="heuristic",
+        org_limit=vol["org_limit"],
+        contacts_per_org=vol["contacts_per_org"],
+        search_limit=vol["search_limit"],
+        email_limit=vol["email_limit"],
     )
 
 
@@ -312,6 +328,10 @@ Heuristic guess (may be wrong): {json.dumps({
     "ignore_emails": base.ignore_emails,
     "draft": base.draft,
     "send": base.send,
+    "org_limit": base.org_limit,
+    "contacts_per_org": base.contacts_per_org,
+    "search_limit": base.search_limit,
+    "email_limit": base.email_limit,
 })}
 
 Recent chat:
@@ -330,8 +350,10 @@ Return JSON:
   "ignore_emails": ["skip@x.com"],
   "draft": true,
   "send": false,
-  "org_limit": 8,
-  "contacts_per_org": 3,
+  "org_limit": {base.org_limit},
+  "contacts_per_org": {base.contacts_per_org},
+  "search_limit": {base.search_limit},
+  "email_limit": {base.email_limit},
   "reason": "one short sentence"
 }}
 """
@@ -398,6 +420,25 @@ Return JSON:
     if action in ("draft_email", "research_then_zoom") and not send:
         draft = True
 
+    vol = parse_research_limits(user_msg)
+    org_limit = int(data.get("org_limit") or vol["org_limit"] or base.org_limit)
+    contacts_per_org = int(
+        data.get("contacts_per_org") or vol["contacts_per_org"] or base.contacts_per_org
+    )
+    search_limit = int(
+        data.get("search_limit")
+        or data.get("limit")
+        or vol["search_limit"]
+        or base.search_limit
+    )
+    email_limit = int(
+        data.get("email_limit") or vol["email_limit"] or base.email_limit or MAX_EMAILS
+    )
+    # Prefer explicit user volumes over tiny LLM defaults
+    org_limit = max(org_limit, vol["org_limit"])
+    search_limit = max(search_limit, vol["search_limit"])
+    email_limit = max(email_limit, vol["email_limit"])
+
     return IntentPlan(
         action=action,
         agents=agents,
@@ -408,8 +449,10 @@ Return JSON:
         draft=draft,
         send=send,
         reason=str(data.get("reason") or "planned"),
-        org_limit=int(data.get("org_limit") or 8),
-        contacts_per_org=int(data.get("contacts_per_org") or 3),
+        org_limit=min(max(org_limit, 1), 100),
+        contacts_per_org=min(max(contacts_per_org, 1), 25),
+        search_limit=min(max(search_limit, 1), 100),
+        email_limit=min(max(email_limit, 1), MAX_EMAILS),
         raw=data,
     )
 
@@ -429,6 +472,15 @@ def plan_summary(plan: IntentPlan) -> str:
         f"agents: {', '.join(plan.agents) or 'chat'}",
         f"from: {plan.from_email or default_from_email()}",
     ]
+    if plan.action == "research_then_zoom":
+        parts.append(
+            f"volume: ≤{plan.org_limit} orgs × {plan.contacts_per_org}/org "
+            f"(≤{plan.email_limit} emails)"
+        )
+    elif plan.action == "prospect_search":
+        parts.append(f"search_limit: {plan.search_limit}")
+    elif plan.action in ("draft_email", "send_email"):
+        parts.append(f"email_cap: {plan.email_limit}")
     if plan.cc:
         parts.append(f"cc: {', '.join(plan.cc)}")
     if plan.ignore_emails:

@@ -34,7 +34,7 @@ with tab_search:
             ["zoominfo", "apollo", "rocketreach"],
             default=["zoominfo"],
         )
-        limit = st.slider("Limit per provider", 5, 50, 10)
+        limit = st.slider("Limit per provider", 5, 100, 50)
         submitted = st.form_submit_button("🔍 Search")
 
     if submitted:
