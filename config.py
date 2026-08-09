@@ -43,6 +43,8 @@ def _apply_streamlit_secrets() -> None:
         "GMAIL_OAUTH_JSON",
         "GMAIL_CLIENT_SECRETS",
         "GMAIL_TOKEN_PATH",
+        "BOOTSTRAP_TOKEN_JSON",
+        "BOOTSTRAP_TOKEN_PATH",
         "GMAIL_FROM_EMAIL",
         "GMAIL_DEFAULT_CC",
         "CHROMA_DIR",
@@ -95,6 +97,10 @@ class Settings:
             "GMAIL_FROM_EMAIL", "csr@karunamedia.org"
         )
         self.GMAIL_DEFAULT_CC: str = os.getenv("GMAIL_DEFAULT_CC", "")
+        self.BOOTSTRAP_TOKEN_JSON: str = os.getenv("BOOTSTRAP_TOKEN_JSON", "")
+        self.BOOTSTRAP_TOKEN_PATH: str = os.getenv(
+            "BOOTSTRAP_TOKEN_PATH", "./credentials/bootstrap_token.json"
+        )
         self.GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
         self.TRACKING_BASE_URL: str = os.getenv("TRACKING_BASE_URL", "").rstrip("/")
         self.APPS_SCRIPT_TRACKING_URL: str = os.getenv("APPS_SCRIPT_TRACKING_URL", "")
@@ -129,3 +135,8 @@ if settings.GMAIL_TOKEN_JSON:
     if not token_path.exists():
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(settings.GMAIL_TOKEN_JSON, encoding="utf-8")
+if settings.BOOTSTRAP_TOKEN_JSON:
+    boot_path = Path(settings.BOOTSTRAP_TOKEN_PATH)
+    if not boot_path.exists():
+        boot_path.parent.mkdir(parents=True, exist_ok=True)
+        boot_path.write_text(settings.BOOTSTRAP_TOKEN_JSON, encoding="utf-8")

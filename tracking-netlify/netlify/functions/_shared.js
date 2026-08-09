@@ -18,6 +18,42 @@ export function clientIp(event) {
   );
 }
 
+function cleanId(raw) {
+  if (!raw) return "";
+  let id = decodeURIComponent(String(raw)).trim();
+  // Drop anything after whitespace/newline (path+rawUrl concat hazard)
+  id = id.split(/\s+/)[0];
+  if (id.endsWith(".gif")) id = id.slice(0, -4);
+  return id;
+}
+
+/**
+ * Pull tracking id from query (?id=) or path (/t/o/{id}.gif, /t/c/{id}).
+ * Netlify splat rewrites sometimes drop query params — path parsing is required.
+ * Parse path and rawUrl separately so [^/?#] never eats across a newline.
+ */
+export function extractIdFromEvent(event, { kind = "open" } = {}) {
+  const q = event.queryStringParameters || {};
+  const fromQ = cleanId(q.id || q.email_id || q.link_id || "");
+  if (fromQ) return fromQ;
+
+  const candidates = [
+    String(event.path || ""),
+    String(event.rawPath || ""),
+    String(event.rawUrl || ""),
+  ];
+  const pathRe =
+    kind === "click" ? /\/t\/c\/([^/?#\s]+)/i : /\/t\/o\/([^/?#\s]+)/i;
+  for (const src of candidates) {
+    if (!src) continue;
+    const m = src.match(pathRe);
+    if (m) return cleanId(m[1]);
+    const qm = src.match(/[?&]id=([^&#\s]+)/i);
+    if (qm) return cleanId(qm[1]);
+  }
+  return "";
+}
+
 /** Fire-and-forget POST to Apps Script with a 5s timeout. */
 export async function logToSheet(payload) {
   const url = process.env.APPS_SCRIPT_LOG_URL;

@@ -112,7 +112,7 @@ function handleRegister(body) {
     sh.getRange(sh.getLastRow() + 1, 1, rows.length, 4).setValues(rows);
   }
   // Seed Sends so opens/clicks from Relay drafts (sent later in Gmail) join in Tracking
-  if (body.email_id && body.recipient_email) {
+  if (body.email_id) {
     const sends = ss.getSheetByName(SENDS_SHEET);
     const data = sends.getDataRange().getValues();
     const headers = data[0] || [];
@@ -144,7 +144,7 @@ function handleRegister(body) {
       ]);
     }
   }
-  return { ok: true, email_id: body.email_id, links: links.length };
+  return { ok: true, email_id: body.email_id, links: links.length, seeded_send: true };
 }
 
 function handleSchedule(body) {
@@ -471,12 +471,12 @@ function instrumentHtmlServerSide(html, emailId) {
       if (TRACKING_BASE && h.indexOf(TRACKING_BASE) !== -1) return match;
       const linkId = Utilities.getUuid();
       linkRows.push([linkId, emailId, h, ""]);
-      return '<a ' + pre + 'href=' + quote + TRACKING_BASE + '/t/c/' + linkId + quote + post + '>';
+      return '<a ' + pre + 'href=' + quote + TRACKING_BASE + '/.netlify/functions/click?id=' + linkId + quote + post + '>';
     }
   );
   const pixel =
-    '<img src="' + TRACKING_BASE + '/t/o/' + emailId +
-    '.gif" width="1" height="1" alt="" style="display:block;border:0;">';
+    '<img src="' + TRACKING_BASE + '/.netlify/functions/open?id=' + emailId +
+    '" width="1" height="1" alt="" style="display:block;border:0;">';
   let out = rewritten;
   if (/<\/body>/i.test(out)) {
     out = out.replace(/<\/body>/i, pixel + "</body>");

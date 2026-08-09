@@ -19,8 +19,12 @@ logout_button()
 st.title("📬 Tracking")
 st.caption(
     "Opens/clicks work for emails Relay sends **and** for Relay drafts you send later from Gmail "
-    "(tracking is embedded when the draft is created)."
+    "(tracking is embedded when the draft is created). "
+    "Gmail image proxy often marks opens as bots — keep Exclude bots on and trust clicks more."
 )
+if st.button("Refresh data", type="secondary"):
+    st.cache_data.clear()
+    st.rerun()
 
 
 def _apps_post(payload: dict) -> dict:

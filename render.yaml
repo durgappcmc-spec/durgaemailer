@@ -36,6 +36,8 @@ services:
         sync: false
       - key: GMAIL_OAUTH_JSON
         sync: false
+      - key: BOOTSTRAP_TOKEN_JSON
+        sync: false
       - key: APP_USERNAME
         sync: false
       - key: APP_PASSWORD

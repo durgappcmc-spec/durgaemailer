@@ -43,13 +43,14 @@ def instrument_html(
             links.append(
                 {"link_id": link_id, "original_url": href, "label": label}
             )
-            a["href"] = f"{base}/t/c/{link_id}"
+            # Query-param form is reliable on Netlify (path splat can drop id)
+            a["href"] = f"{base}/.netlify/functions/click?id={link_id}"
 
     instrumented = str(soup)
-    if track_opens and base and f"{base}/t/o/" not in instrumented:
+    if track_opens and base and "/.netlify/functions/open" not in instrumented and f"{base}/t/o/" not in instrumented:
         pixel = (
-            f'<img src="{base}/t/o/{email_id}.gif" width="1" height="1" '
-            f'alt="" style="display:block;border:0;">'
+            f'<img src="{base}/.netlify/functions/open?id={email_id}" '
+            f'width="1" height="1" alt="" style="display:block;border:0;">'
         )
         if "</body>" in instrumented.lower():
             # Case-insensitive replace of closing body
@@ -58,6 +59,7 @@ def instrument_html(
         else:
             instrumented = instrumented + pixel
 
+    src = prospect_source or "relay_draft"
     if settings.APPS_SCRIPT_TRACKING_URL:
         payload = {
             "action": "register",
@@ -66,17 +68,44 @@ def instrument_html(
             "recipient_name": recipient_name or "",
             "subject": subject or "",
             "campaign": campaign or "",
-            "prospect_source": prospect_source or "",
-            "source": prospect_source or "",
+            "prospect_source": src,
+            "source": src,
             "links": links,
         }
         try:
-            requests.post(
+            resp = requests.post(
                 settings.APPS_SCRIPT_TRACKING_URL,
                 json=payload,
                 timeout=15,
             )
+            if not resp.ok:
+                print(
+                    f"[tracking] register HTTP {resp.status_code}: {resp.text[:200]}",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    data = resp.json()
+                    if not data.get("ok", True):
+                        print(f"[tracking] register rejected: {data}", file=sys.stderr)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[tracking] register failed: {e}", file=sys.stderr)
+
+    # Apps Script web app may lag behind repo — also seed Sends via Sheets API when possible
+    try:
+        from tracking.sheets_seed import seed_send_row
+
+        seed_send_row(
+            email_id=email_id,
+            recipient_email=recipient_email,
+            recipient_name=recipient_name or "",
+            subject=subject or "",
+            campaign=campaign or "",
+            source=src,
+        )
+    except Exception as e:
+        print(f"[tracking] sheets seed skipped: {e}", file=sys.stderr)
 
     return instrumented, email_id
