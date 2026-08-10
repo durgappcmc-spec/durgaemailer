@@ -85,6 +85,11 @@ Critical:
 - Prefer draft over send unless they say send now.
 - Honor requested volumes: org_limit / contacts / emails up to 100 when the user asks
   (e.g. "100 emails", "40 NGOs", "as many as needed"). Do not default to tiny 8–10 lists.
+- If they ask to create an email LIKE one previously SENT to a company
+  (e.g. "create email like sent to IndiaMART" or "similar to the email we sent to X"),
+  use draft_email with agents ["gmail","web_research"]. Set like_sent_to to that company
+  and like_sent_for to the new target company when named (e.g. "for Flipkart").
+  Do NOT use research_then_zoom for this — it is style-clone + alignment research, not NGO discovery.
 """
 
 
@@ -111,6 +116,8 @@ class IntentPlan:
     contacts_per_org: int = DEFAULT_CONTACTS_PER_ORG
     search_limit: int = DEFAULT_SEARCH_LIMIT
     email_limit: int = MAX_EMAILS
+    like_sent_to: str = ""
+    like_sent_for: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     def non_recipient_emails(self) -> set[str]:
@@ -218,9 +225,78 @@ def classify_email_roles(user_msg: str) -> EmailRoles:
     )
 
 
+def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
+    """Detect 'create email like the one sent to IndiaMART [for Acme]'.
+
+    Returns {"reference": "...", "target": "..."} or None.
+    """
+    msg = (user_msg or "").strip()
+    if not msg:
+        return None
+
+    # Company tokens; do not consume "for/about/targeting/to …" as part of the name
+    company = (
+        r"([A-Za-z0-9][A-Za-z0-9&.\'\-]*"
+        r"(?:\s+(?!for\b|about\b|targeting\b|to\b|cc\b|from\b|and\b|with\b)"
+        r"[A-Za-z0-9][A-Za-z0-9&.\'\-]*){0,6})"
+    )
+    patterns = [
+        # create/draft email like (the one) sent/emailed to X [for Y]
+        rf"(?:create|write|draft|compose|make)\s+(?:an?\s+)?(?:similar\s+)?"
+        rf"(?:email|mail|message).{{0,80}}?(?:like|similar\s+to).{{0,40}}?"
+        rf"(?:the\s+)?(?:one\s+|email\s+|mail\s+)?(?:we\s+|you\s+|i\s+)?"
+        rf"(?:sent|emailed)\s+to\s+{company}"
+        rf"(?:\s+(?:for|about|targeting)\s+{company})?",
+        # like the email we sent to X
+        rf"(?:like|similar\s+to)\s+(?:the\s+)?"
+        rf"(?:one\s+|email\s+|mail\s+)?(?:we\s+|you\s+|i\s+)?"
+        rf"(?:sent|emailed)\s+to\s+{company}"
+        rf"(?:\s+(?:for|about|targeting)\s+{company})?",
+        # email like sent to X / same as sent to X
+        rf"(?:email|mail).{{0,40}}?(?:like|same\s+as).{{0,20}}?"
+        rf"(?:sent|emailed)\s+to\s+{company}"
+        rf"(?:\s+(?:for|about|targeting)\s+{company})?",
+    ]
+    stop_tail = re.compile(
+        r"\s+\b(?:and|with|cc|from|subject|attach|draft|send|please|thanks|"
+        r"using|based|that|which|who|to)\b.*$",
+        re.I,
+    )
+
+    def _clean(name: str) -> str:
+        name = (name or "").strip(" .,;:!?'\"")
+        name = stop_tail.sub("", name).strip(" .,;:")
+        return name
+
+    for pat in patterns:
+        m = re.search(pat, msg, re.I | re.S)
+        if not m:
+            continue
+        reference = _clean(m.group(1) or "")
+        target = ""
+        if m.lastindex and m.lastindex >= 2 and m.group(2):
+            target = _clean(m.group(2) or "")
+        if not target:
+            # "for <company>" elsewhere in the message (not the reference)
+            for fm in re.finditer(
+                rf"\b(?:for|about|targeting)\s+{company}",
+                msg,
+                re.I,
+            ):
+                cand = _clean(fm.group(1) or "")
+                if cand and cand.lower() != reference.lower():
+                    target = cand
+                    break
+        if reference and len(reference) >= 2:
+            return {"reference": reference, "target": target}
+    return None
+
+
 def looks_like_mission_org_discovery(user_msg: str) -> bool:
     """True only when user wants to discover mission-fit orgs (not CSR-as-sender)."""
     msg = user_msg or ""
+    if parse_like_sent_request(msg):
+        return False
     if re.search(
         r"\b(from|as|using|send(?:\s+as)?)\s+(csr@|csr\b)|csr@karunamedia\.org",
         msg,
@@ -276,7 +352,15 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         )
     )
 
-    if looks_like_mission_org_discovery(msg):
+    like_sent = parse_like_sent_request(msg)
+    like_sent_to = (like_sent or {}).get("reference") or ""
+    like_sent_for = (like_sent or {}).get("target") or ""
+
+    if like_sent_to:
+        action = "send_email" if send and not draft else "draft_email"
+        agents = ["gmail", "web_research"]
+        draft = action == "draft_email"
+    elif looks_like_mission_org_discovery(msg):
         action = "research_then_zoom"
         agents = ["web_research", "zoominfo"]
         if draft or send or re.search(r"\b(email|outreach|personaliz)\b", msg, re.I):
@@ -322,6 +406,8 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         contacts_per_org=vol["contacts_per_org"],
         search_limit=vol["search_limit"],
         email_limit=vol["email_limit"],
+        like_sent_to=like_sent_to,
+        like_sent_for=like_sent_for,
     )
 
 
@@ -370,6 +456,8 @@ Return JSON:
   "ignore_emails": ["skip@x.com"],
   "draft": true,
   "send": false,
+  "like_sent_to": "company name from a prior sent email to clone, or empty",
+  "like_sent_for": "new target company to adapt for, or empty",
   "org_limit": {base.org_limit},
   "contacts_per_org": {base.contacts_per_org},
   "search_limit": {base.search_limit},
@@ -472,6 +560,25 @@ Return JSON:
     search_limit = max(search_limit, vol["search_limit"])
     email_limit = max(email_limit, vol["email_limit"])
 
+    like_sent_to = str(
+        data.get("like_sent_to") or base.like_sent_to or ""
+    ).strip()
+    like_sent_for = str(
+        data.get("like_sent_for") or base.like_sent_for or ""
+    ).strip()
+    if not like_sent_to:
+        parsed_like = parse_like_sent_request(user_msg)
+        if parsed_like:
+            like_sent_to = parsed_like.get("reference") or ""
+            like_sent_for = like_sent_for or (parsed_like.get("target") or "")
+    if like_sent_to and action in ("chat", "research_then_zoom", "gmail_extract"):
+        action = "draft_email" if not send else "send_email"
+        draft = action == "draft_email"
+        if "gmail" not in agents:
+            agents.append("gmail")
+        if "web_research" not in agents:
+            agents.append("web_research")
+
     return IntentPlan(
         action=action,
         agents=agents,
@@ -486,6 +593,8 @@ Return JSON:
         contacts_per_org=min(max(contacts_per_org, 1), 25),
         search_limit=min(max(search_limit, 1), 100),
         email_limit=min(max(email_limit, 1), MAX_EMAILS),
+        like_sent_to=like_sent_to,
+        like_sent_for=like_sent_for,
         raw=data,
     )
 
@@ -514,6 +623,11 @@ def plan_summary(plan: IntentPlan) -> str:
         parts.append(f"search_limit: {plan.search_limit}")
     elif plan.action in ("draft_email", "send_email"):
         parts.append(f"email_cap: {plan.email_limit}")
+    if plan.like_sent_to:
+        like_bit = f"like sent to: {plan.like_sent_to}"
+        if plan.like_sent_for:
+            like_bit += f" → for {plan.like_sent_for}"
+        parts.append(like_bit)
     if plan.cc:
         parts.append(f"cc: {', '.join(plan.cc)}")
     if plan.ignore_emails:

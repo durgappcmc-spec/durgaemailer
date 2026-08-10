@@ -13,11 +13,12 @@ from connectors.prospects import enrich_fallthrough, search_all
 from connectors.zoominfo import extract_linkedin_url, names_from_linkedin_url
 from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
 from core import memory as mem
-from core.llm import chat_fast, chat_grounded, extract_json
+from core.llm import chat_fast, chat_grounded, extract_json, grounded_collect
 from agent.intent import (
     IntentPlan,
     classify_email_roles,
     filter_recipient_emails,
+    parse_like_sent_request,
     plan_request,
     plan_summary,
 )
@@ -40,6 +41,9 @@ from gmail_client.extract import (
     extract_batch,
     extract_inbox_and_sent,
     filter_messages,
+    find_sent_to_company,
+    get_message,
+    pick_best_sent_reference,
 )
 from gmail_client.send import (
     create_draft,
@@ -90,10 +94,14 @@ Rules:
   Multi: {"batch":true,"recipient_emails":["a@b.com"],"cc":["x@y.com","z@y.com"]}
   From last prospects: {"batch":true,"from_prospects":true,"subject":"Hello"}
   From mailbox: {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
+  Like a prior sent email: {"like_sent_to":"IndiaMART","like_sent_for":"Acme"}
   Include ALL cc addresses the user listed. Put ignored emails in "ignore_emails".
   Never put csr@karunamedia.org or CC addresses in recipient_email(s).
   Known CC aliases (use these when only a name is given):
   Deepti → deepti.87.srivastava@gmail.com; Raahul/Rahul → raahul.ppcm@gmail.com.
+  When user says "create email like sent to X" / "similar to the email we sent to X",
+  use DRAFT_EMAIL with like_sent_to set (and like_sent_for for the new company if named).
+  Do NOT use RESEARCH_THEN_ZOOM for style-clone requests.
 - SEND_EMAIL: send now only. Same compact JSON shapes as DRAFT_EMAIL.
 - SCHEDULE_EMAIL: schedule later. Compact JSON with recipient_email, subject, send_at.
   NEVER include html_body in routing lines.
@@ -825,6 +833,414 @@ def _deliver_job(
     return create_draft(**kwargs, track=True), False
 
 
+def _infer_like_sent_target(
+    *,
+    explicit: str,
+    reference: str,
+    prospects: Optional[list[dict[str, Any]]],
+    history: Optional[list[dict[str, str]]],
+) -> str:
+    """Pick the company to adapt the cloned email for."""
+    target = (explicit or "").strip()
+    if target and target.lower() != (reference or "").strip().lower():
+        return target
+    companies: list[str] = []
+    for p in prospects or []:
+        c = (p.get("company") or "").strip()
+        if c and c.lower() != (reference or "").strip().lower():
+            companies.append(c)
+    uniq = list(dict.fromkeys(companies))
+    if len(uniq) == 1:
+        return uniq[0]
+    if uniq:
+        return uniq[-1]
+    # Last user/assistant turn may name a company after "for/about"
+    if history:
+        for m in reversed(history[-6:]):
+            text = str(m.get("content") or "")
+            fm = re.search(
+                r"\b(?:for|about|targeting|company)\s+([A-Za-z0-9][A-Za-z0-9&.\'\- ]{2,50})",
+                text,
+                re.I,
+            )
+            if fm:
+                cand = fm.group(1).strip(" .,;:")
+                if cand.lower() != (reference or "").strip().lower():
+                    return cand
+    return target or ""
+
+
+def _prospects_for_company(
+    prospects: Optional[list[dict[str, Any]]],
+    company: str,
+) -> list[dict[str, Any]]:
+    company_l = (company or "").strip().lower()
+    rows = _prospects_with_email(prospects)
+    if not company_l:
+        return rows
+    matched = [
+        p
+        for p in rows
+        if company_l in (p.get("company") or "").lower()
+        or (p.get("company") or "").lower() in company_l
+    ]
+    return matched or rows
+
+
+def _extract_pasted_email(user_msg: str) -> str:
+    """If the user pasted a full outreach email in chat, return that body."""
+    msg = (user_msg or "").strip()
+    if len(msg) < 800:
+        return ""
+    m = re.search(
+        r"((?:Dear|Hi|Hello)\s+[^\n,]{1,80},?\s*\n[\s\S]{600,}?"
+        r"(?:Thanks,?|Thank you|Best regards|Warm regards|Regards)\s*,?\s*(?:\n|$))",
+        msg,
+        re.I,
+    )
+    if not m:
+        return ""
+    pasted = m.group(1).strip()
+    return pasted if len(pasted) >= 800 else ""
+
+
+def _company_name_variants(company: str) -> list[str]:
+    """Generate match variants for swapping a company name in copied email text."""
+    name = (company or "").strip()
+    if not name:
+        return []
+    variants = {name, name.lower(), name.upper(), name.title()}
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", name).strip()
+    if spaced and spaced.lower() != name.lower():
+        variants.update({spaced, spaced.lower(), spaced.title()})
+    compact = re.sub(r"\s+", "", name)
+    if compact:
+        variants.add(compact)
+        variants.add(compact.lower())
+    return sorted({v for v in variants if v}, key=len, reverse=True)
+
+
+def _detect_company_phrases(text: str, company: str) -> list[str]:
+    """Find longer legal/brand phrases like 'IndiaMART Intermesh' in the body."""
+    if not text or not company:
+        return []
+    phrases: set[str] = set()
+    for variant in _company_name_variants(company):
+        if len(variant) < 3:
+            continue
+        pat = re.compile(
+            rf"\b{re.escape(variant)}(?:\s+(?:Intermesh|Limited|Ltd\.?|Pvt\.?|Private|Inc\.?|LLC|Group|Corporation|Corp\.?))?\b",
+            re.I,
+        )
+        for m in pat.finditer(text):
+            phrases.add(m.group(0))
+    # Always include base variants
+    phrases.update(_company_name_variants(company))
+    return sorted(phrases, key=len, reverse=True)
+
+
+def _replace_company_names(
+    text: str,
+    old_company: str,
+    new_company: str,
+    *,
+    extra_phrases: Optional[list[str]] = None,
+) -> str:
+    """Replace all old-company variants/phrases with new_company (longest first)."""
+    if not text or not old_company or not new_company:
+        return text or ""
+    out = text
+    phrases = list(extra_phrases or []) + _company_name_variants(old_company)
+    # Dedupe, longest first
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in sorted(phrases, key=len, reverse=True):
+        key = p.lower()
+        if not p or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(p)
+    for variant in ordered:
+        out = re.sub(re.escape(variant), new_company, out, flags=re.I)
+    return out
+
+
+def _strip_email_noise(html: str) -> str:
+    """Remove scripts/styles/tracking pixels; keep real content."""
+    if not (html or "").strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").lower()
+            if any(
+                x in src
+                for x in ("track", "/o?", "pixel", "open.gif", "spacer")
+            ):
+                img.decompose()
+                continue
+            w, h = img.get("width"), img.get("height")
+            if str(w) in ("1", "0") and str(h) in ("1", "0"):
+                img.decompose()
+        return str(soup)
+    except Exception:
+        return re.sub(
+            r"<style[\s\S]*?</style>|<script[\s\S]*?</script>",
+            "",
+            html,
+            flags=re.I,
+        )
+
+
+def _full_reference_text(body_text: str, body_html: str) -> str:
+    """Return the complete plain-text email body (no truncation)."""
+    text = (body_text or "").strip()
+    html = _strip_email_noise(body_html or "")
+    html_text = ""
+    if html:
+        try:
+            from bs4 import BeautifulSoup
+
+            html_text = BeautifulSoup(html, "html.parser").get_text("\n").strip()
+        except Exception:
+            html_text = html
+    # Prefer whichever source is more complete
+    if len(html_text) > len(text) + 80:
+        return html_text
+    return text or html_text
+
+
+def _linkify_plain(text: str) -> str:
+    """Escape HTML then turn URLs into anchors."""
+    safe = (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return re.sub(
+        r"(https?://[^\s<]+)",
+        r'<a href="\1">\1</a>',
+        safe,
+    )
+
+
+def _full_text_to_html(text: str) -> str:
+    """Convert a full plain-text email to HTML, keeping every section and line."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    blocks = re.split(r"\n\s*\n+", text)
+    parts: list[str] = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = [ln.strip() for ln in block.split("\n")]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            continue
+        # Multi-line block (e.g. YouTube list): keep line breaks
+        if len(lines) > 1:
+            inner = "<br>\n".join(_linkify_plain(ln) for ln in lines)
+            parts.append(f"<p>{inner}</p>")
+        else:
+            line = lines[0]
+            # Section headers — keep emphasis
+            if (
+                len(line) < 120
+                and not line.endswith(".")
+                and not line.lower().startswith("http")
+                and (
+                    line.endswith(":")
+                    or "—" in line
+                    or re.match(
+                        r"^(The opportunity|Why |What your|See our|Success stories|"
+                        r"AI-integrated|Craft &|Full channel|Next step|Thanks,?)",
+                        line,
+                        re.I,
+                    )
+                )
+            ):
+                parts.append(f"<p><strong>{_linkify_plain(line)}</strong></p>")
+            else:
+                parts.append(f"<p>{_linkify_plain(line)}</p>")
+    return "\n".join(parts)
+
+
+def _reference_still_present(text: str, reference_company: str) -> bool:
+    if not text or not reference_company:
+        return False
+    compact = re.sub(r"[^a-z0-9]", "", reference_company.lower())
+    if compact and len(compact) >= 4:
+        if compact in re.sub(r"[^a-z0-9]", "", text.lower()):
+            return True
+    return False
+
+
+def _adapt_why_section(
+    full_text: str,
+    *,
+    reference_company: str,
+    target_company: str,
+    research_notes: str,
+) -> str:
+    """Optionally rewrite only the 'Why X specifically' block; leave rest intact."""
+    if not research_notes.strip() or not full_text:
+        return full_text
+    m = re.search(
+        r"(Why\s+[^\n]{0,80}\n)([\s\S]*?)(?=\n(?:Next step|Thank you|Thanks,?)\b)",
+        full_text,
+        re.I,
+    )
+    if not m:
+        return full_text
+    header, body = m.group(1), m.group(2).strip()
+    if len(body) < 40:
+        return full_text
+    try:
+        raw = extract_json(
+            f"""Rewrite ONLY this "Why company specifically" email section for {target_company}.
+Keep similar length and the same pitch structure. Use research facts.
+Never mention {reference_company}. Keep it as plain paragraphs (no markdown).
+
+Header line to keep (already renamed): {header.strip()}
+
+Section body to rewrite:
+{body}
+
+Research:
+{research_notes[:4000]}
+
+Return JSON: {{"section_body": "...full rewritten section body only..."}}
+""",
+            system="Rewrite one email section only. Preserve length. JSON only.",
+            max_tokens=2000,
+        )
+        data = json.loads(raw or "{}")
+        new_body = str((data or {}).get("section_body") or "").strip()
+        if new_body and len(new_body) >= int(len(body) * 0.7):
+            new_body = _replace_company_names(
+                new_body, reference_company, target_company
+            )
+            return full_text[: m.start(2)] + new_body + "\n\n" + full_text[m.end(2) :]
+    except Exception as e:
+        print(f"[router] why-section adapt failed: {e}", file=sys.stderr)
+    return full_text
+
+
+def _compose_like_sent_email(
+    *,
+    user_msg: str,
+    reference_msg: dict[str, Any],
+    reference_company: str,
+    target_company: str,
+    research_notes: str,
+    document_context: str = "",
+) -> dict[str, str]:
+    """Keep the FULL sent email; swap company names; lightly adapt Why-section only."""
+    ref_subject = (reference_msg.get("subject") or "").strip()
+    ref_body = (reference_msg.get("body_text") or "").strip()
+    ref_html = (reference_msg.get("body_html") or "").strip()
+
+    full_text = _full_reference_text(ref_body, ref_html)
+    target = (target_company or "").strip() or "{company}"
+    phrases = _detect_company_phrases(full_text + "\n" + ref_subject, reference_company)
+
+    # 1) Deterministic full-body company swap — never summarize / never drop sections
+    swapped = _replace_company_names(
+        full_text,
+        reference_company,
+        target,
+        extra_phrases=phrases,
+    )
+    swapped_subject = _replace_company_names(
+        ref_subject,
+        reference_company,
+        target,
+        extra_phrases=phrases,
+    ) or ref_subject
+
+    # 2) Optional: rewrite only "Why X specifically" using research (rest untouched)
+    if research_notes.strip() and target and target != "{company}":
+        swapped = _adapt_why_section(
+            swapped,
+            reference_company=reference_company,
+            target_company=target,
+            research_notes=research_notes,
+        )
+
+    # 3) If HTML source is richer structurally, swap names inside cleaned HTML instead
+    html_out = ""
+    cleaned_html = _strip_email_noise(ref_html)
+    if cleaned_html and len(cleaned_html) > 200:
+        html_swapped = _replace_company_names(
+            cleaned_html,
+            reference_company,
+            target,
+            extra_phrases=phrases,
+        )
+        # Prefer HTML only when it still contains essentially the full text
+        try:
+            from bs4 import BeautifulSoup
+
+            html_plain = BeautifulSoup(html_swapped, "html.parser").get_text("\n")
+        except Exception:
+            html_plain = html_swapped
+        if len(re.sub(r"\s+", "", html_plain)) >= int(
+            len(re.sub(r"\s+", "", swapped)) * 0.9
+        ):
+            # Also apply why-section text into HTML path by rebuilding from swapped text
+            # when why-section was adapted (swapped may differ from html_plain)
+            if len(swapped) >= len(full_text) * 0.9:
+                html_out = _full_text_to_html(swapped)
+            else:
+                html_out = html_swapped
+
+    if not html_out:
+        html_out = _full_text_to_html(swapped)
+
+    # Final scrub for leftover reference company
+    if _reference_still_present(html_out + swapped_subject, reference_company):
+        html_out = _replace_company_names(
+            html_out, reference_company, target, extra_phrases=phrases
+        )
+        swapped_subject = _replace_company_names(
+            swapped_subject, reference_company, target, extra_phrases=phrases
+        )
+        swapped = _replace_company_names(
+            swapped, reference_company, target, extra_phrases=phrases
+        )
+
+    alignment = ""
+    if research_notes.strip():
+        try:
+            raw = extract_json(
+                f"""In 1-2 sentences, why {target} fits this CSR outreach email.
+Research:\n{research_notes[:3000]}
+Return JSON: {{"alignment_summary":"..."}}""",
+                system="Return JSON only.",
+                max_tokens=300,
+            )
+            data = json.loads(raw or "{}")
+            alignment = str((data or {}).get("alignment_summary") or "").strip()
+        except Exception:
+            alignment = ""
+
+    return {
+        "subject": swapped_subject or f"Partnership idea for {target}",
+        "html_body": html_out,
+        "alignment_summary": alignment,
+        "paragraph_count": str(html_out.count("<p>")),
+        "char_count": str(len(swapped)),
+        "plain_preview": swapped[:1200],
+    }
+
+
 def _attach_note(
     attachments: Optional[list[dict[str, Any]]],
     *,
@@ -1014,7 +1430,32 @@ def answer(
             seed_json["cc"] = plan.cc
         if plan.ignore_emails:
             seed_json["ignore_emails"] = plan.ignore_emails
+        if plan.like_sent_to:
+            seed_json["like_sent_to"] = plan.like_sent_to
+        if plan.like_sent_for:
+            seed_json["like_sent_for"] = plan.like_sent_for
         routing = "DRAFT_EMAIL:" + json.dumps(seed_json, ensure_ascii=False)
+        meta_routing = routing
+    elif plan.like_sent_to and (
+        routing == "CHAT"
+        or routing.startswith("CHAT")
+        or routing.startswith("RESEARCH_THEN_ZOOM")
+        or routing.startswith("GMAIL_EXTRACT")
+    ):
+        seed_json = {"like_sent_to": plan.like_sent_to}
+        if plan.like_sent_for:
+            seed_json["like_sent_for"] = plan.like_sent_for
+        if len(plan.to_emails) == 1:
+            seed_json["recipient_email"] = plan.to_emails[0]
+        elif plan.to_emails:
+            seed_json["recipient_emails"] = plan.to_emails
+            seed_json["batch"] = True
+        if plan.cc:
+            seed_json["cc"] = plan.cc
+        routing = (
+            ("SEND_EMAIL:" if plan.send and not plan.draft else "DRAFT_EMAIL:")
+            + json.dumps(seed_json, ensure_ascii=False)
+        )
         meta_routing = routing
     elif planned_prefix == "RESEARCH_THEN_ZOOM" and (
         routing == "CHAT"
@@ -1929,181 +2370,580 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 if routing.startswith(prefix)
                 else {}
             )
-            # Prefer mailbox follow-ups when user asks and we have a prior pull
-            if mailbox_messages and re.search(
-                r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
-                user_msg or "",
-                re.I,
-            ):
-                seed = {**seed, "batch": True, "from_mailbox": True}
-            # Bulk to last ZoomInfo / prospect search
-            if prospects and re.search(
-                r"\b(these prospects|this list|all (these |the )?prospects|"
-                r"zoominfo list|everyone (we |you )?found|all of them)\b",
-                user_msg or "",
-                re.I,
-            ):
-                seed = {**seed, "batch": True, "from_prospects": True}
-            payload = _extract_email_job(
-                user_msg,
-                history=history,
-                seed=seed,
-                for_schedule=False,
-                document_context=doc_context,
-            )
-            for flag in (
-                "batch",
-                "from_prospects",
-                "use_prospects",
-                "from_mailbox",
-                "use_mailbox",
-                "follow_up",
-                "mailbox_filter",
-                "recipient_emails",
-            ):
-                if flag in seed and flag not in payload:
-                    payload[flag] = seed[flag]
-            # Attach binary files only when explicitly requested
-            if email_atts:
-                payload["attachments"] = email_atts
-            elif "attachments" in payload:
-                payload.pop("attachments", None)
-            # Default personalized follow-up templates when missing
-            if payload.get("from_mailbox") or payload.get("use_mailbox"):
-                if not payload.get("subject") or payload.get("subject") in (
-                    "(no subject)",
-                    user_msg,
-                ):
-                    payload["subject"] = "Following up: {prior_subject}"
-                body = payload.get("html_body") or ""
-                if (
-                    not body
-                    or body.strip() == f"<p>{user_msg}</p>"
-                    or "{first_name}" not in body
-                ):
-                    payload["html_body"] = (
-                        "<p>Hi {first_name},</p>"
-                        "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
-                        "<p>{prior_summary}</p>"
-                        "<p>Would you have time this week for a quick chat?</p>"
-                        "<p>Best regards</p>"
-                    )
+            like_ref = str(
+                plan.like_sent_to or seed.get("like_sent_to") or ""
+            ).strip()
+            like_for = str(
+                plan.like_sent_for or seed.get("like_sent_for") or ""
+            ).strip()
+            if not like_ref:
+                parsed_like = parse_like_sent_request(user_msg or "")
+                if parsed_like:
+                    like_ref = (parsed_like.get("reference") or "").strip()
+                    like_for = like_for or (parsed_like.get("target") or "").strip()
 
-            if plan.cc and not payload.get("cc"):
-                payload["cc"] = plan.cc
-            if plan.ignore_emails:
-                payload["ignore_emails"] = plan.ignore_emails
-            if plan.to_emails and not payload.get("recipient_email") and not payload.get(
-                "recipient_emails"
-            ):
-                if len(plan.to_emails) == 1:
-                    payload["recipient_email"] = plan.to_emails[0]
-                else:
-                    payload["recipient_emails"] = plan.to_emails
-                    payload["batch"] = True
-
-            jobs = _build_draft_jobs(
-                payload,
-                user_msg,
-                history=history,
-                prospects=prospects,
-                mailbox_messages=mailbox_messages,
-                plan=plan,
-            )
-            email_cap = min(max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS)
-            if len(jobs) > email_cap:
-                yield (
-                    f"_Capping at **{email_cap}** emails "
-                    f"(found {len(jobs)}; ask for up to 100 if you need more)._\n"
+            if like_ref:
+                # Clone angle from a prior sent email → research target → draft
+                target_company = _infer_like_sent_target(
+                    explicit=like_for,
+                    reference=like_ref,
+                    prospects=prospects,
+                    history=history,
                 )
-                jobs = apply_email_cap(jobs, email_limit=email_cap)
-            headers = _mail_headers(
-                user_msg,
-                seed=payload,
-                to_emails=[j.get("recipient_email") or "" for j in jobs],
-                plan=plan,
-            )
-            payload["from_email"] = headers["from_email"]
-            payload["cc"] = headers["cc"]
-            want_send = is_send and not _prefer_draft_over_send(user_msg, True)
-            action = "send" if want_send else "draft"
-            if not jobs and (
-                payload.get("from_mailbox") or payload.get("use_mailbox")
-            ):
                 yield (
-                    f"I couldn't {action} follow-ups — no mailbox contacts loaded yet. "
-                    "First say `show my inbox` or `show sent last 30 days`, "
-                    "optionally filter, then ask for personalized follow-ups."
-                )
-            elif not jobs:
-                yield (
-                    f"I couldn't {action} — no recipient emails found. "
-                    "List addresses, search prospects, or pull inbox/sent first."
-                )
-            else:
-                yield (
-                    f"{'Sending' if want_send else 'Creating new Gmail draft(s)'} "
-                    f"from **{headers['from_email']}**"
+                    f"**Like-sent:** finding Gmail sent to **{like_ref}**"
                     + (
-                        f" (cc: {', '.join(headers['cc'])})"
-                        if headers["cc"]
+                        f", adapting for **{target_company}**"
+                        if target_company
                         else ""
                     )
-                    + " with your signature…\n"
+                    + "…\n"
                 )
-                results = []
-                for job in jobs:
-                    if _stop_now():
-                        yield stopped_message()
-                        break
-                    job = _stamp_mail_fields(
-                        job,
-                        from_email=headers["from_email"],
-                        cc=headers["cc"],
-                        attachments=email_atts,
-                    )
-                    out, did_send = _deliver_job(
-                        job, want_send=want_send, user_msg=user_msg
-                    )
-                    results.append({**out, "_did_send": did_send})
-                ok = [r for r in results if not r.get("error")]
-                fail = [r for r in results if r.get("error")]
-                if ok and email_atts:
-                    consumed_attachments = True
-                yield f"Done: **{len(ok)}** ok"
-                if fail:
-                    yield f", **{len(fail)}** failed"
-                yield (
-                    _attach_note(
-                        chat_attachments if chat_attachments else email_atts,
-                        used_document_context=used_docs,
-                        attached_to_email=bool(email_atts),
-                    )
-                    + "\n"
+                if _stop_now():
+                    yield stopped_message()
+                else:
+                    sent_rows: list[dict[str, Any]] = []
+                    try:
+                        sent_rows = find_sent_to_company(
+                            like_ref,
+                            days=365,
+                            max_results=15,
+                            ai_extract=False,
+                        )
+                    except Exception as e:
+                        print(f"[router] like-sent gmail: {e}", file=sys.stderr)
+                        yield f"_Couldn't search Sent mail: {e}_\n"
+                    # Fallback: filter already-loaded mailbox (prefer sent)
+                    if not sent_rows and mailbox_messages:
+                        sent_only = [
+                            m
+                            for m in mailbox_messages
+                            if (m.get("mailbox") or "").lower() == "sent"
+                        ]
+                        pool = sent_only or list(mailbox_messages)
+                        sent_rows = filter_messages(pool, like_ref)
+                    mailbox_out = list(sent_rows)
+                    ref_msg = pick_best_sent_reference(sent_rows, like_ref)
+                    if ref_msg and ref_msg.get("message_id"):
+                        # Always re-fetch full MIME so we don't draft from a stub
+                        try:
+                            fresh = get_message(str(ref_msg["message_id"]))
+                            if not fresh.get("error") and (
+                                fresh.get("body_text") or fresh.get("body_html")
+                            ):
+                                ref_msg = {
+                                    **ref_msg,
+                                    **{
+                                        k: fresh.get(k) or ref_msg.get(k) or ""
+                                        for k in (
+                                            "subject",
+                                            "from",
+                                            "to",
+                                            "cc",
+                                            "date",
+                                            "body_text",
+                                            "body_html",
+                                            "thread_id",
+                                        )
+                                    },
+                                    "mailbox": "sent",
+                                }
+                        except Exception as e:
+                            print(
+                                f"[router] like-sent refresh: {e}",
+                                file=sys.stderr,
+                            )
+                    if not ref_msg:
+                        yield (
+                            f"I couldn't find a sent email matching **{like_ref}**. "
+                            "Try `show sent last 365 days` first, or use the exact "
+                            "company/recipient name from the Sent folder.\n"
+                        )
+                    elif not (
+                        (ref_msg.get("body_text") or "").strip()
+                        or (ref_msg.get("body_html") or "").strip()
+                    ):
+                        yield (
+                            f"Found a sent message for **{like_ref}** "
+                            f"(**{(ref_msg.get('subject') or '(no subject)').strip()}**) "
+                            "but the body came back empty. "
+                            "Open it in Gmail Sent and try again, or paste the body here.\n"
+                        )
+                    else:
+                        # Prefer a full email pasted in chat over a truncated Gmail body
+                        pasted = _extract_pasted_email(user_msg or "")
+                        gmail_body = (
+                            (ref_msg.get("body_text") or "").strip()
+                            or (ref_msg.get("body_html") or "").strip()
+                        )
+                        if pasted and len(pasted) > len(gmail_body) + 100:
+                            ref_msg = {
+                                **ref_msg,
+                                "body_text": pasted,
+                                "body_html": "",
+                            }
+                            yield (
+                                "_Using the **full email you pasted** as the reference "
+                                f"({len(pasted)} chars) — fuller than the Gmail capture._\n"
+                            )
+                        ref_subj = (ref_msg.get("subject") or "(no subject)").strip()
+                        body_preview = (ref_msg.get("body_text") or "").strip()
+                        if len(body_preview) < 80 and ref_msg.get("body_html"):
+                            try:
+                                from bs4 import BeautifulSoup
+
+                                body_preview = (
+                                    BeautifulSoup(
+                                        ref_msg.get("body_html") or "",
+                                        "html.parser",
+                                    )
+                                    .get_text("\n")
+                                    .strip()
+                                )
+                            except Exception:
+                                pass
+                        preview = body_preview[:700].replace("\n", " ").strip()
+                        if len(body_preview) > 700:
+                            preview += "…"
+                        yield (
+                            f"Using reference: **{ref_subj}** "
+                            f"(to {ref_msg.get('to') or '—'}; "
+                            f"{ref_msg.get('date') or ''})\n"
+                            f"_Captured body: **{len(body_preview)}** chars"
+                            + (
+                                f" + HTML **{len(ref_msg.get('body_html') or '')}**"
+                                if ref_msg.get("body_html")
+                                else ""
+                            )
+                            + f"_\n> {preview}\n"
+                        )
+                        if len(body_preview) < 1500:
+                            yield (
+                                "_Note: Sent capture looks short for a full proposal. "
+                                "Paste the complete email in chat if sections are missing._\n"
+                            )
+                        research_notes = ""
+                        research_target = target_company or like_ref
+                        yield (
+                            f"**Researching** how **{research_target}** aligns "
+                            "with that outreach content…\n"
+                        )
+                        try:
+                            notes, web_sources = grounded_collect(
+                                f"""Research {research_target} and how it aligns with
+this prior outreach email's FULL content (offers, asks, themes).
+
+Prior subject: {ref_subj}
+Prior To: {ref_msg.get('to') or ''}
+Prior body:
+{(ref_msg.get('body_text') or body_preview)[:12000]}
+
+User request: {user_msg}
+
+Cover: what the company does, relevant CSR/partnerships/programs, and concrete
+ways each major point in the prior email maps to {research_target}. Be specific.
+""",
+                                system=(
+                                    "You are a careful company researcher. Use Google Search. "
+                                    "Focus on alignment with the prior outreach content."
+                                ),
+                            )
+                            research_notes = notes or ""
+                            sources.extend(web_sources or [])
+                        except Exception as e:
+                            print(f"[router] like-sent research: {e}", file=sys.stderr)
+                            yield f"_Research limited: {e}_\n"
+
+                        composed = _compose_like_sent_email(
+                            user_msg=user_msg,
+                            reference_msg=ref_msg,
+                            reference_company=like_ref,
+                            target_company=target_company,
+                            research_notes=research_notes,
+                            document_context=doc_context,
+                        )
+                        if composed.get("alignment_summary"):
+                            yield f"_{composed['alignment_summary']}_\n"
+                        yield (
+                            f"_Draft keeps **{composed.get('paragraph_count') or '?'}** "
+                            f"sections · **{composed.get('char_count') or '?'}** chars "
+                            f"(full Sent body preserved; company names → "
+                            f"**{target_company or 'target'}**)._\n"
+                        )
+                        if int(composed.get("char_count") or 0) < 1500:
+                            yield (
+                                "_Warning: the captured Sent body looks short. "
+                                "If sections are missing, paste the full email in chat "
+                                "and ask again (e.g. create email like this for Flipkart)._\n"
+                            )
+
+                        payload = {
+                            "subject": composed.get("subject") or ref_subj,
+                            "html_body": composed.get("html_body") or "",
+                            "source": "like_sent",
+                            "campaign": f"like:{like_ref}",
+                        }
+                        if email_atts:
+                            payload["attachments"] = email_atts
+                        if plan.cc:
+                            payload["cc"] = plan.cc
+                        if plan.ignore_emails:
+                            payload["ignore_emails"] = plan.ignore_emails
+
+                        # Recipients: explicit To → matching prospects → all prospects
+                        if plan.to_emails:
+                            if len(plan.to_emails) == 1:
+                                payload["recipient_email"] = plan.to_emails[0]
+                            else:
+                                payload["recipient_emails"] = plan.to_emails
+                                payload["batch"] = True
+                        elif prospects:
+                            matched = _prospects_for_company(
+                                prospects, target_company
+                            )
+                            if matched:
+                                payload["batch"] = True
+                                payload["from_prospects"] = True
+                                prospects = matched
+                                for p in matched:
+                                    if target_company and not (p.get("company") or ""):
+                                        p["company"] = target_company
+                                    if target_company and not (p.get("org_focus") or ""):
+                                        p["org_focus"] = (
+                                            composed.get("alignment_summary") or ""
+                                        )[:240]
+                                    if target_company and not (p.get("why_match") or ""):
+                                        p["why_match"] = (
+                                            composed.get("alignment_summary") or ""
+                                        )[:240]
+
+                        jobs = _build_draft_jobs(
+                            payload,
+                            user_msg,
+                            history=history,
+                            prospects=prospects,
+                            mailbox_messages=None,  # never follow-up path
+                            plan=plan,
+                        )
+                        # Fill company / alignment placeholders for explicit To rows
+                        if jobs and (
+                            target_company or composed.get("alignment_summary")
+                        ):
+                            for job in jobs:
+                                pctx = {
+                                    "name": job.get("recipient_name") or "",
+                                    "first_name": (
+                                        (job.get("recipient_name") or "").split(
+                                            None, 1
+                                        )
+                                        or [""]
+                                    )[0],
+                                    "email": job.get("recipient_email") or "",
+                                    "recipient_email": job.get("recipient_email")
+                                    or "",
+                                    "company": target_company,
+                                    "title": "",
+                                    "org_focus": (
+                                        composed.get("alignment_summary") or ""
+                                    )[:240],
+                                    "why_match": (
+                                        composed.get("alignment_summary") or ""
+                                    )[:240],
+                                    "prior_subject": "",
+                                    "prior_summary": "",
+                                }
+                                # Only re-apply when templates still have braces
+                                subj = job.get("subject") or ""
+                                body = job.get("html_body") or ""
+                                if "{" in subj or "{" in body:
+                                    job["subject"] = _apply_template(
+                                        composed.get("subject") or subj, pctx
+                                    )
+                                    job["html_body"] = _apply_template(
+                                        composed.get("html_body") or body, pctx
+                                    )
+
+                        email_cap = min(
+                            max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS
+                        )
+                        if len(jobs) > email_cap:
+                            yield (
+                                f"_Capping at **{email_cap}** emails "
+                                f"(found {len(jobs)})._\n"
+                            )
+                            jobs = apply_email_cap(jobs, email_limit=email_cap)
+
+                        headers = _mail_headers(
+                            user_msg,
+                            seed=payload,
+                            to_emails=[j.get("recipient_email") or "" for j in jobs],
+                            plan=plan,
+                        )
+                        payload["from_email"] = headers["from_email"]
+                        payload["cc"] = headers["cc"]
+                        want_send = is_send and not _prefer_draft_over_send(
+                            user_msg, True
+                        )
+                        action = "send" if want_send else "draft"
+
+                        if not jobs:
+                            yield (
+                                f"I wrote a **{like_ref}**-style email for "
+                                f"**{target_company or 'your target'}**, but need a "
+                                "recipient. Give a To address, or load prospects first.\n\n"
+                                f"**Subject:** {payload.get('subject')}\n\n"
+                                f"{payload.get('html_body')}\n"
+                            )
+                        else:
+                            yield (
+                                f"{'Sending' if want_send else 'Creating Gmail draft(s)'} "
+                                f"from **{headers['from_email']}**"
+                                + (
+                                    f" (cc: {', '.join(headers['cc'])})"
+                                    if headers["cc"]
+                                    else ""
+                                )
+                                + f" · style of sent-to-**{like_ref}**…\n"
+                            )
+                            results = []
+                            for job in jobs:
+                                if _stop_now():
+                                    yield stopped_message()
+                                    break
+                                # Ensure company placeholder context
+                                if target_company and "{company}" not in (
+                                    job.get("subject") or ""
+                                ):
+                                    pass
+                                job = _stamp_mail_fields(
+                                    job,
+                                    from_email=headers["from_email"],
+                                    cc=headers["cc"],
+                                    attachments=email_atts,
+                                )
+                                job["source"] = "like_sent"
+                                out, did_send = _deliver_job(
+                                    job, want_send=want_send, user_msg=user_msg
+                                )
+                                results.append({**out, "_did_send": did_send})
+                            ok = [r for r in results if not r.get("error")]
+                            fail = [r for r in results if r.get("error")]
+                            if ok and email_atts:
+                                consumed_attachments = True
+                            yield f"Done: **{len(ok)}** ok"
+                            if fail:
+                                yield f", **{len(fail)}** failed"
+                            yield (
+                                _attach_note(
+                                    chat_attachments
+                                    if chat_attachments
+                                    else email_atts,
+                                    used_document_context=used_docs,
+                                    attached_to_email=bool(email_atts),
+                                )
+                                + "\n"
+                            )
+                            for r in ok[:100]:
+                                target = r.get("to") or r.get("recipient_email")
+                                did = r.get("_did_send")
+                                yield (
+                                    f"- {'Sent' if did else 'Draft'} → {target}"
+                                    + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                                    + (
+                                        f" (draft_id={r.get('draft_id')})"
+                                        if r.get("draft_id")
+                                        else ""
+                                    )
+                                    + "\n"
+                                )
+                            if not want_send and ok:
+                                yield (
+                                    "\nOpen Gmail → Drafts to review, then send. "
+                                    "Tracking is embedded for 📬 Tracking after send.\n"
+                                )
+                            for r in fail[:10]:
+                                yield f"- Failed: {r.get('error')}\n"
+                            try:
+                                ingest_mailbox_messages(mailbox_out)
+                            except Exception:
+                                pass
+
+            else:
+                # Prefer mailbox follow-ups when user asks and we have a prior pull
+                if mailbox_messages and re.search(
+                    r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
+                    user_msg or "",
+                    re.I,
+                ):
+                    seed = {**seed, "batch": True, "from_mailbox": True}
+                # Bulk to last ZoomInfo / prospect search
+                if prospects and re.search(
+                    r"\b(these prospects|this list|all (these |the )?prospects|"
+                    r"zoominfo list|everyone (we |you )?found|all of them)\b",
+                    user_msg or "",
+                    re.I,
+                ):
+                    seed = {**seed, "batch": True, "from_prospects": True}
+                payload = _extract_email_job(
+                    user_msg,
+                    history=history,
+                    seed=seed,
+                    for_schedule=False,
+                    document_context=doc_context,
                 )
-                for r in ok[:100]:
-                    target = r.get("to") or r.get("recipient_email")
-                    did = r.get("_did_send")
+                for flag in (
+                    "batch",
+                    "from_prospects",
+                    "use_prospects",
+                    "from_mailbox",
+                    "use_mailbox",
+                    "follow_up",
+                    "mailbox_filter",
+                    "recipient_emails",
+                ):
+                    if flag in seed and flag not in payload:
+                        payload[flag] = seed[flag]
+                # Attach binary files only when explicitly requested
+                if email_atts:
+                    payload["attachments"] = email_atts
+                elif "attachments" in payload:
+                    payload.pop("attachments", None)
+                # Default personalized follow-up templates when missing
+                if payload.get("from_mailbox") or payload.get("use_mailbox"):
+                    if not payload.get("subject") or payload.get("subject") in (
+                        "(no subject)",
+                        user_msg,
+                    ):
+                        payload["subject"] = "Following up: {prior_subject}"
+                    body = payload.get("html_body") or ""
+                    if (
+                        not body
+                        or body.strip() == f"<p>{user_msg}</p>"
+                        or "{first_name}" not in body
+                    ):
+                        payload["html_body"] = (
+                            "<p>Hi {first_name},</p>"
+                            "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
+                            "<p>{prior_summary}</p>"
+                            "<p>Would you have time this week for a quick chat?</p>"
+                            "<p>Best regards</p>"
+                        )
+
+                if plan.cc and not payload.get("cc"):
+                    payload["cc"] = plan.cc
+                if plan.ignore_emails:
+                    payload["ignore_emails"] = plan.ignore_emails
+                if plan.to_emails and not payload.get("recipient_email") and not payload.get(
+                    "recipient_emails"
+                ):
+                    if len(plan.to_emails) == 1:
+                        payload["recipient_email"] = plan.to_emails[0]
+                    else:
+                        payload["recipient_emails"] = plan.to_emails
+                        payload["batch"] = True
+
+                jobs = _build_draft_jobs(
+                    payload,
+                    user_msg,
+                    history=history,
+                    prospects=prospects,
+                    mailbox_messages=mailbox_messages,
+                    plan=plan,
+                )
+                email_cap = min(max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS)
+                if len(jobs) > email_cap:
                     yield (
-                        f"- {'Sent' if did else 'Draft'} → {target}"
-                        + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                        f"_Capping at **{email_cap}** emails "
+                        f"(found {len(jobs)}; ask for up to 100 if you need more)._\n"
+                    )
+                    jobs = apply_email_cap(jobs, email_limit=email_cap)
+                headers = _mail_headers(
+                    user_msg,
+                    seed=payload,
+                    to_emails=[j.get("recipient_email") or "" for j in jobs],
+                    plan=plan,
+                )
+                payload["from_email"] = headers["from_email"]
+                payload["cc"] = headers["cc"]
+                want_send = is_send and not _prefer_draft_over_send(user_msg, True)
+                action = "send" if want_send else "draft"
+                if not jobs and (
+                    payload.get("from_mailbox") or payload.get("use_mailbox")
+                ):
+                    yield (
+                        f"I couldn't {action} follow-ups — no mailbox contacts loaded yet. "
+                        "First say `show my inbox` or `show sent last 30 days`, "
+                        "optionally filter, then ask for personalized follow-ups."
+                    )
+                elif not jobs:
+                    yield (
+                        f"I couldn't {action} — no recipient emails found. "
+                        "List addresses, search prospects, or pull inbox/sent first."
+                    )
+                else:
+                    yield (
+                        f"{'Sending' if want_send else 'Creating new Gmail draft(s)'} "
+                        f"from **{headers['from_email']}**"
                         + (
-                            f" (draft_id={r.get('draft_id')})"
-                            if r.get("draft_id")
+                            f" (cc: {', '.join(headers['cc'])})"
+                            if headers["cc"]
                             else ""
+                        )
+                        + " with your signature…\n"
+                    )
+                    results = []
+                    for job in jobs:
+                        if _stop_now():
+                            yield stopped_message()
+                            break
+                        job = _stamp_mail_fields(
+                            job,
+                            from_email=headers["from_email"],
+                            cc=headers["cc"],
+                            attachments=email_atts,
+                        )
+                        out, did_send = _deliver_job(
+                            job, want_send=want_send, user_msg=user_msg
+                        )
+                        results.append({**out, "_did_send": did_send})
+                    ok = [r for r in results if not r.get("error")]
+                    fail = [r for r in results if r.get("error")]
+                    if ok and email_atts:
+                        consumed_attachments = True
+                    yield f"Done: **{len(ok)}** ok"
+                    if fail:
+                        yield f", **{len(fail)}** failed"
+                    yield (
+                        _attach_note(
+                            chat_attachments if chat_attachments else email_atts,
+                            used_document_context=used_docs,
+                            attached_to_email=bool(email_atts),
                         )
                         + "\n"
                     )
-                if len(ok) > 100:
-                    yield f"_…and {len(ok) - 100} more._\n"
-                if not want_send:
-                    yield (
-                        "\nOpen Gmail → Drafts to review, then send. "
-                        "Open/click tracking is already embedded "
-                        "(visible in 📬 Tracking after send).\n"
-                    )
-                for r in fail[:10]:
-                    yield f"- Failed: {r.get('error')}\n"
+                    for r in ok[:100]:
+                        target = r.get("to") or r.get("recipient_email")
+                        did = r.get("_did_send")
+                        yield (
+                            f"- {'Sent' if did else 'Draft'} → {target}"
+                            + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                            + (
+                                f" (draft_id={r.get('draft_id')})"
+                                if r.get("draft_id")
+                                else ""
+                            )
+                            + "\n"
+                        )
+                    if len(ok) > 100:
+                        yield f"_…and {len(ok) - 100} more._\n"
+                    if not want_send:
+                        yield (
+                            "\nOpen Gmail → Drafts to review, then send. "
+                            "Open/click tracking is already embedded "
+                            "(visible in 📬 Tracking after send).\n"
+                        )
+                    for r in fail[:10]:
+                        yield f"- Failed: {r.get('error')}\n"
 
         elif routing.startswith("SCHEDULE_EMAIL"):
             # Accept truncated "SCHEDULE_EMAIL:{"recipient_email" lines.
