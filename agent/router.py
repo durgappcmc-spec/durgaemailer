@@ -92,6 +92,8 @@ Rules:
   From mailbox: {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
   Include ALL cc addresses the user listed. Put ignored emails in "ignore_emails".
   Never put csr@karunamedia.org or CC addresses in recipient_email(s).
+  Known CC aliases (use these when only a name is given):
+  Deepti → deepti.87.srivastava@gmail.com; Raahul/Rahul → raahul.ppcm@gmail.com.
 - SEND_EMAIL: send now only. Same compact JSON shapes as DRAFT_EMAIL.
 - SCHEDULE_EMAIL: schedule later. Compact JSON with recipient_email, subject, send_at.
   NEVER include html_body in routing lines.

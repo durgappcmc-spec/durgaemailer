@@ -77,6 +77,9 @@ Critical:
 - csr@karunamedia.org / "from CSR" / "as CSR" means the SENDER identity, NOT a search for CSR NGOs.
 - If they already have contacts/prospects/list and ask to draft, use draft_email (agents: gmail).
 - Put every CC address in cc (array). Never drop the second CC.
+- If the user names people for CC without emails (e.g. "cc Deepti and Rahul"),
+  resolve known aliases: Deepti → deepti.87.srivastava@gmail.com,
+  Raahul/Rahul → raahul.ppcm@gmail.com. Put the resolved emails in cc.
 - Put ignored addresses in ignore_emails when they say ignore/skip/don't use/except.
 - from_email defaults to csr@karunamedia.org for outreach.
 - Prefer draft over send unless they say send now.
@@ -159,7 +162,12 @@ def ignored_emails(user_msg: str) -> list[str]:
 
 def classify_email_roles(user_msg: str) -> EmailRoles:
     """Heuristic From / To / CC / ignore from the user message."""
+    from agent.contact_aliases import learn_aliases_from_text, resolve_names_in_text
+
     msg = user_msg or ""
+    # Learn "Raahul as <email>" style mappings from this turn
+    learn_aliases_from_text(msg)
+
     ignore = ignored_emails(msg)
     ignore_set = {e.lower() for e in ignore}
 
@@ -173,18 +181,30 @@ def classify_email_roles(user_msg: str) -> EmailRoles:
     from_email = (from_cands[0] if from_cands else default_from_email()).strip()
 
     cc: list[str] = []
+    cc_spans: list[str] = []
     for m in _CC_BLOCK_RE.finditer(msg):
-        cc.extend(_EMAIL_RE.findall(m.group(1)))
+        span = m.group(1)
+        cc_spans.append(span)
+        cc.extend(_EMAIL_RE.findall(span))
     for m in re.finditer(r"\bcc(?:\s*[:=]|\s+to)?\s*([^\n]+)", msg, re.I):
-        cc.extend(_EMAIL_RE.findall(m.group(1)))
+        span = m.group(1)
+        cc_spans.append(span)
+        cc.extend(_EMAIL_RE.findall(span))
     for m in re.finditer(r"\b(?:copy|carbon\s+copy)\s+([^\n]+)", msg, re.I):
-        cc.extend(_EMAIL_RE.findall(m.group(1)))
+        span = m.group(1)
+        cc_spans.append(span)
+        cc.extend(_EMAIL_RE.findall(span))
+    # Resolve nicknames in CC phrases: "cc deepti and rahul"
+    for span in cc_spans:
+        cc.extend(resolve_names_in_text(span))
     cc.extend(default_cc_emails())
     cc = _uniq(cc, exclude=ignore_set | {from_email.lower()})
 
     to: list[str] = []
     for m in _TO_BLOCK_RE.finditer(msg):
-        to.extend(_EMAIL_RE.findall(m.group(1)))
+        span = m.group(1)
+        to.extend(_EMAIL_RE.findall(span))
+        to.extend(resolve_names_in_text(span))
     to = _uniq(
         to,
         exclude=ignore_set | {from_email.lower()} | {e.lower() for e in cc},
@@ -367,13 +387,26 @@ Return JSON:
         return base
 
     roles = classify_email_roles(user_msg)
+    from agent.contact_aliases import resolve_name, resolve_names_in_text
+
     llm_cc: list[str] = []
     for key in ("cc", "cc_emails"):
         val = data.get(key)
         if isinstance(val, list):
-            llm_cc.extend(str(x) for x in val)
+            for x in val:
+                s = str(x).strip()
+                if _EMAIL_RE.fullmatch(s):
+                    llm_cc.append(s)
+                else:
+                    # LLM may return "Deepti" — resolve alias
+                    resolved = resolve_name(s) or resolve_names_in_text(s)
+                    if isinstance(resolved, list):
+                        llm_cc.extend(resolved)
+                    elif resolved:
+                        llm_cc.append(resolved)
         elif isinstance(val, str):
             llm_cc.extend(_EMAIL_RE.findall(val))
+            llm_cc.extend(resolve_names_in_text(val))
     cc = _uniq(llm_cc + roles.cc + base.cc)
 
     llm_ignore: list[str] = []
