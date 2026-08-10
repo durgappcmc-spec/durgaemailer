@@ -17,6 +17,39 @@ _DISABLED = False
 _FALLBACK_PATH = Path(settings.CHROMA_DIR).parent / "memory_fallback.jsonl"
 if not str(_FALLBACK_PATH).startswith(str(_DATA)):
     _FALLBACK_PATH = _DATA / "memory_fallback.jsonl"
+_CLOUD_RESTORED = False
+
+
+def _restore_memory_from_cloud() -> None:
+    """Hydrate local JSONL from Sheets after Render rebuilds wipe /tmp."""
+    global _CLOUD_RESTORED
+    if _CLOUD_RESTORED:
+        return
+    _CLOUD_RESTORED = True
+    try:
+        if _FALLBACK_PATH.exists() and _FALLBACK_PATH.stat().st_size > 0:
+            return
+        from core.durable_store import load_memory_rows
+
+        rows = load_memory_rows()
+        if not rows:
+            return
+        _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"[memory] restored {len(rows)} rows from durable Sheets store", file=sys.stderr)
+    except Exception as e:
+        print(f"[memory] cloud restore skipped: {e}", file=sys.stderr)
+
+
+def _sync_memory_to_cloud(existing: dict[str, dict[str, Any]]) -> None:
+    try:
+        from core.durable_store import save_memory_rows
+
+        save_memory_rows(list(existing.values()))
+    except Exception as e:
+        print(f"[memory] cloud sync skipped: {e}", file=sys.stderr)
 
 
 def _get_collection():
@@ -49,6 +82,7 @@ def _fallback_upsert(
     texts: list[str],
     metadatas: list[dict[str, Any]],
 ) -> None:
+    _restore_memory_from_cloud()
     existing: dict[str, dict[str, Any]] = {}
     try:
         if _FALLBACK_PATH.exists():
@@ -75,6 +109,7 @@ def _fallback_upsert(
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[memory] fallback write error: {e}", file=sys.stderr)
+    _sync_memory_to_cloud(existing)
 
 
 def _fallback_search(
@@ -82,6 +117,7 @@ def _fallback_search(
     k: int = 5,
     source: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    _restore_memory_from_cloud()
     rows: list[dict[str, Any]] = []
     try:
         if not _FALLBACK_PATH.exists():
@@ -122,6 +158,11 @@ def _fallback_search(
             }
         )
     return hits
+
+
+def hydrate_from_cloud() -> None:
+    """Public hook — restore memory JSONL from Sheets after container rebuild."""
+    _restore_memory_from_cloud()
 
 
 def add(

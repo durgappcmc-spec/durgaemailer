@@ -165,6 +165,11 @@ def sync_gmail(
 
 def ensure_session_sync(session_state: Any) -> dict[str, Any]:
     """Run once per Streamlit session (and respect time interval)."""
+    try:
+        memory.hydrate_from_cloud()
+    except Exception as e:
+        print(f"[auto_sync] memory hydrate: {e}", file=sys.stderr)
+
     if session_state.get("_auto_sync_done"):
         return session_state.get("_auto_sync_result") or {"skipped": True}
 

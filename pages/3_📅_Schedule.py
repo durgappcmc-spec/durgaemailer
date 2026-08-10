@@ -49,7 +49,8 @@ with tab_send:
     send_now = c2.button("📨 Send now", key="now_send")
     if send_now or draft_now:
         html = body.replace("{name}", name or "").replace("{{name}}", name or "")
-        atts = files_to_attachments(list(files) if files else [])
+        with st.spinner("Reading uploaded files…"):
+            atts = files_to_attachments(list(files) if files else [])
         gmail_atts = [{"name": a["name"], "data": a["data"]} for a in atts]
         kwargs = dict(
             to=to,
@@ -82,7 +83,8 @@ with tab_single:
     if st.button("📤 Schedule", key="single_go"):
         send_at = datetime.combine(d, t)
         html = body.replace("{{name}}", name or "").replace("{name}", name or "")
-        atts = files_to_attachments(list(files) if files else [])
+        with st.spinner("Reading uploaded files…"):
+            atts = files_to_attachments(list(files) if files else [])
         result = schedule_email(
             recipient_email=to,
             subject=subject,
@@ -127,7 +129,8 @@ with tab_bulk:
             cursor = datetime.fromisoformat(start)
         except Exception:
             cursor = datetime.now() + timedelta(days=1)
-        atts = files_to_attachments(list(bulk_files) if bulk_files else [])
+        with st.spinner("Reading uploaded files…"):
+            atts = files_to_attachments(list(bulk_files) if bulk_files else [])
         jobs = []
         for p in prospects:
             html = (

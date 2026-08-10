@@ -9,6 +9,7 @@ from agent.router import answer
 from config import APP_NAME
 from core.auth_ui import logout_button, require_login
 from core.auto_sync import ensure_session_sync
+from core import durable_store
 from gmail_client.attachments import files_to_attachments
 
 st.set_page_config(page_title=f"Chat · {APP_NAME}", page_icon="💬", layout="wide")
@@ -22,7 +23,8 @@ st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
     "Stop / Edit / Clear sit under the chat, next to where you type. "
-    "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it."
+    "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it. "
+    "Chat + prospects memory sync to Google Sheets so they survive new deploys."
 )
 
 # ---- session defaults ----
@@ -32,13 +34,31 @@ for key, default in (
     ("pending_user_msg", ""),
     ("need_file", False),
     ("last_mailbox", []),
+    ("last_prospects", []),
     ("run_cancel", False),
     ("run_active", False),
     ("show_edit", False),
     ("edit_text", ""),
+    ("_durable_hydrated", False),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Restore chat / prospects / mailbox once per browser session after rebuild
+if not st.session_state._durable_hydrated:
+    st.session_state._durable_hydrated = True
+    try:
+        if not st.session_state.messages:
+            restored = durable_store.load_chat_messages()
+            if restored:
+                st.session_state.messages = restored
+        extras = durable_store.load_session_extras()
+        if extras.get("last_prospects") and not st.session_state.get("last_prospects"):
+            st.session_state.last_prospects = extras["last_prospects"]
+        if extras.get("last_mailbox") and not st.session_state.get("last_mailbox"):
+            st.session_state.last_mailbox = extras["last_mailbox"]
+    except Exception:
+        pass
 
 # Keep composer controls visually tight against the bottom chat input
 st.markdown(
@@ -215,6 +235,10 @@ if clear_clicked:
     st.session_state.run_active = False
     st.session_state.show_edit = False
     st.session_state.edit_text = ""
+    try:
+        durable_store.clear_chat_messages()
+    except Exception:
+        pass
     st.rerun()
 
 if edit_clicked:
@@ -252,7 +276,11 @@ if prompt:
         chat_files = []
 
     staged = list(st.session_state.get("staged_attachments") or [])
-    paperclip = files_to_attachments(chat_files) if chat_files else []
+    if chat_files:
+        with st.spinner("Reading uploaded files (PDF / docs)…"):
+            paperclip = files_to_attachments(chat_files)
+    else:
+        paperclip = []
 
     by_name: dict = {a.get("name"): a for a in staged}
     for a in paperclip:
@@ -365,6 +393,14 @@ if prompt:
     )
     st.session_state.run_active = False
     st.session_state.run_cancel = False
+    try:
+        durable_store.save_chat_messages(st.session_state.messages)
+        durable_store.save_session_extras(
+            prospects=st.session_state.get("last_prospects") or [],
+            mailbox=st.session_state.get("last_mailbox") or [],
+        )
+    except Exception:
+        pass
 
     if meta.get("need_file"):
         st.session_state.need_file = True
