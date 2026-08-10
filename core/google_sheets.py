@@ -26,7 +26,10 @@ def sheets_credentials():
     except ImportError:
         return None
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
     raw = (
         getattr(settings, "BOOTSTRAP_TOKEN_JSON", None)
         or os.getenv("BOOTSTRAP_TOKEN_JSON", "")

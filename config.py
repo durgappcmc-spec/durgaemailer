@@ -112,9 +112,10 @@ class Settings:
         self.AUTO_SYNC_INTERVAL_MINUTES: int = int(
             os.getenv("AUTO_SYNC_INTERVAL_MINUTES", "30") or 30
         )
-        self.AUTO_SYNC_GMAIL_DAYS: int = int(os.getenv("AUTO_SYNC_GMAIL_DAYS", "30") or 30)
-        self.AUTO_SYNC_MAX_PER: int = int(os.getenv("AUTO_SYNC_MAX_PER", "75") or 75)
+        self.AUTO_SYNC_GMAIL_DAYS: int = int(os.getenv("AUTO_SYNC_GMAIL_DAYS", "7") or 7)
+        self.AUTO_SYNC_MAX_PER: int = int(os.getenv("AUTO_SYNC_MAX_PER", "25") or 25)
         self.AUTO_INGEST_PROSPECTS: str = os.getenv("AUTO_INGEST_PROSPECTS", "true")
+        self.RELAY_LIGHT_MEMORY: str = os.getenv("RELAY_LIGHT_MEMORY", "true")
 
 
 settings = Settings()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -14,13 +15,21 @@ from config import _DATA, settings
 
 _client = None
 _collection = None
-_DISABLED = False
+# Free Render: never load chromadb / sentence-transformers (OOM)
+_light = str(os.getenv("RELAY_LIGHT_MEMORY", "true")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_DISABLED = _light
 _FALLBACK_PATH = Path(settings.CHROMA_DIR).parent / "memory_fallback.jsonl"
 if not str(_FALLBACK_PATH).startswith(str(_DATA)):
     _FALLBACK_PATH = _DATA / "memory_fallback.jsonl"
 _CLOUD_RESTORED = False
 _LAST_CLOUD_SYNC = 0.0
-_CLOUD_SYNC_INTERVAL = 120.0  # seconds — avoid Sheets rewrite on every memory.add
+_CLOUD_SYNC_INTERVAL = 180.0
+_MAX_FALLBACK_ROWS = 1200 if _light else 5000
 
 
 def _restore_memory_from_cloud() -> None:
@@ -57,10 +66,10 @@ def _sync_memory_to_cloud(existing: dict[str, dict[str, Any]]) -> None:
         from core.durable_store import save_json_blob, save_memory_rows_async
 
         rows = list(existing.values())
-        save_json_blob("memory_rows", rows[-5000:], sync_sheets=False)
+        save_json_blob("memory_rows", rows[-_MAX_FALLBACK_ROWS:], sync_sheets=False)
         if now - _LAST_CLOUD_SYNC >= _CLOUD_SYNC_INTERVAL:
             _LAST_CLOUD_SYNC = now
-            save_memory_rows_async(rows)
+            save_memory_rows_async(rows[-_MAX_FALLBACK_ROWS:])
     except Exception as e:
         print(f"[memory] cloud sync skipped: {e}", file=sys.stderr)
 
@@ -117,6 +126,11 @@ def _fallback_upsert(
         }
     try:
         _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Cap file size on free tier
+        values = list(existing.values())
+        if len(values) > _MAX_FALLBACK_ROWS:
+            values = values[-_MAX_FALLBACK_ROWS:]
+            existing = {str(r.get("id")): r for r in values}
         with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
             for row in existing.values():
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")

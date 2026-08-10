@@ -14,13 +14,25 @@ from core.google_sheets import ensure_tab, sheet_id, sheets_service
 
 APP_STATE_TAB = "AppState"
 _CHUNK = 45000
-_MAX_CHAT_MSGS = 80
+_MAX_CHAT_MSGS = 40
 _LOCAL_DIR = _DATA / "durable"
 _ENSURED_TABS: set[str] = set()
 _APPSTATE_CACHE: Optional[dict[str, Any]] = None
 _APPSTATE_CACHE_AT = 0.0
 _APPSTATE_TTL = 60.0
 _sheets_lock = threading.Lock()
+
+# Large blobs → Google Drive (avoids Sheets cell rewrites + Render OOM)
+_DRIVE_KEYS = frozenset(
+    {"memory_rows", "prospect_list", "chat_messages", "session_extras", "contact_aliases"}
+)
+_DRIVE_FILE = {
+    "memory_rows": "relay_memory.json",
+    "prospect_list": "relay_prospects.json",
+    "chat_messages": "relay_chat.json",
+    "session_extras": "relay_session.json",
+    "contact_aliases": "relay_aliases.json",
+}
 
 
 def _now() -> str:
@@ -168,10 +180,18 @@ def _write_appstate_key(key: str, text: str) -> bool:
 
 
 def save_json_blob(key: str, payload: Any, *, sync_sheets: bool = True) -> bool:
-    """Local write is immediate; Sheets sync is optional / background-friendly."""
+    """Local write is immediate; large keys sync to Google Drive (not Sheets)."""
     _save_local(key, payload)
     if not sync_sheets:
         return True
+    if key in _DRIVE_KEYS:
+        try:
+            from core.drive_store import upload_json
+
+            return upload_json(_DRIVE_FILE.get(key, f"{key}.json"), payload)
+        except Exception as e:
+            print(f"[durable] drive save {key} failed: {e}", file=sys.stderr)
+            return False
     try:
         text = json.dumps(payload, ensure_ascii=False, default=str)
         return _write_appstate_key(key, text)
@@ -181,13 +201,18 @@ def save_json_blob(key: str, payload: Any, *, sync_sheets: bool = True) -> bool:
 
 
 def save_json_blob_async(key: str, payload: Any) -> None:
-    """Non-blocking Sheets backup after local save."""
+    """Non-blocking Drive/Sheets backup after local save."""
     _save_local(key, payload)
 
     def _run() -> None:
         try:
-            text = json.dumps(payload, ensure_ascii=False, default=str)
-            _write_appstate_key(key, text)
+            if key in _DRIVE_KEYS:
+                from core.drive_store import upload_json
+
+                upload_json(_DRIVE_FILE.get(key, f"{key}.json"), payload)
+            else:
+                text = json.dumps(payload, ensure_ascii=False, default=str)
+                _write_appstate_key(key, text)
         except Exception as e:
             print(f"[durable] async save {key} failed: {e}", file=sys.stderr)
 
@@ -195,12 +220,22 @@ def save_json_blob_async(key: str, payload: Any) -> None:
 
 
 def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
-    """Prefer local file (fast). Sheets only if local missing."""
+    """Prefer local file (fast). Drive (then Sheets) only if local missing."""
     local = _load_local(key)
     if local is not None:
         return local
     if not allow_sheets:
         return None
+    if key in _DRIVE_KEYS:
+        try:
+            from core.drive_store import download_json
+
+            data = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
+            if data is not None:
+                _save_local(key, data)
+                return data
+        except Exception as e:
+            print(f"[durable] drive load {key} failed: {e}", file=sys.stderr)
     try:
         flat = _read_appstate_map()
         raw = flat.get(key)
@@ -259,7 +294,7 @@ def save_session_extras(
         payload = {}
     if prospects is not None:
         slim = []
-        for p in (prospects or [])[:200]:
+        for p in (prospects or [])[:80]:
             if not isinstance(p, dict):
                 continue
             slim.append(
@@ -268,11 +303,8 @@ def save_session_extras(
                     for k in (
                         "email",
                         "name",
-                        "full_name",
                         "title",
-                        "organization",
                         "company",
-                        "org",
                         "phone",
                         "mobile",
                         "source",
@@ -283,7 +315,7 @@ def save_session_extras(
         payload["last_prospects"] = slim
     if mailbox is not None:
         slim_m = []
-        for m in (mailbox or [])[:100]:
+        for m in (mailbox or [])[:40]:
             if not isinstance(m, dict):
                 continue
             slim_m.append(
@@ -291,13 +323,11 @@ def save_session_extras(
                     k: m.get(k)
                     for k in (
                         "id",
-                        "thread_id",
                         "from",
                         "to",
                         "subject",
                         "snippet",
                         "date",
-                        "label",
                     )
                     if m.get(k)
                 }
@@ -314,13 +344,13 @@ def load_session_extras(*, allow_sheets: bool = True) -> dict[str, Any]:
 
 
 def save_memory_rows(rows: list[dict[str, Any]]) -> bool:
-    # Memory can be large — local always; Sheets throttled by caller
-    payload = rows[-5000:]
+    # Keep cloud memory small on free Render
+    payload = rows[-1500:]
     return save_json_blob("memory_rows", payload, sync_sheets=True)
 
 
 def save_memory_rows_async(rows: list[dict[str, Any]]) -> None:
-    save_json_blob_async("memory_rows", rows[-5000:])
+    save_json_blob_async("memory_rows", rows[-1500:])
 
 
 def load_memory_rows(*, allow_sheets: bool = True) -> list[dict[str, Any]]:
@@ -370,19 +400,14 @@ def hydrate_chat_from_sheets_if_empty(session_state: Any) -> bool:
 
 
 def pull_sheets_into_local_async() -> None:
-    """Background: fill local cache from Sheets if local keys are empty."""
+    """Background: fill local cache from Drive/Sheets if local keys are empty."""
 
     def _run() -> None:
         try:
-            for key in ("chat_messages", "session_extras", "memory_rows"):
+            for key in ("chat_messages", "session_extras", "memory_rows", "prospect_list"):
                 if _load_local(key) is not None:
                     continue
-                flat = _read_appstate_map()
-                raw = flat.get(key)
-                if not raw:
-                    continue
-                data = json.loads(raw)
-                _save_local(key, data)
+                load_json_blob(key, allow_sheets=True)
         except Exception as e:
             print(f"[durable] background pull failed: {e}", file=sys.stderr)
 

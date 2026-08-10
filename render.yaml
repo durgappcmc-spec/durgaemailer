@@ -17,11 +17,13 @@ services:
       - key: AUTO_INGEST_PROSPECTS
         value: "true"
       - key: AUTO_SYNC_INTERVAL_MINUTES
-        value: "30"
+        value: "60"
       - key: AUTO_SYNC_GMAIL_DAYS
-        value: "30"
+        value: "7"
       - key: AUTO_SYNC_MAX_PER
-        value: "75"
+        value: "25"
+      - key: RELAY_LIGHT_MEMORY
+        value: "true"
       - key: GMAIL_FROM_EMAIL
         value: csr@karunamedia.org
       - key: GMAIL_DEFAULT_CC

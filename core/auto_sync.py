@@ -54,7 +54,7 @@ def ingest_mailbox_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
                 "to": r.get("to"),
                 "date": r.get("date"),
                 "mailbox": r.get("mailbox"),
-                "body": (r.get("body_text") or "")[:2000],
+                "body": (r.get("body_text") or "")[:800],
                 "extracted": r.get("extracted") or {},
             },
             default=str,

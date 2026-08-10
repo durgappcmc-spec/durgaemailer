@@ -68,7 +68,7 @@ def _persist(rows: list[dict[str, Any]]) -> None:
         from core.durable_store import save_json_blob_async
 
         # Cap growth — keep newest/most complete first
-        save_json_blob_async("prospect_list", rows[-5000:])
+        save_json_blob_async("prospect_list", rows[-1000:])
     except Exception as e:
         print(f"[prospect_list] save failed: {e}", file=sys.stderr)
 
