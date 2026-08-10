@@ -1,6 +1,10 @@
 [server]
 headless = true
 enableXsrfProtection = true
+maxUploadSize = 15
 
 [browser]
 gatherUsageStats = false
+
+[runner]
+fastReruns = true
