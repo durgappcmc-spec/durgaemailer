@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -18,10 +19,12 @@ _FALLBACK_PATH = Path(settings.CHROMA_DIR).parent / "memory_fallback.jsonl"
 if not str(_FALLBACK_PATH).startswith(str(_DATA)):
     _FALLBACK_PATH = _DATA / "memory_fallback.jsonl"
 _CLOUD_RESTORED = False
+_LAST_CLOUD_SYNC = 0.0
+_CLOUD_SYNC_INTERVAL = 120.0  # seconds — avoid Sheets rewrite on every memory.add
 
 
 def _restore_memory_from_cloud() -> None:
-    """Hydrate local JSONL from Sheets after Render rebuilds wipe /tmp."""
+    """Hydrate local JSONL from local durable cache / Sheets after rebuilds wipe /tmp."""
     global _CLOUD_RESTORED
     if _CLOUD_RESTORED:
         return
@@ -31,23 +34,33 @@ def _restore_memory_from_cloud() -> None:
             return
         from core.durable_store import load_memory_rows
 
-        rows = load_memory_rows()
+        # Local-first (fast); Sheets only if local empty
+        rows = load_memory_rows(allow_sheets=False)
+        if not rows:
+            rows = load_memory_rows(allow_sheets=True)
         if not rows:
             return
         _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"[memory] restored {len(rows)} rows from durable Sheets store", file=sys.stderr)
+        print(f"[memory] restored {len(rows)} rows from durable store", file=sys.stderr)
     except Exception as e:
         print(f"[memory] cloud restore skipped: {e}", file=sys.stderr)
 
 
 def _sync_memory_to_cloud(existing: dict[str, dict[str, Any]]) -> None:
+    global _LAST_CLOUD_SYNC
+    now = time.time()
+    # Always keep a local durable snapshot; Sheets at most every 2 minutes
     try:
-        from core.durable_store import save_memory_rows
+        from core.durable_store import save_json_blob, save_memory_rows_async
 
-        save_memory_rows(list(existing.values()))
+        rows = list(existing.values())
+        save_json_blob("memory_rows", rows[-5000:], sync_sheets=False)
+        if now - _LAST_CLOUD_SYNC >= _CLOUD_SYNC_INTERVAL:
+            _LAST_CLOUD_SYNC = now
+            save_memory_rows_async(rows)
     except Exception as e:
         print(f"[memory] cloud sync skipped: {e}", file=sys.stderr)
 

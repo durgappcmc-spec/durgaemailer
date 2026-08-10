@@ -1,30 +1,25 @@
 # NOTE: Streaming UI captures __meta__ dicts separately from text chunks.
 # Stop / Edit / Clear sit in the composer bar above st.chat_input.
 # Files come only from st.chat_input paperclip; staged across turns until cleared/used.
+# Load path stays light: no Gmail sync / no heavy router import until the user sends.
 from __future__ import annotations
 
 import streamlit as st
 
-from agent.router import answer
 from config import APP_NAME
 from core.auth_ui import logout_button, require_login
-from core.auto_sync import ensure_session_sync
 from core import durable_store
-from gmail_client.attachments import files_to_attachments
 
 st.set_page_config(page_title=f"Chat · {APP_NAME}", page_icon="💬", layout="wide")
 if not require_login():
     st.stop()
 logout_button()
 
-sync = ensure_session_sync(st.session_state)
-
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
     "Stop / Edit / Clear sit under the chat, next to where you type. "
-    "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it. "
-    "Chat + prospects memory sync to Google Sheets so they survive new deploys."
+    "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it."
 )
 
 # ---- session defaults ----
@@ -40,31 +35,28 @@ for key, default in (
     ("show_edit", False),
     ("edit_text", ""),
     ("_durable_hydrated", False),
+    ("_durable_pull_started", False),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Restore chat / prospects / mailbox once per browser session after rebuild
-if not st.session_state._durable_hydrated:
-    st.session_state._durable_hydrated = True
-    try:
-        if not st.session_state.messages:
-            restored = durable_store.load_chat_messages()
-            if restored:
-                st.session_state.messages = restored
-        extras = durable_store.load_session_extras()
-        if extras.get("last_prospects") and not st.session_state.get("last_prospects"):
-            st.session_state.last_prospects = extras["last_prospects"]
-        if extras.get("last_mailbox") and not st.session_state.get("last_mailbox"):
-            st.session_state.last_mailbox = extras["last_mailbox"]
-    except Exception:
-        pass
+# Instant local restore (no Gmail). Sheets pull only if local chat is empty.
+durable_store.hydrate_session_fast(st.session_state)
+if not st.session_state.messages:
+    with st.spinner("Restoring saved chat…"):
+        durable_store.hydrate_chat_from_sheets_if_empty(st.session_state)
+if not st.session_state._durable_pull_started:
+    st.session_state._durable_pull_started = True
+    durable_store.pull_sheets_into_local_async()
+
+mailbox_n = len(st.session_state.get("last_mailbox") or [])
+if mailbox_n:
+    st.caption(f"Mailbox context loaded: **{mailbox_n}** messages (for filters / follow-ups).")
 
 # Keep composer controls visually tight against the bottom chat input
 st.markdown(
     """
 <style>
-/* Composer bar: sit just above the fixed chat input */
 .relay-composer {
   position: sticky;
   bottom: 5.5rem;
@@ -83,19 +75,6 @@ st.markdown(
 )
 
 staged = st.session_state.staged_attachments or []
-mailbox_n = len(st.session_state.get("last_mailbox") or [])
-if sync.get("ok"):
-    st.caption(
-        f"Auto-synced **{sync.get('messages', 0)}** emails "
-        f"({sync.get('contacts', 0)} contacts) into memory."
-    )
-elif mailbox_n:
-    st.caption(f"Mailbox context loaded: **{mailbox_n}** messages (for filters / follow-ups).")
-elif sync.get("skipped") and sync.get("messages"):
-    st.caption(
-        f"Mailbox memory ready: **{sync.get('messages', 0)}** msgs / "
-        f"**{sync.get('contacts', 0)}** contacts."
-    )
 if st.session_state.get("need_file"):
     st.info(
         "Upload a file with the **paperclip** on the chat box, then send your "
@@ -122,8 +101,12 @@ if staged:
         st.session_state.need_file = False
         st.rerun()
 
-# ---- message history ----
-for msg in st.session_state.messages:
+# ---- message history (cap render for speed) ----
+_DISPLAY_MSGS = 40
+_all_msgs = st.session_state.messages or []
+if len(_all_msgs) > _DISPLAY_MSGS:
+    st.caption(f"Showing last {_DISPLAY_MSGS} of {len(_all_msgs)} messages")
+for msg in _all_msgs[-_DISPLAY_MSGS:]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         files = msg.get("files") or []
@@ -268,6 +251,9 @@ if force and not prompt:
     prompt = _Forced()
 
 if prompt:
+    from agent.router import answer  # lazy — keeps Chat page open fast
+    from gmail_client.attachments import files_to_attachments
+
     if hasattr(prompt, "text"):
         user_text = (prompt.text or "").strip()
         chat_files = list(getattr(prompt, "files", None) or [])
