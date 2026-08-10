@@ -52,6 +52,12 @@ with tab_search:
             )
         st.session_state.last_prospects = results
         saved = auto_ingest_prospects([p for p in results if not p.get("error")])
+        try:
+            from core import durable_store
+
+            durable_store.save_session_extras(prospects=results)
+        except Exception:
+            pass
         st.success(
             f"Got {len(results)} rows. Auto-saved **{len(saved)}** contacts to memory."
         )
