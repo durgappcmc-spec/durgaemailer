@@ -280,6 +280,48 @@ def lookup_for_query(
     return hits[:limit]
 
 
+def search_saved(
+    *,
+    name: str = "",
+    organisation: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Filter saved contacts by name and/or organisation (substring, case-insensitive)."""
+    name_n = _norm(name)
+    org_n = _norm(organisation)
+    hits: list[dict[str, Any]] = []
+    with _LOCK:
+        for p in _load():
+            if name_n:
+                blob = _norm(
+                    " ".join(
+                        str(p.get(k) or "")
+                        for k in ("name", "first_name", "last_name", "email", "title")
+                    )
+                )
+                if name_n not in blob:
+                    continue
+            if org_n:
+                org_blob = _norm(
+                    " ".join(
+                        str(p.get(k) or "")
+                        for k in ("company", "organization", "org", "org_website", "website")
+                    )
+                )
+                if org_n not in org_blob and org_blob not in org_n:
+                    continue
+            hits.append(p)
+            if len(hits) >= limit:
+                break
+    hits.sort(
+        key=lambda p: (
+            _norm(str(p.get("company") or "")),
+            _norm(str(p.get("name") or "")),
+        )
+    )
+    return hits
+
+
 def wants_force_refresh(user_msg: str) -> bool:
     return bool(
         re.search(
