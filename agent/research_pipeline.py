@@ -461,11 +461,15 @@ Only include emails/phones that appear in the notes.
                     company = o.get("name") or company
                     break
         name = (row.get("name") or "").strip()
-        first = name.split()[0] if name else "there"
+        if name and "@" in name:
+            if not email and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", name):
+                email = name
+            name = ""
+        first = name.split()[0] if name else ""
         out.append(
             {
-                "name": name or company,
-                "first_name": first if name else "",
+                "name": name,
+                "first_name": first,
                 "email": email,
                 "phone": phone or mobile,
                 "mobile": mobile or phone,

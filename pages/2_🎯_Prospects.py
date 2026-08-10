@@ -8,13 +8,23 @@ from connectors.ingest_to_memory import ingest_prospects, prospects_to_dataframe
 from connectors.prospects import enrich_fallthrough, search_all
 from core.auth_ui import logout_button, require_login
 from core.auto_sync import auto_ingest_prospects, ensure_session_sync
-from core.prospect_list import all_prospects, search_saved
+from core.prospect_list import all_prospects, repair_saved_prospects, search_saved
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
 if not require_login():
     st.stop()
 logout_button()
 ensure_session_sync(st.session_state)
+
+# One-time repair of name/email mix-ups on the durable list
+if not st.session_state.get("_prospects_repaired"):
+    st.session_state._prospects_repaired = True
+    try:
+        n_fix = repair_saved_prospects()
+        if n_fix:
+            st.toast(f"Fixed {n_fix} contacts where email was stored as name")
+    except Exception:
+        pass
 
 st.title("🎯 Prospects")
 st.caption(

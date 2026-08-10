@@ -63,7 +63,9 @@ def ingest_prospects(
 
 
 def prospects_to_dataframe(prospects: list[dict[str, Any]]) -> pd.DataFrame:
-    """Return a tidy DataFrame of prospect fields."""
+    """Return a tidy DataFrame of prospect fields (name never shows a raw email)."""
+    from connectors import sanitize_prospect
+
     cols = [
         "name",
         "title",
@@ -81,5 +83,6 @@ def prospects_to_dataframe(prospects: list[dict[str, Any]]) -> pd.DataFrame:
     for p in prospects:
         if p.get("error"):
             continue
-        rows.append({c: p.get(c, "") for c in cols})
+        clean = sanitize_prospect(p)
+        rows.append({c: clean.get(c, "") for c in cols})
     return pd.DataFrame(rows, columns=cols)

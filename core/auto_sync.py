@@ -74,23 +74,27 @@ def ingest_mailbox_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
 
     contacts = contacts_from_mailbox(messages, prefer="auto")
     prospects: list[dict[str, Any]] = []
+    from connectors import sanitize_prospect
+
     for c in contacts:
         prospects.append(
-            {
-                "name": c.get("name") or "",
-                "first_name": c.get("first_name") or "",
-                "last_name": "",
-                "email": c.get("email") or "",
-                "title": c.get("title") or "",
-                "company": c.get("company") or "",
-                "source": "gmail",
-                "source_id": (c.get("email") or "").lower(),
-                "phone": "",
-                "linkedin_url": "",
-                "location": "",
-                "seniority": "",
-                "department": "",
-            }
+            sanitize_prospect(
+                {
+                    "name": c.get("name") or "",
+                    "first_name": c.get("first_name") or "",
+                    "last_name": "",
+                    "email": c.get("email") or "",
+                    "title": c.get("title") or "",
+                    "company": c.get("company") or "",
+                    "source": "gmail",
+                    "source_id": (c.get("email") or "").lower(),
+                    "phone": "",
+                    "linkedin_url": "",
+                    "location": "",
+                    "seniority": "",
+                    "department": "",
+                }
+            )
         )
     contact_ids = ingest_prospects(prospects, source_tag="gmail_contacts")
     return {

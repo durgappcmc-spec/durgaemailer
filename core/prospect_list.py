@@ -77,6 +77,8 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
     """Merge prospects into the durable list. Returns count newly saved/updated."""
     if not prospects:
         return 0
+    from connectors import sanitize_prospect
+
     with _LOCK:
         rows = list(_load())
         by_key = {_prospect_key(r): i for i, r in enumerate(rows)}
@@ -84,6 +86,7 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
         for p in prospects:
             if not p or p.get("error") or p.get("research_only"):
                 continue
+            p = sanitize_prospect(p)
             # Need at least a name or email or company signal
             if not (
                 (p.get("email") or "").strip()
@@ -98,13 +101,12 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
             }
             if key in by_key:
                 idx = by_key[key]
-                old = rows[idx]
+                old = sanitize_prospect(rows[idx])
                 merged = {**old, **row}
-                # Prefer non-empty email/phone/mobile from either
-                for field in ("email", "phone", "mobile", "linkedin_url", "title"):
+                for field in ("email", "phone", "mobile", "linkedin_url", "title", "name"):
                     if not (merged.get(field) or "").strip() and (old.get(field) or "").strip():
                         merged[field] = old[field]
-                rows[idx] = merged
+                rows[idx] = sanitize_prospect(merged)
             else:
                 by_key[key] = len(rows)
                 rows.append(row)
@@ -114,9 +116,34 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
         return changed
 
 
-def all_prospects() -> list[dict[str, Any]]:
+def repair_saved_prospects() -> int:
+    """Fix name/email mix-ups already on the saved list. Returns rows changed."""
+    from connectors import sanitize_prospect
+
     with _LOCK:
-        return list(_load())
+        rows = list(_load())
+        fixed = 0
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for p in rows:
+            clean = sanitize_prospect(p)
+            if clean.get("name") != p.get("name") or clean.get("email") != p.get("email"):
+                fixed += 1
+            key = _prospect_key(clean)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(clean)
+        if fixed or len(out) != len(rows):
+            _persist(out)
+        return fixed
+
+
+def all_prospects() -> list[dict[str, Any]]:
+    from connectors import sanitize_prospect
+
+    with _LOCK:
+        return [sanitize_prospect(p) for p in _load()]
 
 
 def find_by_company(
@@ -287,11 +314,14 @@ def search_saved(
     limit: int = 500,
 ) -> list[dict[str, Any]]:
     """Filter saved contacts by name and/or organisation (substring, case-insensitive)."""
+    from connectors import sanitize_prospect
+
     name_n = _norm(name)
     org_n = _norm(organisation)
     hits: list[dict[str, Any]] = []
     with _LOCK:
         for p in _load():
+            p = sanitize_prospect(p)
             if name_n:
                 blob = _norm(
                     " ".join(

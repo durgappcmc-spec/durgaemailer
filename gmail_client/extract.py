@@ -252,7 +252,25 @@ def contacts_from_mailbox(
         ex = m.get("extracted") or {}
         display = (ex.get("sender_name") or "").strip()
         if not display:
-            display = header.split("<")[0].strip().strip('"') or email_addr.split("@")[0]
+            before = header.split("<")[0].strip().strip('"')
+            # Bare "a@b.com" headers must not become the Name field
+            if before and "@" not in before:
+                display = before
+            else:
+                local = email_addr.split("@")[0]
+                display = " ".join(
+                    p[:1].upper() + p[1:]
+                    for p in re.split(r"[._+\-]+", local)
+                    if p
+                )
+        if "@" in display:
+            # Still looks like an address — humanize local-part only
+            local = (emails[0] if "@" in display else email_addr).split("@")[0]
+            display = " ".join(
+                p[:1].upper() + p[1:]
+                for p in re.split(r"[._+\-]+", local)
+                if p
+            )
         name_parts = display.split(None, 1)
         rows.append(
             {
