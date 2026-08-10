@@ -119,6 +119,54 @@ def enrich_one_org_on_zoominfo(
             "notes": ["skipped - no name/domain"],
         }
 
+    # Reuse saved prospect list for this org before ZoomInfo
+    try:
+        from core.prospect_list import find_by_company, save_prospects
+
+        saved = find_by_company(name or domain, limit=contacts_per_org)
+        if domain and not saved:
+            saved = find_by_company(domain, limit=contacts_per_org)
+        if saved:
+            notes.append(f"prospect list hit ({len(saved)} saved)")
+            contacts = []
+            seen: set[str] = set()
+            for r in saved:
+                email = (r.get("email") or "").strip().lower()
+                key = email or f"{r.get('name')}|{r.get('company')}|{r.get('source_id')}"
+                key = key.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                contacts.append(
+                    {
+                        **r,
+                        "org_focus": org.get("focus") or "",
+                        "org_website": website,
+                        "why_match": org.get("why_match") or "",
+                        "company": r.get("company") or name,
+                    }
+                )
+            contacts = contacts[:contacts_per_org]
+            with_email = sum(1 for c in contacts if (c.get("email") or "").strip())
+            with_mobile = sum(
+                1
+                for c in contacts
+                if (c.get("mobile") or c.get("phone") or "").strip()
+            )
+            try:
+                save_prospects([c for c in contacts if not c.get("research_only")])
+            except Exception:
+                pass
+            return {
+                "org": org,
+                "contacts": contacts,
+                "with_email": with_email,
+                "with_mobile": with_mobile,
+                "notes": notes,
+            }
+    except Exception as e:
+        notes.append(f"prospect list skip: {e}")
+
     name_variants = _company_name_variants(name)
 
     # 1) Domain

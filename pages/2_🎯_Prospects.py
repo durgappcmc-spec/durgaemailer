@@ -16,7 +16,18 @@ logout_button()
 ensure_session_sync(st.session_state)
 
 st.title("🎯 Prospects")
-st.caption("Search results auto-save to memory. ZoomInfo is the default provider.")
+st.caption(
+    "Search results auto-save to your **prospect list**. "
+    "Asking again for the same org/person reuses the list (no ZoomInfo) unless you say **refresh**."
+)
+try:
+    from core.prospect_list import all_prospects
+
+    n_saved = len(all_prospects())
+    if n_saved:
+        st.caption(f"Saved on your list: **{n_saved}** contacts")
+except Exception:
+    pass
 
 tab_search, tab_enrich = st.tabs(["Search", "Enrich"])
 

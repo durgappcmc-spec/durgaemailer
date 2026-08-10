@@ -30,11 +30,13 @@ def ingest_prospects(
     prospects: list[dict[str, Any]],
     source_tag: str = "prospects",
 ) -> list[str]:
-    """Add prospects to Chroma memory. Skips rows with errors."""
+    """Add prospects to Chroma/JSONL memory and the durable prospect list."""
     ids: list[str] = []
+    clean: list[dict[str, Any]] = []
     for p in prospects:
         if not p or p.get("error"):
             continue
+        clean.append(p)
         text = prospect_to_text(p)
         title = f"{p.get('name') or 'Unknown'} @ {p.get('company') or '?'}"
         added = memory.add(
@@ -46,9 +48,17 @@ def ingest_prospects(
                 "email": p.get("email") or "",
                 "company": p.get("company") or "",
                 "provider": p.get("source") or "",
+                "name": p.get("name") or "",
             },
         )
         ids.extend(added)
+    if clean:
+        try:
+            from core.prospect_list import save_prospects
+
+            save_prospects(clean)
+        except Exception:
+            pass
     return ids
 
 

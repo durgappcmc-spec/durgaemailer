@@ -1331,6 +1331,10 @@ def answer(
                 auto_ingest_prospects(
                     [c for c in prospect_out if not c.get("research_only")]
                 )
+                yield (
+                    f"\nSaved contacts to your **prospect list** "
+                    f"(reuse for the same org without ZoomInfo).\n"
+                )
             except Exception as e:
                 print(f"[router] research auto-ingest error: {e}", file=sys.stderr)
 
@@ -1516,68 +1520,158 @@ HTML only in html_body. No markdown. Do not include a signature block.
             )
             limit = max(limit, vol["search_limit"])
             limit = min(max(limit, 1), 100)
-            yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
-            results = search_all(
-                q, providers=tuple(providers), limit_per_provider=limit
+
+            from core.prospect_list import (
+                lookup_for_query,
+                wants_force_refresh,
             )
-            ok = [p for p in results if not p.get("error")]
-            errs = [p for p in results if p.get("error")]
-            prospect_out = ok
-            saved_ids: list[str] = []
-            if ok:
+
+            cached: list[dict[str, Any]] = []
+            if not wants_force_refresh(user_msg or ""):
+                cached = lookup_for_query(q, limit=limit)
+
+            specific = bool(
+                q.get("company_names")
+                or q.get("companies")
+                or q.get("company")
+                or q.get("company_domains")
+                or q.get("domains")
+            )
+            enough = len(cached) >= (1 if specific else min(3, max(limit, 1)))
+
+            if cached and enough:
+                ok = cached[:limit]
+                errs: list[dict[str, Any]] = []
+                prospect_out = ok
+                saved_ids: list[str] = []
                 try:
                     saved_ids = auto_ingest_prospects(ok)
                 except Exception as e:
-                    print(f"[router] auto-ingest prospects error: {e}", file=sys.stderr)
-            ctx_lines = []
-            for i, p in enumerate(ok[:100], 1):
-                ctx_lines.append(f"{i}. {prospect_to_text(p)}")
-            if len(ok) > 100:
-                ctx_lines.append(f"…and {len(ok) - 100} more.")
-            for e in errs[:5]:
-                ctx_lines.append(f"ERROR [{e.get('source')}]: {e.get('error')}")
-            if not ok:
-                yield (
-                    "No prospects returned. "
-                    + (f"Errors: {errs}" if errs else "Try a clearer title/company.")
-                )
-            else:
+                    print(f"[router] list re-save error: {e}", file=sys.stderr)
+                ctx_lines = [f"{i}. {prospect_to_text(p)}" for i, p in enumerate(ok[:100], 1)]
                 with_email = sum(1 for p in ok if (p.get("email") or "").strip())
                 yield (
-                    f"Found **{len(ok)}** contacts "
-                    f"(**{with_email}** with email) via {', '.join(providers)}.\n\n"
+                    f"Using **{len(ok)}** saved contacts from your prospect list "
+                    f"(**{with_email}** with email) — skipped ZoomInfo. "
+                    f"Say **refresh** to search ZoomInfo again.\n\n"
                 )
                 yield "\n".join(ctx_lines)
                 if saved_ids:
-                    yield f"\n\nAuto-saved **{len(saved_ids)}** contacts to memory."
+                    yield f"\n\nKept **{len(saved_ids)}** contacts on your list."
                 yield (
                     "\n\nNext: `draft emails to all these prospects` or "
-                    "`send personalized emails to this ZoomInfo list`."
+                    "`send personalized emails to this list`."
                 )
-            system = (
-                "Summarize these prospect search results for the user. "
-                "Highlight emails when present. If emails exist, remind them they can "
-                "bulk draft/send personalized emails to this list.\n\n"
-                + "\n\n".join(ctx_lines)
-            )
-            if used_docs:
-                system += "\n\nUploaded file context:\n" + doc_context
-            for chunk in chat_grounded(
-                user_msg, history=history, system=system, use_search=False
-            ):
-                if isinstance(chunk, dict) and "__meta__" in chunk:
-                    sources = chunk["__meta__"].get("sources") or []
+                system = (
+                    "Summarize these saved prospect list results for the user. "
+                    "Highlight emails when present.\n\n" + "\n\n".join(ctx_lines)
+                )
+                if used_docs:
+                    system += "\n\nUploaded file context:\n" + doc_context
+                for chunk in chat_grounded(
+                    user_msg, history=history, system=system, use_search=False
+                ):
+                    if isinstance(chunk, dict) and "__meta__" in chunk:
+                        sources = chunk["__meta__"].get("sources") or []
+                    else:
+                        yield chunk
+                sources.append(
+                    {
+                        "title": "prospect_list",
+                        "url": "",
+                        "type": "prospects",
+                        "count": len(ok),
+                        "cached": True,
+                    }
+                )
+            else:
+                yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
+                results = search_all(
+                    q, providers=tuple(providers), limit_per_provider=limit
+                )
+                ok = [p for p in results if not p.get("error")]
+                if cached:
+                    seen = {
+                        (
+                            (p.get("email") or p.get("source_id") or p.get("name") or "")
+                            .lower()
+                        )
+                        for p in ok
+                    }
+                    for p in cached:
+                        key = (
+                            p.get("email") or p.get("source_id") or p.get("name") or ""
+                        ).lower()
+                        if key and key not in seen:
+                            ok.append(p)
+                            seen.add(key)
+                errs = [p for p in results if p.get("error")]
+                prospect_out = ok
+                saved_ids = []
+                if ok:
+                    try:
+                        saved_ids = auto_ingest_prospects(ok)
+                    except Exception as e:
+                        print(
+                            f"[router] auto-ingest prospects error: {e}",
+                            file=sys.stderr,
+                        )
+                ctx_lines = []
+                for i, p in enumerate(ok[:100], 1):
+                    ctx_lines.append(f"{i}. {prospect_to_text(p)}")
+                if len(ok) > 100:
+                    ctx_lines.append(f"…and {len(ok) - 100} more.")
+                for e in errs[:5]:
+                    ctx_lines.append(f"ERROR [{e.get('source')}]: {e.get('error')}")
+                if not ok:
+                    yield (
+                        "No prospects returned. "
+                        + (
+                            f"Errors: {errs}"
+                            if errs
+                            else "Try a clearer title/company."
+                        )
+                    )
                 else:
-                    yield chunk
-            sources.append(
-                {
-                    "title": "prospect_search",
-                    "url": "",
-                    "type": "prospects",
-                    "count": len(ok),
-                    "providers": list(providers),
-                }
-            )
+                    with_email = sum(1 for p in ok if (p.get("email") or "").strip())
+                    yield (
+                        f"Found **{len(ok)}** contacts "
+                        f"(**{with_email}** with email) via {', '.join(providers)}.\n\n"
+                    )
+                    yield "\n".join(ctx_lines)
+                    if saved_ids:
+                        yield (
+                            f"\n\nSaved **{len(saved_ids)}** contacts to your prospect list "
+                            f"(reuse next time without ZoomInfo)."
+                        )
+                    yield (
+                        "\n\nNext: `draft emails to all these prospects` or "
+                        "`send personalized emails to this ZoomInfo list`."
+                    )
+                system = (
+                    "Summarize these prospect search results for the user. "
+                    "Highlight emails when present. If emails exist, remind them they can "
+                    "bulk draft/send personalized emails to this list.\n\n"
+                    + "\n\n".join(ctx_lines)
+                )
+                if used_docs:
+                    system += "\n\nUploaded file context:\n" + doc_context
+                for chunk in chat_grounded(
+                    user_msg, history=history, system=system, use_search=False
+                ):
+                    if isinstance(chunk, dict) and "__meta__" in chunk:
+                        sources = chunk["__meta__"].get("sources") or []
+                    else:
+                        yield chunk
+                sources.append(
+                    {
+                        "title": "prospect_search",
+                        "url": "",
+                        "type": "prospects",
+                        "count": len(ok),
+                        "providers": list(providers),
+                    }
+                )
 
         elif routing.startswith("PROSPECT_ENRICH:"):
             ident = _parse_json_tail(routing, "PROSPECT_ENRICH:") or {}
@@ -1604,8 +1698,35 @@ HTML only in html_body. No markdown. Do not include a signature block.
             if not ident:
                 ident = {"name": user_msg}
 
-            yield "Enriching contact…\n"
-            result = enrich_fallthrough(ident)
+            from core.prospect_list import find_by_person, wants_force_refresh
+
+            result = None
+            name_hint = (
+                ident.get("name")
+                or " ".join(
+                    x
+                    for x in [
+                        ident.get("first_name") or "",
+                        ident.get("last_name") or "",
+                    ]
+                    if x
+                )
+                or ""
+            )
+            if name_hint and not wants_force_refresh(user_msg or ""):
+                cached_people = find_by_person(
+                    name_hint, company=str(ident.get("company") or ""), limit=5
+                )
+                if cached_people:
+                    result = cached_people[0]
+                    yield (
+                        f"Found **{result.get('name') or 'contact'}** on your saved "
+                        f"prospect list — skipped ZoomInfo. Say **refresh** to re-enrich.\n"
+                    )
+
+            if result is None:
+                yield "Enriching contact…\n"
+                result = enrich_fallthrough(ident)
             if result and not result.get("error"):
                 prospect_out = [result]
                 try:
