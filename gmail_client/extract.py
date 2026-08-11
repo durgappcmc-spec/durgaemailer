@@ -382,12 +382,23 @@ def contacts_from_mailbox(
 
 
 def _company_search_queries(company: str, days: int) -> list[str]:
-    """Build several Gmail queries to find sent mail about a company."""
+    """Build several Gmail queries to find sent mail about a company or address."""
     company = (company or "").strip()
     if not company:
         return []
     days = max(1, int(days))
     base = f"in:sent newer_than:{days}d"
+
+    # Recipient email → precise to: search
+    if "@" in company and re.match(
+        r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", company
+    ):
+        return [
+            f"{base} to:{company}",
+            f'{base} "{company}"',
+            f"{base} {company}",
+        ]
+
     quoted = f'"{company}"'
     compact = re.sub(r"[^a-zA-Z0-9]", "", company).lower()
     queries = [
@@ -418,10 +429,11 @@ def find_sent_to_company(
     max_results: int = 15,
     ai_extract: bool = False,
 ) -> list[dict[str, Any]]:
-    """Find sent messages related to a company — full body, no AI trim by default."""
+    """Find sent messages related to a company or recipient email — full body."""
     company = (company or "").strip()
     if not company:
         return []
+    is_email = "@" in company
     seen_ids: set[str] = set()
     rows: list[dict[str, Any]] = []
     for query in _company_search_queries(company, days):
@@ -444,11 +456,25 @@ def find_sent_to_company(
             for r in rows
             if (r.get("body_text") or r.get("body_html") or "").strip()
         ]
+        # One solid hit is enough when searching by exact recipient email
+        if is_email and with_body:
+            break
         if len(with_body) >= 3:
             break
 
-    filtered = filter_messages(rows, company)
-    candidates = filtered or rows
+    if is_email:
+        email_l = company.lower()
+        matched = [
+            r
+            for r in rows
+            if email_l in str(r.get("to") or "").lower()
+            or email_l in str(r.get("cc") or "").lower()
+            or email_l in str(r.get("body_text") or "").lower()[:2000]
+        ]
+        candidates = matched or rows
+    else:
+        filtered = filter_messages(rows, company)
+        candidates = filtered or rows
 
     refreshed: list[dict[str, Any]] = []
     for row in candidates[:max_results]:
@@ -485,6 +511,7 @@ def pick_best_sent_reference(
 ) -> Optional[dict[str, Any]]:
     """Score sent rows; prefer To/subject/body matches with a usable full body."""
     company_l = (company or "").strip().lower()
+    is_email = "@" in company_l
     compact = re.sub(r"[^a-z0-9]", "", company_l)
     best: Optional[dict[str, Any]] = None
     best_score = -1
@@ -493,9 +520,12 @@ def pick_best_sent_reference(
             continue
         body = (m.get("body_text") or "").strip()
         html = (m.get("body_html") or "").strip()
+        to_l = str(m.get("to") or "").lower()
+        cc_l = str(m.get("cc") or "").lower()
         blob = " ".join(
             [
-                str(m.get("to") or ""),
+                to_l,
+                cc_l,
                 str(m.get("subject") or ""),
                 body[:8000],
                 html[:2000],
@@ -504,15 +534,21 @@ def pick_best_sent_reference(
             ]
         ).lower()
         score = 0
+        if is_email and company_l in to_l:
+            score += 25
+        elif is_email and company_l in cc_l:
+            score += 15
+        elif is_email and company_l in blob:
+            score += 8
         if company_l and company_l in blob:
             score += 10
         if compact and compact in re.sub(r"[^a-z0-9]", "", blob):
             score += 6
-        to_l = str(m.get("to") or "").lower()
-        if company_l and company_l in to_l:
-            score += 8
-        if compact and compact in re.sub(r"[^a-z0-9@.]", "", to_l):
-            score += 8
+        if not is_email:
+            if company_l and company_l in to_l:
+                score += 8
+            if compact and compact in re.sub(r"[^a-z0-9@.]", "", to_l):
+                score += 8
         if len(body) > 400:
             score += 8
         elif len(body) > 80:

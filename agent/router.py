@@ -18,9 +18,13 @@ from agent.intent import (
     IntentPlan,
     classify_email_roles,
     filter_recipient_emails,
+    org_label_from_email,
+    parse_gmail_message_id,
     parse_like_sent_request,
+    parse_mailbox_list_index,
     plan_request,
     plan_summary,
+    resolve_like_sent_from_history,
 )
 from agent.research_pipeline import (
     discover_orgs_from_web,
@@ -95,12 +99,18 @@ Rules:
   From last prospects: {"batch":true,"from_prospects":true,"subject":"Hello"}
   From mailbox: {"batch":true,"from_mailbox":true,"subject":"Re: {prior_subject}"}
   Like a prior sent email: {"like_sent_to":"IndiaMART","like_sent_for":"Acme"}
+  From a Sent message id: {"like_sent_message_id":"18abc...","like_sent_for":"Acme"}
   Include ALL cc addresses the user listed. Put ignored emails in "ignore_emails".
   Never put csr@karunamedia.org or CC addresses in recipient_email(s).
   Known CC aliases (use these when only a name is given):
   Deepti → deepti.87.srivastava@gmail.com; Raahul/Rahul → raahul.ppcm@gmail.com.
-  When user says "create email like sent to X" / "similar to the email we sent to X",
+  When user says "create email like sent to X" / "like info@org.org in sent items",
   use DRAFT_EMAIL with like_sent_to set (and like_sent_for for the new company if named).
+  like_sent_to may be a company name OR a Sent recipient email — never put that
+  reference email in recipient_email(s).
+  When user gives a Gmail message id / "email id" / "#N from sent", use DRAFT_EMAIL with
+  like_sent_message_id (and like_sent_for if they name a new company).
+  Use recent chat history when they say "like that" / "same as before" without repeating X.
   Do NOT use RESEARCH_THEN_ZOOM for style-clone requests.
 - SEND_EMAIL: send now only. Same compact JSON shapes as DRAFT_EMAIL.
 - SCHEDULE_EMAIL: schedule later. Compact JSON with recipient_email, subject, send_at.
@@ -316,9 +326,14 @@ def _extract_email_job(
     seed = dict(seed or {})
     hist_txt = ""
     if history:
-        hist_txt = "\n".join(
-            f"{m.get('role')}: {m.get('content')}" for m in history[-6:]
-        )
+        parts: list[str] = []
+        for m in history[-12:]:
+            role = m.get("role") or "?"
+            content = (m.get("content") or "").strip()
+            if len(content) > 2500:
+                content = content[:2500] + "…"
+            parts.append(f"{role}: {content}")
+        hist_txt = "\n".join(parts)
     default_send = (datetime.now() + timedelta(days=1)).replace(
         hour=9, minute=30, second=0, microsecond=0
     ).isoformat()
@@ -354,12 +369,14 @@ Rules for recipients:
 - Addresses after "cc" go ONLY in cc (include every one).
 - Addresses after ignore/skip/don't use go ONLY in ignore_emails.
 - Do not invent NGO lists; extract the email job only.
+- If the latest message is a short follow-up ("draft to them", "same for Flipkart"),
+  pull To/CC/subject/body intent from earlier messages in the conversation.
 
 Rules for html_body:
 - If uploaded document text is provided, write a clear professional email that uses
   the important facts/offers/details from that document (do not dump the raw PDF).
 - Keep HTML simple (<p>, <ul>/<li>, <strong>).
-- If the user already drafted body text, prefer refining that with document facts.
+- If the user already drafted body text in prior chat turns, prefer refining that.
 - For bulk follow-ups from inbox/sent, use placeholders
   {{first_name}}, {{name}}, {{company}}, {{prior_subject}}, {{prior_summary}}
   so each recipient gets a personalized message.
@@ -674,7 +691,9 @@ def _format_mailbox_digest(rows: list[dict[str, Any]], *, limit: int = 25) -> st
         who = r.get("from") if box != "sent" else (r.get("to") or r.get("from"))
         who = (who or "")[:60]
         date = (r.get("date") or "")[:32]
-        lines.append(f"{i}. [{box}] {date} | {who} | {subj}")
+        mid = (r.get("message_id") or "").strip()
+        id_bit = f" id=`{mid}`" if mid else ""
+        lines.append(f"{i}. [{box}]{id_bit} | {date} | {who} | {subj}")
     if len(rows) > limit:
         lines.append(f"…and {len(rows) - limit} more.")
     return "\n".join(lines) or "(no messages)"
@@ -833,6 +852,24 @@ def _deliver_job(
     return create_draft(**kwargs, track=True), False
 
 
+def _reference_org_for_swap(
+    like_ref: str,
+    ref_msg: Optional[dict[str, Any]] = None,
+) -> str:
+    """Company/org label to replace in the cloned body (not the raw email)."""
+    ref = (like_ref or "").strip()
+    msg = ref_msg or {}
+    if "@" in ref:
+        to_hdr = str(msg.get("to") or "")
+        m_name = re.match(r'\s*"?([^"<]+?)"?\s*<', to_hdr)
+        if m_name:
+            display = m_name.group(1).strip()
+            if display and "@" not in display and len(display) > 1:
+                return display
+        return org_label_from_email(ref) or ref
+    return ref or "prior organization"
+
+
 def _infer_like_sent_target(
     *,
     explicit: str,
@@ -856,7 +893,7 @@ def _infer_like_sent_target(
         return uniq[-1]
     # Last user/assistant turn may name a company after "for/about"
     if history:
-        for m in reversed(history[-6:]):
+        for m in reversed(history[-16:]):
             text = str(m.get("content") or "")
             fm = re.search(
                 r"\b(?:for|about|targeting|company)\s+([A-Za-z0-9][A-Za-z0-9&.\'\- ]{2,50})",
@@ -865,6 +902,16 @@ def _infer_like_sent_target(
             )
             if fm:
                 cand = fm.group(1).strip(" .,;:")
+                if cand.lower() != (reference or "").strip().lower():
+                    return cand
+            # From prior like-sent planner lines
+            m_for = re.search(
+                r"like sent to:[^\n]*→\s*for\s+([^\n]+)",
+                text,
+                re.I,
+            )
+            if m_for:
+                cand = m_for.group(1).strip()
                 if cand.lower() != (reference or "").strip().lower():
                     return cand
     return target or ""
@@ -1434,17 +1481,23 @@ def answer(
             seed_json["like_sent_to"] = plan.like_sent_to
         if plan.like_sent_for:
             seed_json["like_sent_for"] = plan.like_sent_for
+        if plan.like_sent_message_id:
+            seed_json["like_sent_message_id"] = plan.like_sent_message_id
         routing = "DRAFT_EMAIL:" + json.dumps(seed_json, ensure_ascii=False)
         meta_routing = routing
-    elif plan.like_sent_to and (
+    elif (plan.like_sent_to or plan.like_sent_message_id) and (
         routing == "CHAT"
         or routing.startswith("CHAT")
         or routing.startswith("RESEARCH_THEN_ZOOM")
         or routing.startswith("GMAIL_EXTRACT")
     ):
-        seed_json = {"like_sent_to": plan.like_sent_to}
+        seed_json = {}
+        if plan.like_sent_to:
+            seed_json["like_sent_to"] = plan.like_sent_to
         if plan.like_sent_for:
             seed_json["like_sent_for"] = plan.like_sent_for
+        if plan.like_sent_message_id:
+            seed_json["like_sent_message_id"] = plan.like_sent_message_id
         if len(plan.to_emails) == 1:
             seed_json["recipient_email"] = plan.to_emails[0]
         elif plan.to_emails:
@@ -2348,9 +2401,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 except Exception as e:
                     print(f"[router] mailbox auto-ingest error: {e}", file=sys.stderr)
                 yield (
-                    "\n\nNext: ask me to **draft personalized follow-ups** to these "
-                    "(optionally filtered), e.g. "
-                    "`draft follow-ups to everyone in this list about next steps`."
+                    "\n\nNext: ask me to **draft personalized follow-ups**, or clone one "
+                    "by **id** / list number, e.g. "
+                    "`create draft like message id <id> for Acme` or "
+                    "`draft like #2 from sent for Flipkart`."
                 )
             sources.append(
                 {
@@ -2376,13 +2430,45 @@ HTML only in html_body. No markdown. Do not include a signature block.
             like_for = str(
                 plan.like_sent_for or seed.get("like_sent_for") or ""
             ).strip()
-            if not like_ref:
-                parsed_like = parse_like_sent_request(user_msg or "")
-                if parsed_like:
-                    like_ref = (parsed_like.get("reference") or "").strip()
-                    like_for = like_for or (parsed_like.get("target") or "").strip()
+            like_mid = str(
+                plan.like_sent_message_id
+                or seed.get("like_sent_message_id")
+                or ""
+            ).strip()
+            resolved_like = resolve_like_sent_from_history(
+                user_msg or "",
+                history,
+                like_sent_to=like_ref,
+                like_sent_for=like_for,
+                like_sent_message_id=like_mid,
+            )
+            like_ref = (resolved_like.get("reference") or like_ref).strip()
+            like_for = (resolved_like.get("target") or like_for).strip()
+            like_mid = (resolved_like.get("message_id") or like_mid).strip()
+            if not like_mid:
+                like_mid = parse_gmail_message_id(user_msg or "")
+            list_idx = parse_mailbox_list_index(user_msg or "")
 
-            if like_ref:
+            # Resolve reference from mailbox list index (#2 / email 3)
+            if not like_mid and list_idx and mailbox_messages:
+                pool = [
+                    m
+                    for m in mailbox_messages
+                    if (m.get("mailbox") or "").lower() == "sent"
+                ] or list(mailbox_messages)
+                if 1 <= list_idx <= len(pool):
+                    picked = pool[list_idx - 1]
+                    like_mid = str(picked.get("message_id") or "").strip()
+                    if not like_ref:
+                        # Best-effort company hint from To header
+                        to_hdr = str(picked.get("to") or "")
+                        dom = re.search(
+                            r"@([A-Za-z0-9.\-]+)\.[A-Za-z]{2,}", to_hdr
+                        )
+                        if dom:
+                            like_ref = dom.group(1).split(".")[0]
+
+            if like_ref or like_mid:
                 # Clone angle from a prior sent email → research target → draft
                 target_company = _infer_like_sent_target(
                     explicit=like_for,
@@ -2391,7 +2477,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     history=history,
                 )
                 yield (
-                    f"**Like-sent:** finding Gmail sent to **{like_ref}**"
+                    "**Like-sent:** "
+                    + (
+                        f"loading message id `{like_mid}`"
+                        if like_mid
+                        else f"finding Gmail sent to **{like_ref or 'prior email'}**"
+                    )
                     + (
                         f", adapting for **{target_company}**"
                         if target_company
@@ -2403,27 +2494,74 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     yield stopped_message()
                 else:
                     sent_rows: list[dict[str, Any]] = []
-                    try:
-                        sent_rows = find_sent_to_company(
-                            like_ref,
-                            days=365,
-                            max_results=15,
-                            ai_extract=False,
-                        )
-                    except Exception as e:
-                        print(f"[router] like-sent gmail: {e}", file=sys.stderr)
-                        yield f"_Couldn't search Sent mail: {e}_\n"
-                    # Fallback: filter already-loaded mailbox (prefer sent)
-                    if not sent_rows and mailbox_messages:
-                        sent_only = [
-                            m
-                            for m in mailbox_messages
-                            if (m.get("mailbox") or "").lower() == "sent"
-                        ]
-                        pool = sent_only or list(mailbox_messages)
-                        sent_rows = filter_messages(pool, like_ref)
+                    ref_msg: Optional[dict[str, Any]] = None
+
+                    # 1) Direct fetch by Gmail message id (preferred)
+                    if like_mid:
+                        try:
+                            fresh = get_message(like_mid)
+                            if fresh.get("error"):
+                                yield (
+                                    f"_Couldn't load message id `{like_mid}`: "
+                                    f"{fresh.get('error')}_\n"
+                                )
+                            else:
+                                ref_msg = {
+                                    **fresh,
+                                    "message_id": like_mid,
+                                    "mailbox": "sent",
+                                    "extracted": {
+                                        "summary": (fresh.get("body_text") or "")[
+                                            :500
+                                        ],
+                                    },
+                                }
+                                sent_rows = [ref_msg]
+                                if not like_ref:
+                                    to_hdr = str(fresh.get("to") or "")
+                                    dom = re.search(
+                                        r"@([A-Za-z0-9.\-]+)\.[A-Za-z]{2,}",
+                                        to_hdr,
+                                    )
+                                    if dom:
+                                        like_ref = dom.group(1).split(".")[0]
+                                    elif fresh.get("subject"):
+                                        like_ref = "prior sent email"
+                                yield (
+                                    f"_Loaded id=`{like_mid}` · "
+                                    f"**{(fresh.get('subject') or '(no subject)').strip()}** "
+                                    f"→ {fresh.get('to') or '—'}_\n"
+                                )
+                        except Exception as e:
+                            print(
+                                f"[router] like-sent by id: {e}", file=sys.stderr
+                            )
+                            yield f"_Couldn't load message id `{like_mid}`: {e}_\n"
+
+                    # 2) Company search in Sent
+                    if not ref_msg and like_ref:
+                        try:
+                            sent_rows = find_sent_to_company(
+                                like_ref,
+                                days=365,
+                                max_results=15,
+                                ai_extract=False,
+                            )
+                        except Exception as e:
+                            print(f"[router] like-sent gmail: {e}", file=sys.stderr)
+                            yield f"_Couldn't search Sent mail: {e}_\n"
+                        # Fallback: filter already-loaded mailbox (prefer sent)
+                        if not sent_rows and mailbox_messages:
+                            sent_only = [
+                                m
+                                for m in mailbox_messages
+                                if (m.get("mailbox") or "").lower() == "sent"
+                            ]
+                            pool = sent_only or list(mailbox_messages)
+                            sent_rows = filter_messages(pool, like_ref)
+                        ref_msg = pick_best_sent_reference(sent_rows, like_ref)
+
                     mailbox_out = list(sent_rows)
-                    ref_msg = pick_best_sent_reference(sent_rows, like_ref)
                     if ref_msg and ref_msg.get("message_id"):
                         # Always re-fetch full MIME so we don't draft from a stub
                         try:
@@ -2455,9 +2593,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             )
                     if not ref_msg:
                         yield (
-                            f"I couldn't find a sent email matching **{like_ref}**. "
-                            "Try `show sent last 365 days` first, or use the exact "
-                            "company/recipient name from the Sent folder.\n"
+                            "I couldn't find that sent email"
+                            + (f" (**{like_ref}**)" if like_ref else "")
+                            + (f" / id `{like_mid}`" if like_mid else "")
+                            + ". Try `show sent last 365 days`, then "
+                            "`create draft like message id <id> for <company>` "
+                            "or `draft like #1 from sent`.\n"
                         )
                     elif not (
                         (ref_msg.get("body_text") or "").strip()
@@ -2554,14 +2695,39 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                             print(f"[router] like-sent research: {e}", file=sys.stderr)
                             yield f"_Research limited: {e}_\n"
 
+                        ref_org = _reference_org_for_swap(like_ref, ref_msg)
+                        if "@" in (like_ref or ""):
+                            yield (
+                                f"_Template recipient: `{like_ref}` · "
+                                f"org label for rewrite: **{ref_org}**_\n"
+                            )
                         composed = _compose_like_sent_email(
                             user_msg=user_msg,
                             reference_msg=ref_msg,
-                            reference_company=like_ref,
+                            reference_company=ref_org,
                             target_company=target_company,
                             research_notes=research_notes,
                             document_context=doc_context,
                         )
+                        # Also scrub the literal Sent recipient email / domain token
+                        if "@" in (like_ref or "") and target_company:
+                            for old in (
+                                like_ref,
+                                org_label_from_email(like_ref),
+                                ref_org,
+                            ):
+                                if not old:
+                                    continue
+                                composed["html_body"] = _replace_company_names(
+                                    composed.get("html_body") or "",
+                                    old,
+                                    target_company,
+                                )
+                                composed["subject"] = _replace_company_names(
+                                    composed.get("subject") or "",
+                                    old,
+                                    target_company,
+                                )
                         if composed.get("alignment_summary"):
                             yield f"_{composed['alignment_summary']}_\n"
                         yield (
