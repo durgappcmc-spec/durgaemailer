@@ -169,16 +169,16 @@ def sync_gmail(
 
 def ensure_session_sync(session_state: Any, *, light: bool = False) -> dict[str, Any]:
     """Run once per Streamlit session. Chat uses light=True (skip blocking Gmail)."""
-    if light:
-        # Chat page: never block on Gmail or Sheets memory pull
-        return session_state.get("_auto_sync_result") or {"skipped": True, "reason": "light"}
-
     if not session_state.get("_memory_hydrated"):
         session_state["_memory_hydrated"] = True
         try:
             memory.hydrate_from_cloud()
         except Exception as e:
             print(f"[auto_sync] memory hydrate: {e}", file=sys.stderr)
+
+    if light:
+        # Chat page: never block on Gmail
+        return session_state.get("_auto_sync_result") or {"skipped": True, "reason": "light"}
 
     if session_state.get("_auto_sync_done"):
         return session_state.get("_auto_sync_result") or {"skipped": True}

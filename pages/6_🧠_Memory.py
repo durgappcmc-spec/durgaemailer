@@ -13,6 +13,10 @@ if not require_login():
 logout_button()
 
 st.title("🧠 Memory")
+st.caption(
+    "Notes, Gmail sync, and ZoomInfo hits auto-save to **Google Drive** "
+    "(`relay_memory.json` in Relay Memory) so they survive redeploys."
+)
 
 q = st.text_input("Search memory")
 source = st.selectbox("Source filter", ["all", "gmail_extract", "prospects", "manual"])
@@ -42,4 +46,12 @@ if st.button("💾 Save note") and body.strip():
         title=title or "untitled",
         metadata={"tags": tag_list},
     )
-    st.success("Saved.")
+    ok = False
+    try:
+        ok = memory.flush_memory_to_drive()
+    except Exception:
+        ok = False
+    if ok:
+        st.success("Saved to memory and Google Drive.")
+    else:
+        st.success("Saved to memory (Drive upload queued).")

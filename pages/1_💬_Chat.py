@@ -40,7 +40,7 @@ for key, default in (
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Instant local restore (no Gmail). Sheets pull only if local chat is empty.
+# Instant local restore (no Gmail). Drive pull if local chat is empty.
 durable_store.hydrate_session_fast(st.session_state)
 if not st.session_state.messages:
     with st.spinner("Restoring saved chat…"):
@@ -48,6 +48,15 @@ if not st.session_state.messages:
 if not st.session_state._durable_pull_started:
     st.session_state._durable_pull_started = True
     durable_store.pull_sheets_into_local_async()
+# Restore RAG memory from Google Drive (non-blocking; Drive is source of truth)
+if not st.session_state.get("_memory_hydrated"):
+    st.session_state._memory_hydrated = True
+    try:
+        from core import memory as _mem
+
+        _mem.hydrate_from_cloud()
+    except Exception:
+        pass
 
 mailbox_n = len(st.session_state.get("last_mailbox") or [])
 if mailbox_n:

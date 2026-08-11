@@ -1,12 +1,13 @@
 # NOTE: Embedding model downloads on first use (~80MB all-MiniLM-L6-v2).
 # Cloud deploy may omit chromadb; memory then falls back to a JSONL store.
+# Every write is snapshotted locally and auto-uploaded to Google Drive (relay_memory.json).
 from __future__ import annotations
 
 import json
 import os
 import re
 import sys
-import time
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -27,49 +28,147 @@ _FALLBACK_PATH = Path(settings.CHROMA_DIR).parent / "memory_fallback.jsonl"
 if not str(_FALLBACK_PATH).startswith(str(_DATA)):
     _FALLBACK_PATH = _DATA / "memory_fallback.jsonl"
 _CLOUD_RESTORED = False
-_LAST_CLOUD_SYNC = 0.0
-_CLOUD_SYNC_INTERVAL = 180.0
 _MAX_FALLBACK_ROWS = 1200 if _light else 5000
+
+_SYNC_LOCK = threading.Lock()
+_PENDING_DRIVE_ROWS: Optional[list[dict[str, Any]]] = None
+_DRIVE_FLUSH_TIMER: Optional[threading.Timer] = None
+_DRIVE_DEBOUNCE_SEC = 2.0
+
+
+def _read_fallback_map() -> dict[str, dict[str, Any]]:
+    existing: dict[str, dict[str, Any]] = {}
+    try:
+        if not _FALLBACK_PATH.exists():
+            return {}
+        for line in _FALLBACK_PATH.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                existing[str(row.get("id"))] = row
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return existing
+
+
+def _write_fallback_map(existing: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    values = list(existing.values())
+    if len(values) > _MAX_FALLBACK_ROWS:
+        values = values[-_MAX_FALLBACK_ROWS:]
+        existing = {str(r.get("id")): r for r in values}
+    try:
+        _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
+            for row in existing.values():
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[memory] fallback write error: {e}", file=sys.stderr)
+    return existing
 
 
 def _restore_memory_from_cloud() -> None:
-    """Hydrate local JSONL from local durable cache / Sheets after rebuilds wipe /tmp."""
+    """Hydrate local JSONL from Google Drive after rebuilds wipe ephemeral disk."""
     global _CLOUD_RESTORED
     if _CLOUD_RESTORED:
         return
     _CLOUD_RESTORED = True
     try:
-        if _FALLBACK_PATH.exists() and _FALLBACK_PATH.stat().st_size > 0:
-            return
         from core.durable_store import load_memory_rows
 
-        # Local-first (fast); Sheets only if local empty
-        rows = load_memory_rows(allow_sheets=False)
-        if not rows:
-            rows = load_memory_rows(allow_sheets=True)
-        if not rows:
+        local_rows = list(_read_fallback_map().values())
+        # Always ask Drive — prefer the richer cloud copy after deploys
+        cloud_rows = load_memory_rows(allow_sheets=True) or []
+        if not cloud_rows and not local_rows:
             return
-        _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"[memory] restored {len(rows)} rows from durable store", file=sys.stderr)
+
+        prefer_cloud = bool(
+            cloud_rows
+            and (
+                not local_rows
+                or (
+                    len(cloud_rows) > max(len(local_rows), 2)
+                    and len(local_rows) < max(3, int(len(cloud_rows) * 0.5))
+                )
+            )
+        )
+        if not prefer_cloud and local_rows:
+            return
+
+        rows = cloud_rows if prefer_cloud else (local_rows or cloud_rows)
+        existing = {str(r.get("id")): r for r in rows if isinstance(r, dict) and r.get("id")}
+        _write_fallback_map(existing)
+        print(
+            f"[memory] restored {len(existing)} rows from Google Drive",
+            file=sys.stderr,
+        )
     except Exception as e:
         print(f"[memory] cloud restore skipped: {e}", file=sys.stderr)
 
 
-def _sync_memory_to_cloud(existing: dict[str, dict[str, Any]]) -> None:
-    global _LAST_CLOUD_SYNC
-    now = time.time()
-    # Always keep a local durable snapshot; Sheets at most every 2 minutes
+def _flush_pending_drive_upload() -> None:
+    """Upload the latest pending memory snapshot to Google Drive."""
+    global _PENDING_DRIVE_ROWS, _DRIVE_FLUSH_TIMER
+    with _SYNC_LOCK:
+        rows = _PENDING_DRIVE_ROWS
+        _PENDING_DRIVE_ROWS = None
+        _DRIVE_FLUSH_TIMER = None
+    if not rows:
+        return
     try:
-        from core.durable_store import save_json_blob, save_memory_rows_async
+        from core.durable_store import save_memory_rows_async
 
-        rows = list(existing.values())
-        save_json_blob("memory_rows", rows[-_MAX_FALLBACK_ROWS:], sync_sheets=False)
-        if now - _LAST_CLOUD_SYNC >= _CLOUD_SYNC_INTERVAL:
-            _LAST_CLOUD_SYNC = now
-            save_memory_rows_async(rows[-_MAX_FALLBACK_ROWS:])
+        save_memory_rows_async(rows)
+        print(f"[memory] queued Google Drive save ({len(rows)} rows)", file=sys.stderr)
+    except Exception as e:
+        print(f"[memory] Drive save failed: {e}", file=sys.stderr)
+
+
+def flush_memory_to_drive() -> bool:
+    """Force-upload current memory to Google Drive immediately."""
+    global _DRIVE_FLUSH_TIMER
+    with _SYNC_LOCK:
+        if _DRIVE_FLUSH_TIMER is not None:
+            try:
+                _DRIVE_FLUSH_TIMER.cancel()
+            except Exception:
+                pass
+            _DRIVE_FLUSH_TIMER = None
+    _flush_pending_drive_upload()
+    try:
+        existing = _read_fallback_map()
+        if not existing:
+            return True
+        from core.durable_store import save_memory_rows
+
+        return bool(save_memory_rows(list(existing.values())[-_MAX_FALLBACK_ROWS:]))
+    except Exception as e:
+        print(f"[memory] flush Drive failed: {e}", file=sys.stderr)
+        return False
+
+
+def _sync_memory_to_cloud(existing: dict[str, dict[str, Any]]) -> None:
+    """Local durable snapshot + auto Google Drive upload (debounced ~2s)."""
+    global _PENDING_DRIVE_ROWS, _DRIVE_FLUSH_TIMER
+    try:
+        from core.durable_store import save_json_blob
+
+        rows = list(existing.values())[-_MAX_FALLBACK_ROWS:]
+        # Instant local durable file (within the container)
+        save_json_blob("memory_rows", rows, sync_sheets=False)
+        with _SYNC_LOCK:
+            _PENDING_DRIVE_ROWS = rows
+            if _DRIVE_FLUSH_TIMER is not None:
+                try:
+                    _DRIVE_FLUSH_TIMER.cancel()
+                except Exception:
+                    pass
+            timer = threading.Timer(_DRIVE_DEBOUNCE_SEC, _flush_pending_drive_upload)
+            timer.daemon = True
+            _DRIVE_FLUSH_TIMER = timer
+            timer.start()
     except Exception as e:
         print(f"[memory] cloud sync skipped: {e}", file=sys.stderr)
 
@@ -105,37 +204,14 @@ def _fallback_upsert(
     metadatas: list[dict[str, Any]],
 ) -> None:
     _restore_memory_from_cloud()
-    existing: dict[str, dict[str, Any]] = {}
-    try:
-        if _FALLBACK_PATH.exists():
-            for line in _FALLBACK_PATH.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                    existing[str(row.get("id"))] = row
-                except Exception:
-                    continue
-    except Exception:
-        existing = {}
+    existing = _read_fallback_map()
     for i, doc_id in enumerate(ids):
         existing[doc_id] = {
             "id": doc_id,
             "text": texts[i],
             "metadata": metadatas[i],
         }
-    try:
-        _FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # Cap file size on free tier
-        values = list(existing.values())
-        if len(values) > _MAX_FALLBACK_ROWS:
-            values = values[-_MAX_FALLBACK_ROWS:]
-            existing = {str(r.get("id")): r for r in values}
-        with _FALLBACK_PATH.open("w", encoding="utf-8") as fh:
-            for row in existing.values():
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[memory] fallback write error: {e}", file=sys.stderr)
+    existing = _write_fallback_map(existing)
     _sync_memory_to_cloud(existing)
 
 
@@ -188,7 +264,7 @@ def _fallback_search(
 
 
 def hydrate_from_cloud() -> None:
-    """Public hook — restore memory JSONL from Sheets after container rebuild."""
+    """Public hook — restore memory JSONL from Google Drive after container rebuild."""
     _restore_memory_from_cloud()
 
 
@@ -199,7 +275,7 @@ def add(
     title: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
 ) -> list[str]:
-    """Upsert one or more texts into memory. Returns ids."""
+    """Upsert one or more texts into memory. Returns ids. Auto-saves to Google Drive."""
     if isinstance(texts, str):
         texts = [texts]
     ids: list[str] = []
@@ -232,6 +308,8 @@ def add(
                 col.upsert(documents=texts, ids=ids, metadatas=metadatas)
             else:
                 col.add(documents=texts, ids=ids, metadatas=metadatas)
+            # Always mirror to Drive-backed JSONL (Render disk is ephemeral)
+            _fallback_upsert(ids, texts, metadatas)
             return ids
         except Exception as e:
             print(f"[memory] chroma upsert error, using fallback: {e}", file=sys.stderr)
