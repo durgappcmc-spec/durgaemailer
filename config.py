@@ -102,6 +102,9 @@ class Settings:
             "BOOTSTRAP_TOKEN_PATH", "./credentials/bootstrap_token.json"
         )
         self.GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+        # Pin the Drive folder that holds relay_prospects.json / relay_chat.json /
+        # relay_memory.json so redeploys never create a second empty "Relay Memory".
+        self.RELAY_DRIVE_FOLDER_ID: str = os.getenv("RELAY_DRIVE_FOLDER_ID", "")
         self.TRACKING_BASE_URL: str = os.getenv("TRACKING_BASE_URL", "").rstrip("/")
         self.APPS_SCRIPT_TRACKING_URL: str = os.getenv("APPS_SCRIPT_TRACKING_URL", "")
         self.CHROMA_DIR: str = str(_CHROMA)

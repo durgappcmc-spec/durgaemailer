@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import threading
 from typing import Any, Optional
@@ -38,9 +39,22 @@ def _drive():
         return None
 
 
+def _pinned_folder_id() -> str:
+    try:
+        from config import settings
+
+        return str(getattr(settings, "RELAY_DRIVE_FOLDER_ID", "") or "").strip()
+    except Exception:
+        return (os.getenv("RELAY_DRIVE_FOLDER_ID") or "").strip()
+
+
 def _ensure_folder() -> Optional[str]:
     global _FOLDER_ID
     if _FOLDER_ID:
+        return _FOLDER_ID
+    pinned = _pinned_folder_id()
+    if pinned:
+        _FOLDER_ID = pinned
         return _FOLDER_ID
     svc = _drive()
     if not svc:
@@ -71,6 +85,11 @@ def _ensure_folder() -> Optional[str]:
             .execute()
         )
         _FOLDER_ID = meta["id"]
+        print(
+            f"[drive] created folder '{FOLDER_NAME}' id={_FOLDER_ID} "
+            f"(set RELAY_DRIVE_FOLDER_ID to pin across deploys)",
+            file=sys.stderr,
+        )
         return _FOLDER_ID
     except Exception as e:
         print(f"[drive] folder failed: {e}", file=sys.stderr)

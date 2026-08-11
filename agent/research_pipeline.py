@@ -119,23 +119,30 @@ def enrich_one_org_on_zoominfo(
             "notes": ["skipped - no name/domain"],
         }
 
-    # Reuse saved prospect list only when emails are already present
+    # Reuse saved prospect list only when enough emails are already present
     try:
         from core.prospect_list import (
+            count_with_email,
             find_by_company,
             save_prospects,
-            saved_contacts_are_usable,
         )
 
-        saved = find_by_company(name or domain, limit=contacts_per_org)
+        saved = find_by_company(name or domain, limit=max(contacts_per_org * 2, 10))
         if domain and not saved:
-            saved = find_by_company(domain, limit=contacts_per_org)
-        if saved and saved_contacts_are_usable(saved, min_with_email=1):
-            notes.append(f"prospect list hit ({len(saved)} saved with email)")
+            saved = find_by_company(domain, limit=max(contacts_per_org * 2, 10))
+        saved_with_email = count_with_email(saved)
+        # Need a full-enough emailed set; one partial hit must not stop ZoomInfo
+        if saved and saved_with_email >= max(1, min(contacts_per_org, 3)):
+            notes.append(
+                f"prospect list hit ({saved_with_email}/{len(saved)} with email)"
+            )
             contacts = []
             seen: set[str] = set()
             for r in saved:
                 email = (r.get("email") or "").strip().lower()
+                # Prefer emailed contacts when reusing; skip stubs without email
+                if not email:
+                    continue
                 key = email or f"{r.get('name')}|{r.get('company')}|{r.get('source_id')}"
                 key = key.lower()
                 if key in seen:
@@ -170,7 +177,8 @@ def enrich_one_org_on_zoominfo(
             }
         if saved:
             notes.append(
-                f"prospect list had {len(saved)} without email — auto ZoomInfo"
+                f"prospect list had {saved_with_email}/{len(saved)} with email "
+                f"— continuing ZoomInfo for contact details"
             )
     except Exception as e:
         notes.append(f"prospect list skip: {e}")

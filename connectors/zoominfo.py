@@ -331,13 +331,20 @@ class ZoomInfoConnector(ProspectConnector):
                     headers=self._headers(),
                     json={
                         "companyId": str(cid),
-                        "rpp": min(5, limit - len(out)),
+                        "rpp": min(25, max(5, limit - len(out))),
                         "page": 1,
                     },
                     timeout=45,
                 )
                 resp.raise_for_status()
                 rows = (resp.json() or {}).get("data") or []
+                rows = sorted(
+                    [r for r in rows if isinstance(r, dict)],
+                    key=lambda c: (
+                        0 if c.get("hasEmail") else 1,
+                        0 if c.get("hasSupplementalEmail") else 1,
+                    ),
+                )
             except Exception as e:
                 print(f"[zoominfo] contacts-for-company error: {e}", file=sys.stderr)
                 continue
@@ -363,6 +370,7 @@ class ZoomInfoConnector(ProspectConnector):
     def _enrich_contact_rows(
         self, contacts: list[dict[str, Any]], limit: int = 10
     ) -> list[dict[str, Any]]:
+        """Search hits → enrich for email/mobile; never drop people if enrich is thin."""
         ranked = sorted(
             contacts,
             key=lambda c: (
@@ -370,36 +378,90 @@ class ZoomInfoConnector(ProspectConnector):
                 0 if c.get("hasSupplementalEmail") else 1,
             ),
         )
-        person_ids = []
-        for c in ranked[: max(limit, 10)]:
+        ranked = [c for c in ranked if isinstance(c, dict)][: max(limit, 10)]
+        person_ids: list[Any] = []
+        search_by_id: dict[str, dict[str, Any]] = {}
+        for c in ranked:
             pid = c.get("personId") or c.get("id")
-            if pid:
-                person_ids.append(pid)
+            if not pid:
+                continue
+            pid_s = str(pid)
+            person_ids.append(pid)
+            search_by_id[pid_s] = c
         person_ids = person_ids[:limit]
-        enriched: list[dict[str, Any]] = []
         if not person_ids:
-            return enriched
+            return [_row_to_prospect(c) for c in ranked[:limit]]
+
+        enriched_by_id: dict[str, dict[str, Any]] = {}
         try:
             rows = self._enrich_by_ids(person_ids)
-            by_id = {
-                str(c.get("personId") or c.get("id")): c for c in ranked[:limit]
-            }
             for row in rows:
+                if not isinstance(row, dict):
+                    continue
                 if row.get("errorMessage") or row.get("invalidInputFields"):
                     continue
                 rid = str(row.get("id") or row.get("personId") or "")
-                search_hit = by_id.get(rid) or {}
+                if not rid:
+                    continue
+                search_hit = search_by_id.get(rid) or {}
                 if not _company_name(row) and search_hit:
                     row = {**row, "company": search_hit.get("company")}
                 if not row.get("jobTitle") and search_hit.get("jobTitle"):
                     row = {**row, "jobTitle": search_hit.get("jobTitle")}
-                prospect = _row_to_prospect(row)
-                enriched.append(prospect)
+                enriched_by_id[rid] = _row_to_prospect(row)
         except Exception as e:
             print(f"[zoominfo] enrich-after-search error: {e}", file=sys.stderr)
-            for c in ranked[:limit]:
-                enriched.append(_row_to_prospect(c))
-        return enriched
+
+        # If batch enrich returned almost nothing, try one-by-one for emails
+        missing_email_ids = [
+            pid
+            for pid in person_ids
+            if not (enriched_by_id.get(str(pid)) or {}).get("email")
+        ]
+        if missing_email_ids and len(enriched_by_id) < len(person_ids):
+            for pid in missing_email_ids[: min(limit, 10)]:
+                if str(pid) in enriched_by_id and (
+                    enriched_by_id[str(pid)].get("email") or ""
+                ).strip():
+                    continue
+                try:
+                    one = self._enrich_by_ids([pid])
+                except Exception:
+                    continue
+                for row in one:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("errorMessage") or row.get("invalidInputFields"):
+                        continue
+                    rid = str(row.get("id") or row.get("personId") or pid)
+                    prospect = _row_to_prospect(row)
+                    if not (prospect.get("email") or "").strip():
+                        continue
+                    search_hit = search_by_id.get(str(pid)) or {}
+                    if not prospect.get("company") and search_hit:
+                        prospect["company"] = _company_name(search_hit)
+                    if not prospect.get("title") and search_hit.get("jobTitle"):
+                        prospect["title"] = search_hit.get("jobTitle")
+                    enriched_by_id[rid] = prospect
+                    enriched_by_id[str(pid)] = prospect
+
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for c in ranked[:limit]:
+            pid = str(c.get("personId") or c.get("id") or "")
+            prospect = enriched_by_id.get(pid) or _row_to_prospect(c)
+            key = (
+                (prospect.get("email") or "").strip().lower()
+                or str(prospect.get("source_id") or pid)
+                or (prospect.get("name") or "").strip().lower()
+            )
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(prospect)
+            if len(out) >= limit:
+                break
+        return out
 
     def enrich(self, identifier: dict[str, Any]) -> Optional[dict[str, Any]]:
         if not self._configured():

@@ -45,25 +45,25 @@ def _load() -> list[dict[str, Any]]:
     global _CACHE, _LOADED
     if _LOADED and _CACHE is not None:
         return _CACHE
-    _LOADED = True
     rows: list[dict[str, Any]] = []
     try:
         from core.durable_store import load_json_blob
 
-        data = load_json_blob("prospect_list", allow_sheets=False)
-        if data is None:
-            data = load_json_blob("prospect_list", allow_sheets=True)
+        # Always allow Drive on cold start (Render wipes local disk each deploy)
+        data = load_json_blob("prospect_list", allow_sheets=True)
         if isinstance(data, list):
             rows = [r for r in data if isinstance(r, dict)]
     except Exception as e:
         print(f"[prospect_list] load failed: {e}", file=sys.stderr)
     _CACHE = rows
+    _LOADED = True
     return _CACHE
 
 
 def _persist(rows: list[dict[str, Any]]) -> None:
-    global _CACHE
+    global _CACHE, _LOADED
     _CACHE = rows
+    _LOADED = True
     try:
         from core.durable_store import save_json_blob_async
 
@@ -73,6 +73,16 @@ def _persist(rows: list[dict[str, Any]]) -> None:
         print(f"[prospect_list] save failed: {e}", file=sys.stderr)
 
 
+def reload_from_drive() -> int:
+    """Invalidate cache and pull contacts from Google Drive. Returns count."""
+    global _CACHE, _LOADED
+    with _LOCK:
+        _LOADED = False
+        _CACHE = None
+        rows = _load()
+        return len(rows)
+
+
 def save_prospects(prospects: list[dict[str, Any]]) -> int:
     """Merge prospects into the durable list. Returns count newly saved/updated."""
     if not prospects:
@@ -80,7 +90,13 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
     from connectors import sanitize_prospect
 
     with _LOCK:
+        global _CACHE, _LOADED
         rows = list(_load())
+        # Safety: if in-memory list is empty, re-pull Drive before merge/upload
+        if not rows:
+            _LOADED = False
+            _CACHE = None
+            rows = list(_load())
         by_key = {_prospect_key(r): i for i, r in enumerate(rows)}
         changed = 0
         for p in prospects:
@@ -369,10 +385,37 @@ def saved_contacts_are_usable(
 ) -> bool:
     """True when saved contacts already have enough emails (skip ZoomInfo).
 
-    Missing email/phone is not “enough” — callers should auto ZoomInfo instead
+    Missing email is not “enough” — callers should auto ZoomInfo instead
     of asking the user to say refresh.
     """
     return count_with_email(rows) >= max(1, int(min_with_email or 1))
+
+
+def enough_emailed_contacts(
+    rows: list[dict[str, Any]] | None,
+    *,
+    limit: int = 10,
+    specific: bool = False,
+) -> bool:
+    """Whether the saved list is complete enough to skip a ZoomInfo search.
+
+    Requires enough *emailed* contacts for the requested limit — a single
+    saved email must not stop ZoomInfo from looking up more people/details.
+    """
+    rows = rows or []
+    with_email = count_with_email(rows)
+    if with_email <= 0:
+        return False
+    want = max(1, int(limit or 1))
+    # Company-specific: need most of the requested volume (cap at 5) with email
+    if specific:
+        needed = min(want, 5)
+    else:
+        needed = min(want, 3)
+    # Also require no large hole of name-only stubs on the matched set
+    if len(rows) >= needed and (len(rows) - with_email) > max(1, needed // 2):
+        return False
+    return with_email >= needed
 
 
 def wants_force_refresh(user_msg: str) -> bool:

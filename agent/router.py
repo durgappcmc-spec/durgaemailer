@@ -2039,8 +2039,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
             limit = min(max(limit, 1), 100)
 
             from core.prospect_list import (
+                count_with_email,
+                enough_emailed_contacts,
                 lookup_for_query,
-                saved_contacts_are_usable,
                 wants_force_refresh,
             )
 
@@ -2055,10 +2056,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 or q.get("company_domains")
                 or q.get("domains")
             )
-            enough = len(cached) >= (1 if specific else min(3, max(limit, 1)))
-            # Reuse list only when emails are already present; otherwise auto ZoomInfo
+            # Only skip ZoomInfo when we already have enough contacts *with email*
             use_saved = bool(
-                cached and enough and saved_contacts_are_usable(cached, min_with_email=1)
+                cached
+                and enough_emailed_contacts(cached, limit=limit, specific=specific)
             )
 
             if use_saved:
@@ -2071,7 +2072,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 except Exception as e:
                     print(f"[router] list re-save error: {e}", file=sys.stderr)
                 ctx_lines = [f"{i}. {prospect_to_text(p)}" for i, p in enumerate(ok[:100], 1)]
-                with_email = sum(1 for p in ok if (p.get("email") or "").strip())
+                with_email = count_with_email(ok)
                 yield (
                     f"Using **{len(ok)}** saved contacts from your prospect list "
                     f"(**{with_email}** with email).\n\n"
@@ -2106,10 +2107,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     }
                 )
             else:
-                if cached and enough and not use_saved:
+                if cached and not use_saved:
                     yield (
-                        "Saved contacts are missing email — checking ZoomInfo "
-                        "automatically…\n"
+                        "Saved list incomplete — checking ZoomInfo for contact "
+                        "details (email/mobile)…\n"
                     )
                 yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
                 results = search_all(

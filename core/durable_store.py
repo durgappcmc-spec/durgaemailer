@@ -1,4 +1,4 @@
-# NOTE: Persist chat / prospects / memory across rebuilds — local-first, Sheets backup.
+# NOTE: Persist chat / prospects / memory across rebuilds — Drive is source of truth.
 from __future__ import annotations
 
 import json
@@ -66,6 +66,29 @@ def _load_local(key: str) -> Optional[Any]:
     except Exception as e:
         print(f"[durable] local load {key} failed: {e}", file=sys.stderr)
         return None
+
+
+def _payload_len(payload: Any) -> int:
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        return len(payload)
+    if payload is None:
+        return 0
+    return 1
+
+
+def _is_empty_payload(payload: Any) -> bool:
+    if payload is None:
+        return True
+    if isinstance(payload, (list, dict)):
+        return len(payload) == 0
+    return False
+
+
+def _local_is_miss(payload: Any) -> bool:
+    """Empty list/dict after a Render rebuild must not block Drive restore."""
+    return payload is None or _is_empty_payload(payload)
 
 
 def _ensure_app_state() -> bool:
@@ -179,7 +202,117 @@ def _write_appstate_key(key: str, text: str) -> bool:
         return False
 
 
-def save_json_blob(key: str, payload: Any, *, sync_sheets: bool = True) -> bool:
+def _protect_drive_upload(key: str, payload: Any, *, allow_empty: bool) -> Any:
+    """Never clobber richer Drive data with empty/sparse post-deploy state.
+
+    Returns the payload to upload, or None to skip the Drive upload.
+    """
+    if key not in _DRIVE_KEYS:
+        return payload
+    if _is_empty_payload(payload) and not allow_empty:
+        print(
+            f"[durable] skip Drive upload for empty {key} (protect cloud data)",
+            file=sys.stderr,
+        )
+        return None
+    if allow_empty:
+        return payload
+    if key not in ("prospect_list", "memory_rows", "chat_messages", "contact_aliases"):
+        return payload
+    if not isinstance(payload, (list, dict)):
+        return payload
+    try:
+        from core.drive_store import download_json
+
+        existing = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
+    except Exception as e:
+        print(f"[durable] drive pre-check {key} failed: {e}", file=sys.stderr)
+        return payload
+    if existing is None:
+        return payload
+    if type(existing) is not type(payload):
+        return payload
+    old_n = _payload_len(existing)
+    new_n = _payload_len(payload)
+    # Accidental wipe: sparse local after rebuild uploading over a full Drive blob
+    if old_n > 0 and new_n < max(3, int(old_n * 0.5)):
+        if key == "prospect_list" and isinstance(existing, list) and isinstance(payload, list):
+            merged = _merge_prospect_lists(existing, payload)
+            print(
+                f"[durable] merge Drive {key}: cloud={old_n} local={new_n} → {len(merged)}",
+                file=sys.stderr,
+            )
+            _save_local(key, merged)
+            return merged
+        if key == "memory_rows" and isinstance(existing, list) and isinstance(payload, list):
+            merged = _merge_memory_rows(existing, payload)
+            print(
+                f"[durable] merge Drive {key}: cloud={old_n} local={new_n} → {len(merged)}",
+                file=sys.stderr,
+            )
+            _save_local(key, merged)
+            return merged
+        if key == "contact_aliases" and isinstance(existing, dict) and isinstance(payload, dict):
+            merged = {**existing, **payload}
+            print(
+                f"[durable] merge Drive {key}: cloud={old_n} local={new_n} → {len(merged)}",
+                file=sys.stderr,
+            )
+            _save_local(key, merged)
+            return merged
+        # chat_messages: keep richer cloud until hydrate succeeds
+        print(
+            f"[durable] skip Drive upload for sparse {key} "
+            f"(cloud={old_n} local={new_n})",
+            file=sys.stderr,
+        )
+        return None
+    return payload
+
+
+def _merge_prospect_lists(
+    existing: list[Any], incoming: list[Any]
+) -> list[dict[str, Any]]:
+    def _key(p: dict[str, Any]) -> str:
+        email = str(p.get("email") or "").strip().lower()
+        if email and "@" in email:
+            return f"email:{email}"
+        sid = str(p.get("source_id") or "").strip().lower()
+        if sid:
+            return f"sid:{sid}"
+        name = str(p.get("name") or "").strip().lower()
+        company = str(
+            p.get("company") or p.get("organization") or p.get("org") or ""
+        ).strip().lower()
+        return f"nc:{name}|{company}"
+
+    by_key: dict[str, dict[str, Any]] = {}
+    for row in list(existing) + list(incoming):
+        if not isinstance(row, dict):
+            continue
+        by_key[_key(row)] = {**by_key.get(_key(row), {}), **row}
+    return list(by_key.values())[-1000:]
+
+
+def _merge_memory_rows(existing: list[Any], incoming: list[Any]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in list(existing) + list(incoming):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or row.get("source_id") or "")
+        if not rid:
+            rid = str(hash(json.dumps(row, sort_keys=True, default=str)))
+        by_id[rid] = row
+    return list(by_id.values())[-1500:]
+
+
+def save_json_blob(
+    key: str,
+    payload: Any,
+    *,
+    sync_sheets: bool = True,
+    allow_empty: bool = False,
+) -> bool:
     """Local write is immediate; large keys sync to Google Drive (not Sheets)."""
     _save_local(key, payload)
     if not sync_sheets:
@@ -188,7 +321,10 @@ def save_json_blob(key: str, payload: Any, *, sync_sheets: bool = True) -> bool:
         try:
             from core.drive_store import upload_json
 
-            return upload_json(_DRIVE_FILE.get(key, f"{key}.json"), payload)
+            to_upload = _protect_drive_upload(key, payload, allow_empty=allow_empty)
+            if to_upload is None:
+                return True
+            return upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
         except Exception as e:
             print(f"[durable] drive save {key} failed: {e}", file=sys.stderr)
             return False
@@ -200,7 +336,9 @@ def save_json_blob(key: str, payload: Any, *, sync_sheets: bool = True) -> bool:
         return False
 
 
-def save_json_blob_async(key: str, payload: Any) -> None:
+def save_json_blob_async(
+    key: str, payload: Any, *, allow_empty: bool = False
+) -> None:
     """Non-blocking Drive/Sheets backup after local save."""
     _save_local(key, payload)
 
@@ -209,7 +347,12 @@ def save_json_blob_async(key: str, payload: Any) -> None:
             if key in _DRIVE_KEYS:
                 from core.drive_store import upload_json
 
-                upload_json(_DRIVE_FILE.get(key, f"{key}.json"), payload)
+                to_upload = _protect_drive_upload(
+                    key, payload, allow_empty=allow_empty
+                )
+                if to_upload is None:
+                    return
+                upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
             else:
                 text = json.dumps(payload, ensure_ascii=False, default=str)
                 _write_appstate_key(key, text)
@@ -220,33 +363,62 @@ def save_json_blob_async(key: str, payload: Any) -> None:
 
 
 def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
-    """Prefer local file (fast). Drive (then Sheets) only if local missing."""
+    """Prefer non-empty local file. Empty/sparse local falls through to Drive."""
     local = _load_local(key)
-    if local is not None:
-        return local
     if not allow_sheets:
-        return None
+        return local
+    cloud: Any = None
     if key in _DRIVE_KEYS:
         try:
             from core.drive_store import download_json
 
-            data = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
-            if data is not None:
-                _save_local(key, data)
-                return data
+            cloud = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
         except Exception as e:
             print(f"[durable] drive load {key} failed: {e}", file=sys.stderr)
+    if cloud is not None and not _is_empty_payload(cloud):
+        # Prefer Drive when local is missing, empty, or much smaller (post-deploy wipe)
+        if _local_is_miss(local):
+            _save_local(key, cloud)
+            return cloud
+        if (
+            isinstance(cloud, list)
+            and isinstance(local, list)
+            and len(cloud) > max(len(local), 2)
+            and len(local) < max(3, int(len(cloud) * 0.5))
+        ):
+            print(
+                f"[durable] prefer Drive {key}: cloud={len(cloud)} local={len(local)}",
+                file=sys.stderr,
+            )
+            _save_local(key, cloud)
+            return cloud
+        if (
+            isinstance(cloud, dict)
+            and isinstance(local, dict)
+            and len(cloud) > len(local)
+            and len(local) < max(2, int(len(cloud) * 0.5))
+        ):
+            _save_local(key, cloud)
+            return cloud
+    if local is not None and not _local_is_miss(local):
+        return local
+    if cloud is not None:
+        if not _is_empty_payload(cloud):
+            _save_local(key, cloud)
+        return cloud
     try:
         flat = _read_appstate_map()
         raw = flat.get(key)
         if not raw:
-            return None
+            return local
         data = json.loads(raw)
-        _save_local(key, data)
-        return data
+        if not _is_empty_payload(data):
+            _save_local(key, data)
+            return data
+        return local if local is not None else data
     except Exception as e:
         print(f"[durable] load {key} failed: {e}", file=sys.stderr)
-        return None
+        return local
 
 
 def _slim_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -280,7 +452,8 @@ def load_chat_messages(*, allow_sheets: bool = True) -> list[dict[str, Any]]:
 
 
 def clear_chat_messages() -> bool:
-    save_json_blob_async("chat_messages", [])
+    # Explicit wipe — allow empty Drive upload
+    save_json_blob_async("chat_messages", [], allow_empty=True)
     return True
 
 
@@ -292,6 +465,14 @@ def save_session_extras(
     payload = _load_local("session_extras") or {}
     if not isinstance(payload, dict):
         payload = {}
+    # Prefer cloud base when local extras are empty (post-deploy)
+    if not payload:
+        try:
+            cloud = load_json_blob("session_extras", allow_sheets=True)
+            if isinstance(cloud, dict) and cloud:
+                payload = dict(cloud)
+        except Exception:
+            pass
     if prospects is not None:
         slim = []
         for p in (prospects or [])[:80]:
@@ -378,7 +559,7 @@ def hydrate_session_fast(session_state: Any) -> None:
 
 
 def hydrate_chat_from_sheets_if_empty(session_state: Any) -> bool:
-    """One Sheets round-trip only when local chat is empty (post-deploy cold start)."""
+    """One Drive/Sheets round-trip only when local chat is empty (post-deploy)."""
     if session_state.get("messages"):
         return False
     if session_state.get("_chat_sheets_tried"):
@@ -399,13 +580,25 @@ def hydrate_chat_from_sheets_if_empty(session_state: Any) -> bool:
     return False
 
 
+def hydrate_prospects_from_drive() -> int:
+    """Force-pull prospect list from Drive into local cache. Returns contact count."""
+    try:
+        data = load_json_blob("prospect_list", allow_sheets=True)
+        if isinstance(data, list):
+            return len([r for r in data if isinstance(r, dict)])
+    except Exception as e:
+        print(f"[durable] prospect hydrate failed: {e}", file=sys.stderr)
+    return 0
+
+
 def pull_sheets_into_local_async() -> None:
-    """Background: fill local cache from Drive/Sheets if local keys are empty."""
+    """Background: fill local cache from Drive/Sheets when local keys are empty."""
 
     def _run() -> None:
         try:
             for key in ("chat_messages", "session_extras", "memory_rows", "prospect_list"):
-                if _load_local(key) is not None:
+                local = _load_local(key)
+                if local is not None and not _local_is_miss(local):
                     continue
                 load_json_blob(key, allow_sheets=True)
         except Exception as e:

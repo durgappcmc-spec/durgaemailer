@@ -32,6 +32,8 @@ services:
         sync: false
       - key: GOOGLE_SHEET_ID
         sync: false
+      - key: RELAY_DRIVE_FOLDER_ID
+        sync: false
       - key: APPS_SCRIPT_TRACKING_URL
         sync: false
       - key: GMAIL_TOKEN_JSON

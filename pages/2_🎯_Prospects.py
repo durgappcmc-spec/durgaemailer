@@ -8,13 +8,28 @@ from connectors.ingest_to_memory import ingest_prospects, prospects_to_dataframe
 from connectors.prospects import enrich_fallthrough, search_all
 from core.auth_ui import logout_button, require_login
 from core.auto_sync import auto_ingest_prospects, ensure_session_sync
-from core.prospect_list import all_prospects, repair_saved_prospects, search_saved
+from core.prospect_list import (
+    all_prospects,
+    reload_from_drive,
+    repair_saved_prospects,
+    search_saved,
+)
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
 if not require_login():
     st.stop()
 logout_button()
 ensure_session_sync(st.session_state)
+
+# After each deploy Render disk is empty — pull Drive before any save can clobber it
+if not st.session_state.get("_prospects_drive_hydrated"):
+    st.session_state._prospects_drive_hydrated = True
+    try:
+        n_cloud = reload_from_drive()
+        if n_cloud:
+            st.toast(f"Restored **{n_cloud}** contacts from Google Drive")
+    except Exception:
+        pass
 
 # One-time repair of name/email mix-ups on the durable list
 if not st.session_state.get("_prospects_repaired"):
@@ -28,9 +43,9 @@ if not st.session_state.get("_prospects_repaired"):
 
 st.title("🎯 Prospects")
 st.caption(
-    "Search results auto-save to your **prospect list**. "
-    "Asking again reuses contacts that already have email; "
-    "missing email triggers ZoomInfo automatically (say **refresh** to force a full re-search)."
+    "Search results auto-save to your **prospect list** on Google Drive. "
+    "Contacts and chat memory survive redeploys. "
+    "Missing email triggers ZoomInfo automatically (say **refresh** to force a full re-search)."
 )
 
 n_saved = 0
@@ -49,11 +64,12 @@ with tab_saved:
     q_name = c1.text_input("Search by name / email / title", key="saved_name")
     q_org = c2.text_input("Search by organisation", key="saved_org")
     if c3.button("Refresh list", use_container_width=True, key="saved_refresh"):
-        # Force reload from disk/Drive
-        import core.prospect_list as pl
-
-        pl._LOADED = False
-        pl._CACHE = None
+        # Force reload from Drive
+        try:
+            n = reload_from_drive()
+            st.toast(f"Loaded {n} contacts from Drive")
+        except Exception as e:
+            st.warning(f"Drive reload failed: {e}")
         st.rerun()
 
     try:
