@@ -34,8 +34,9 @@ _CC_BLOCK_RE = re.compile(
 _TO_BLOCK_RE = re.compile(
     r"\b(?:"
     r"to(?:\s*[:=])?|"
-    r"email(?:\s+to)?|"
-    r"mail(?:\s+to)?|"
+    # "email like info@…" is a Sent template, not To — do not match "email like"
+    r"email(?!\s+like\b)(?:\s+to)?|"
+    r"mail(?!\s+like\b)(?:\s+to)?|"
     r"recipient(?:s)?|"
     r"send(?:\s+to)?"
     r")\s+(.+?)(?="
@@ -93,11 +94,15 @@ Critical:
 - Also support recipient email as the Sent reference:
   "create draft email like info@magicbusindia.org in sent items" → like_sent_to=that email
   (do NOT put that address in to_emails — it is the template source, not the new To).
+  Put the NEW recipient in to_emails from chat history / "previous email" / current org contact.
 - If they give a Gmail message id / "email id" / list number from a prior Sent pull
   (e.g. "create draft from message id 18abc…" or "draft like #2 from sent"),
   use draft_email and set like_sent_message_id. Read like_sent_to / like_sent_for from
   recent chat when they say "like that" / "same as before" / "for Flipkart" without repeating the company.
 - Always use recent chat history for recipients, company names, and which prior email to clone.
+  When they say "to previous email" / "as per chat", set to_emails from earlier turns — never the like_sent_to address.
+- Never invent to_emails, CC, companies, or message ids that are not in the user message or recent chat.
+  If missing, leave arrays empty rather than guessing.
 """
 
 
@@ -136,6 +141,9 @@ class IntentPlan:
         if fe:
             out.add(fe)
         out.add("csr@karunamedia.org")
+        # Sent-template address must never become the new draft's To
+        if self.like_sent_to and "@" in self.like_sent_to:
+            out.add(self.like_sent_to.lower())
         return out
 
 
@@ -495,6 +503,82 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
     return None
 
 
+def wants_previous_chat_recipient(user_msg: str) -> bool:
+    """True when user wants the To address from earlier chat, not the template."""
+    msg = user_msg or ""
+    return bool(
+        re.search(
+            r"\b("
+            r"(?:previous|prior|earlier|same|last)\s+"
+            r"(?:email|recipient|contact|address|person|one|org|organisation|organization)|"
+            r"as per (?:the )?chat|"
+            r"from (?:the )?(?:chat|history|conversation)|"
+            r"current (?:org|organisation|organization|company|prospect)|"
+            r"send (?:it )?to (?:them|him|her|that)|"
+            r"draft (?:it )?to (?:them|him|her|that)"
+            r")\b",
+            msg,
+            re.I,
+        )
+    )
+
+
+def resolve_to_emails_from_history(
+    history: Optional[list[dict[str, str]]] = None,
+    *,
+    exclude: Optional[set[str]] = None,
+) -> list[str]:
+    """Pull To addresses from recent chat (never template/like-sent addresses)."""
+    exclude = {e.lower() for e in (exclude or set())}
+    # Walk newest → oldest; return the first turn that yields To candidates
+    for m in reversed(history or []):
+        content = str(m.get("content") or "")
+        role = (m.get("role") or "").lower()
+        if not content:
+            continue
+        found: list[str] = []
+
+        # Block any like-sent template email mentioned in this turn
+        parsed = parse_like_sent_request(content)
+        if parsed and parsed.get("reference") and "@" in parsed["reference"]:
+            exclude.add(parsed["reference"].lower())
+
+        if role == "assistant":
+            for em in re.findall(
+                r"(?:Draft|Sent|Drafted)\s*→\s*"
+                r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+                content,
+                re.I,
+            ):
+                found.append(em)
+            for em in re.findall(
+                r"(?:to|recipient)\s*[:=]\s*"
+                r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+                content,
+                re.I,
+            ):
+                found.append(em)
+        else:
+            roles = classify_email_roles(content)
+            found.extend(roles.to)
+            # Explicit "to person@x.com" outside blocks
+            for em in _EMAIL_RE.findall(content):
+                # Skip if this message is only a like-sent clone request
+                if parsed and (parsed.get("reference") or "").lower() == em.lower():
+                    continue
+                if re.search(
+                    rf"\b(?:to|draft|send|email|mail|recipient)\b[^\n]{{0,40}}{re.escape(em)}",
+                    content,
+                    re.I,
+                ):
+                    found.append(em)
+
+        cleaned = _uniq(found, exclude=exclude)
+        if cleaned:
+            return cleaned
+    return []
+
+
 def org_label_from_email(email: str) -> str:
     """magicbusindia.org → magicbusindia (for company-name swap)."""
     email = (email or "").strip()
@@ -820,6 +904,13 @@ Return JSON:
         to_emails = [
             e for e in to_emails if e.lower() != like_sent_to.lower()
         ]
+        exclude.add(like_sent_to.lower())
+
+    # For like-sent / "previous email as per chat", take To from recent history
+    if (
+        like_sent_to or like_sent_message_id or wants_previous_chat_recipient(user_msg)
+    ) and not to_emails:
+        to_emails = resolve_to_emails_from_history(history, exclude=exclude)
 
     if (
         like_sent_to or like_sent_message_id or looks_like_history_email_clone(user_msg)

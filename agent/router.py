@@ -25,12 +25,18 @@ from agent.intent import (
     plan_request,
     plan_summary,
     resolve_like_sent_from_history,
+    resolve_to_emails_from_history,
+    wants_previous_chat_recipient,
 )
 from agent.research_pipeline import (
     discover_orgs_from_web,
     iter_enrich_orgs_on_zoominfo,
     run_research_then_zoom,
     wants_research_then_zoom,
+)
+from agent.session_context import (
+    chat_grounding_system,
+    prefers_chat_over_search,
 )
 from agent.run_control import is_cancelled, stopped_message
 from agent.limits import (
@@ -121,6 +127,8 @@ Rules:
 - If user says ignore/skip/don't use an email, never route it as a recipient.
 - Chat may include file attachments; do not mention them in the routing line.
 - When prefixed with [ATTACHED FILES: ...], files are already uploaded — do not ask to attach.
+- Use recent chat history for follow-ups (previous recipient, company, like-sent template).
+  Do not invent emails or orgs that are not in the conversation.
 
 Output NOTHING except the single routing line.
 """
@@ -369,19 +377,24 @@ Rules for recipients:
 - Addresses after "cc" go ONLY in cc (include every one).
 - Addresses after ignore/skip/don't use go ONLY in ignore_emails.
 - Do not invent NGO lists; extract the email job only.
-- If the latest message is a short follow-up ("draft to them", "same for Flipkart"),
-  pull To/CC/subject/body intent from earlier messages in the conversation.
+- If the latest message is a short follow-up ("draft to them", "same for Flipkart",
+  "as per chat", "previous email"), pull To/CC/subject/body intent from earlier
+  messages in the conversation. NEVER invent a recipient email.
+- A Sent-template address ("like info@… in sent") is NOT the new To unless the
+  user explicitly asks to email that same address.
 
 Rules for html_body:
 - If uploaded document text is provided, write a clear professional email that uses
   the important facts/offers/details from that document (do not dump the raw PDF).
 - Keep HTML simple (<p>, <ul>/<li>, <strong>).
 - If the user already drafted body text in prior chat turns, prefer refining that.
+- Do not invent program details, amounts, or links that were not in the conversation
+  or uploaded documents.
 - For bulk follow-ups from inbox/sent, use placeholders
   {{first_name}}, {{name}}, {{company}}, {{prior_subject}}, {{prior_summary}}
   so each recipient gets a personalized message.
 
-Conversation:
+Conversation (source of truth — do not contradict or invent beyond it):
 {hist_txt}
 
 Latest user message:
@@ -394,7 +407,8 @@ Seed fields already known (prefer newer message if conflict):
         raw = extract_json(
             prompt,
             system=(
-                "Extract email fields. Support multiple recipients. "
+                "Extract email fields from conversation only. "
+                "Never invent recipient emails or body facts not present in chat/docs. "
                 "When document text is present, ground the email body in it. "
                 "Return valid JSON only."
             ),
@@ -1350,7 +1364,11 @@ def route(user_msg: str, history: Optional[list[dict[str, str]]] = None) -> str:
     """Ask Gemini for a single-line routing decision."""
     messages = [{"role": "user", "content": user_msg}]
     if history:
-        trimmed = history[-6:]
+        # Keep more turns so follow-ups resolve from chat, not hallucination
+        trimmed = []
+        for m in history[-12:]:
+            content = (m.get("content") or "")[:1200]
+            trimmed.append({"role": m.get("role") or "user", "content": content})
         messages = trimmed + messages
     try:
         # Keep max_tokens modest — schedule bodies are extracted separately.
@@ -1670,17 +1688,21 @@ def answer(
             return
 
         if routing.startswith("MEMORY"):
-            hits = mem.search(user_msg, k=5)
-            ctx = mem.format_for_prompt(hits)
-            system = (
-                "Answer using ONLY the memory context below when possible. "
-                "Cite with [n] markers.\n\n" + ctx
+            hits = mem.search(user_msg, k=8)
+            system = chat_grounding_system(
+                history=history,
+                prospects=prospects,
+                mailbox_messages=mailbox_messages,
+                memory_hits=hits,
+                document_context=doc_context,
+                attachment_names=att_names or None,
             )
-            if used_docs:
-                system += (
-                    "\n\nAlso use this uploaded file context when relevant:\n"
-                    + doc_context
-                )
+            system = (
+                "Answer using saved memory + chat/session context. "
+                "Cite memory with [n] when using saved notes. "
+                "Do not invent facts not present in memory or chat.\n\n"
+                + system
+            )
             for chunk in chat_grounded(
                 user_msg, history=history, system=system, use_search=False
             ):
@@ -2756,17 +2778,74 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                         if plan.ignore_emails:
                             payload["ignore_emails"] = plan.ignore_emails
 
-                        # Recipients: explicit To → matching prospects → all prospects
-                        if plan.to_emails:
-                            if len(plan.to_emails) == 1:
-                                payload["recipient_email"] = plan.to_emails[0]
+                        # Recipients = current org / prior chat To — NEVER the Sent template
+                        block = set(plan.non_recipient_emails())
+                        if like_ref and "@" in like_ref:
+                            block.add(like_ref.lower())
+                        # Domain of template (e.g. magicbusindia.org) — don't draft to same domain by mistake
+                        if like_ref and "@" in like_ref:
+                            try:
+                                block.add(like_ref.split("@", 1)[1].lower())
+                            except Exception:
+                                pass
+
+                        recipients: list[str] = [
+                            e
+                            for e in (plan.to_emails or [])
+                            if e
+                            and e.lower() not in block
+                            and not (
+                                like_ref
+                                and "@" in like_ref
+                                and e.lower().endswith(
+                                    "@" + like_ref.split("@", 1)[1].lower()
+                                )
+                            )
+                        ]
+                        if not recipients or wants_previous_chat_recipient(
+                            user_msg or ""
+                        ):
+                            hist_tos = resolve_to_emails_from_history(
+                                history, exclude=block
+                            )
+                            # Prefer history when user asked for previous/chat recipient
+                            if wants_previous_chat_recipient(user_msg or "") and hist_tos:
+                                recipients = hist_tos
+                            elif not recipients:
+                                recipients = hist_tos
+
+                        if recipients:
+                            if len(recipients) == 1:
+                                payload["recipient_email"] = recipients[0]
                             else:
-                                payload["recipient_emails"] = plan.to_emails
+                                payload["recipient_emails"] = recipients
                                 payload["batch"] = True
+                            yield (
+                                f"_To (from chat / request): "
+                                f"{', '.join(recipients[:5])}"
+                                + (
+                                    f" +{len(recipients) - 5} more"
+                                    if len(recipients) > 5
+                                    else ""
+                                )
+                                + "_\n"
+                            )
                         elif prospects:
                             matched = _prospects_for_company(
                                 prospects, target_company
                             )
+                            # Drop any prospect that is the Sent template address/domain
+                            filtered_m = []
+                            for p in matched:
+                                em = (p.get("email") or "").strip()
+                                if not em or em.lower() in block:
+                                    continue
+                                if like_ref and "@" in like_ref:
+                                    dom = like_ref.split("@", 1)[1].lower()
+                                    if em.lower().endswith("@" + dom):
+                                        continue
+                                filtered_m.append(p)
+                            matched = filtered_m
                             if matched:
                                 payload["batch"] = True
                                 payload["from_prospects"] = True
@@ -2782,15 +2861,76 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                                         p["why_match"] = (
                                             composed.get("alignment_summary") or ""
                                         )[:240]
+                            else:
+                                yield (
+                                    "_No matching prospects for the **current** org "
+                                    "(skipped Magic Bus / template domain). "
+                                    "Give a To address from chat, e.g. "
+                                    "`draft to person@currentorg.org`._\n"
+                                )
+
+                        # Sanitize user_msg so _build_draft_jobs cannot re-scrape
+                        # the template email as To via "email like info@…"
+                        draft_msg = user_msg or ""
+                        if like_ref and "@" in like_ref:
+                            draft_msg = re.sub(
+                                re.escape(like_ref),
+                                "[sent-template]",
+                                draft_msg,
+                                flags=re.I,
+                            )
 
                         jobs = _build_draft_jobs(
                             payload,
-                            user_msg,
+                            draft_msg,
                             history=history,
                             prospects=prospects,
                             mailbox_messages=None,  # never follow-up path
                             plan=plan,
                         )
+                        # Hard filter: drop any job still addressed to the template
+                        safe_jobs = []
+                        for job in jobs:
+                            em = (job.get("recipient_email") or "").strip().lower()
+                            if not em or em in block:
+                                continue
+                            if like_ref and "@" in like_ref:
+                                dom = like_ref.split("@", 1)[1].lower()
+                                if em.endswith("@" + dom):
+                                    continue
+                            safe_jobs.append(job)
+                        if jobs and not safe_jobs:
+                            yield (
+                                "_Blocked draft(s) to the Sent **template** address "
+                                f"(`{like_ref}`). Using chat history for To instead…_\n"
+                            )
+                            hist_tos = resolve_to_emails_from_history(
+                                history, exclude=block
+                            )
+                            if hist_tos:
+                                payload.pop("from_prospects", None)
+                                payload.pop("use_prospects", None)
+                                if len(hist_tos) == 1:
+                                    payload["recipient_email"] = hist_tos[0]
+                                    payload.pop("recipient_emails", None)
+                                else:
+                                    payload["recipient_emails"] = hist_tos
+                                    payload["batch"] = True
+                                jobs = _build_draft_jobs(
+                                    payload,
+                                    draft_msg,
+                                    history=history,
+                                    prospects=None,
+                                    mailbox_messages=None,
+                                    plan=plan,
+                                )
+                                safe_jobs = [
+                                    j
+                                    for j in jobs
+                                    if (j.get("recipient_email") or "").lower()
+                                    not in block
+                                ]
+                        jobs = safe_jobs
                         # Fill company / alignment placeholders for explicit To rows
                         if jobs and (
                             target_company or composed.get("alignment_summary")
@@ -2855,8 +2995,10 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                         if not jobs:
                             yield (
                                 f"I wrote a **{like_ref}**-style email for "
-                                f"**{target_company or 'your target'}**, but need a "
-                                "recipient. Give a To address, or load prospects first.\n\n"
+                                f"**{target_company or 'your current org'}**, but need the "
+                                "**To** address from your chat (not the Sent template). "
+                                "Say e.g. `draft to person@currentorg.org` or "
+                                "`use the previous email from chat`.\n\n"
                                 f"**Subject:** {payload.get('subject')}\n\n"
                                 f"{payload.get('html_body')}\n"
                             )
@@ -3169,24 +3311,32 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                     consumed_attachments = True
 
         else:
-            # CHAT (default) — uploaded files are context for ANY question
-            if att_names:
-                system = (
-                    "The user uploaded these files for context (any topic — not only email): "
-                    f"{', '.join(att_names)}. "
-                    "Do NOT ask them to re-upload. Use the extracted content below to answer. "
-                    "If they later ask to draft/send an email and want the file attached, "
-                    "the same staged files will be attached automatically.\n\n"
-                    f"{doc_context or '(binary/attach-only file — note it exists)'}"
-                )
-            else:
-                system = (
-                    "Files can be uploaded via the chat paperclip for context. "
-                    "If they ask to attach a file to an email and none is uploaded yet, "
-                    "ask them to use the paperclip first. Do not invent file contents."
-                )
+            # CHAT (default) — ground in chat/session memory; avoid inventing facts
+            mem_hits = None
+            try:
+                if prefers_chat_over_search(user_msg) or re.search(
+                    r"\b(remember|recall|what did|who did|which email)\b",
+                    user_msg or "",
+                    re.I,
+                ):
+                    mem_hits = mem.search(user_msg, k=6)
+            except Exception as e:
+                print(f"[router] memory search: {e}", file=sys.stderr)
+            system = chat_grounding_system(
+                history=history,
+                prospects=prospects,
+                mailbox_messages=mailbox_messages,
+                memory_hits=mem_hits,
+                document_context=doc_context if used_docs else "",
+                attachment_names=att_names or None,
+            )
+            # Prefer chat facts over web when user refers to prior conversation
+            use_search = not prefers_chat_over_search(user_msg)
             for chunk in chat_grounded(
-                user_msg, history=history, system=system, use_search=not bool(att_names)
+                user_msg,
+                history=history,
+                system=system,
+                use_search=use_search,
             ):
                 if isinstance(chunk, dict) and "__meta__" in chunk:
                     sources = chunk["__meta__"].get("sources") or []

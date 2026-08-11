@@ -26,11 +26,15 @@ def _get_client() -> genai.Client:
 
 def _history_to_contents(
     history: Optional[list[dict[str, str]]],
+    *,
+    max_turns: int = 16,
+    max_chars_per_msg: int = 2500,
 ) -> list[types.Content]:
+    """Convert chat history for Gemini, keeping recent turns (trimmed per message)."""
     contents: list[types.Content] = []
     if not history:
         return contents
-    for msg in history:
+    for msg in history[-max_turns:]:
         role = msg.get("role", "user")
         # Gemini expects "user" | "model"
         if role == "assistant":
@@ -38,6 +42,8 @@ def _history_to_contents(
         if role not in ("user", "model"):
             role = "user"
         text = msg.get("content") or msg.get("text") or ""
+        if len(text) > max_chars_per_msg:
+            text = text[: max_chars_per_msg - 1] + "…"
         contents.append(
             types.Content(role=role, parts=[types.Part(text=text)])
         )
