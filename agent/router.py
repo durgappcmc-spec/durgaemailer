@@ -1849,7 +1849,8 @@ def answer(
                 )
                 yield (
                     f"\nSaved contacts to your **prospect list** "
-                    f"(reuse for the same org without ZoomInfo).\n"
+                    f"(reused next time when email is already on file; "
+                    f"missing email auto-checks ZoomInfo).\n"
                 )
             except Exception as e:
                 print(f"[router] research auto-ingest error: {e}", file=sys.stderr)
@@ -2039,6 +2040,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
 
             from core.prospect_list import (
                 lookup_for_query,
+                saved_contacts_are_usable,
                 wants_force_refresh,
             )
 
@@ -2054,8 +2056,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 or q.get("domains")
             )
             enough = len(cached) >= (1 if specific else min(3, max(limit, 1)))
+            # Reuse list only when emails are already present; otherwise auto ZoomInfo
+            use_saved = bool(
+                cached and enough and saved_contacts_are_usable(cached, min_with_email=1)
+            )
 
-            if cached and enough:
+            if use_saved:
                 ok = cached[:limit]
                 errs: list[dict[str, Any]] = []
                 prospect_out = ok
@@ -2068,8 +2074,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 with_email = sum(1 for p in ok if (p.get("email") or "").strip())
                 yield (
                     f"Using **{len(ok)}** saved contacts from your prospect list "
-                    f"(**{with_email}** with email) — skipped ZoomInfo. "
-                    f"Say **refresh** to search ZoomInfo again.\n\n"
+                    f"(**{with_email}** with email).\n\n"
                 )
                 yield "\n".join(ctx_lines)
                 if saved_ids:
@@ -2101,6 +2106,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     }
                 )
             else:
+                if cached and enough and not use_saved:
+                    yield (
+                        "Saved contacts are missing email — checking ZoomInfo "
+                        "automatically…\n"
+                    )
                 yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
                 results = search_all(
                     q, providers=tuple(providers), limit_per_provider=limit
@@ -2158,7 +2168,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     if saved_ids:
                         yield (
                             f"\n\nSaved **{len(saved_ids)}** contacts to your prospect list "
-                            f"(reuse next time without ZoomInfo)."
+                            f"(reused when email is on file; missing email auto-checks ZoomInfo)."
                         )
                     yield (
                         "\n\nNext: `draft emails to all these prospects` or "
@@ -2214,7 +2224,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
             if not ident:
                 ident = {"name": user_msg}
 
-            from core.prospect_list import find_by_person, wants_force_refresh
+            from core.prospect_list import (
+                find_by_person,
+                has_email,
+                wants_force_refresh,
+            )
 
             result = None
             name_hint = (
@@ -2234,11 +2248,18 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     name_hint, company=str(ident.get("company") or ""), limit=5
                 )
                 if cached_people:
-                    result = cached_people[0]
-                    yield (
-                        f"Found **{result.get('name') or 'contact'}** on your saved "
-                        f"prospect list — skipped ZoomInfo. Say **refresh** to re-enrich.\n"
-                    )
+                    best = next((p for p in cached_people if has_email(p)), None)
+                    if best is not None:
+                        result = best
+                        yield (
+                            f"Found **{result.get('name') or 'contact'}** on your saved "
+                            f"prospect list (email already on file).\n"
+                        )
+                    else:
+                        yield (
+                            f"Saved **{cached_people[0].get('name') or 'contact'}** "
+                            "has no email — checking ZoomInfo automatically…\n"
+                        )
 
             if result is None:
                 yield "Enriching contact…\n"

@@ -29,7 +29,8 @@ if not st.session_state.get("_prospects_repaired"):
 st.title("🎯 Prospects")
 st.caption(
     "Search results auto-save to your **prospect list**. "
-    "Asking again for the same org/person reuses the list (no ZoomInfo) unless you say **refresh**."
+    "Asking again reuses contacts that already have email; "
+    "missing email triggers ZoomInfo automatically (say **refresh** to force a full re-search)."
 )
 
 n_saved = 0

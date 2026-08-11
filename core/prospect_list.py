@@ -352,6 +352,29 @@ def search_saved(
     return hits
 
 
+def has_email(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    return bool((row.get("email") or "").strip())
+
+
+def count_with_email(rows: list[dict[str, Any]] | None) -> int:
+    return sum(1 for p in (rows or []) if has_email(p))
+
+
+def saved_contacts_are_usable(
+    rows: list[dict[str, Any]] | None,
+    *,
+    min_with_email: int = 1,
+) -> bool:
+    """True when saved contacts already have enough emails (skip ZoomInfo).
+
+    Missing email/phone is not “enough” — callers should auto ZoomInfo instead
+    of asking the user to say refresh.
+    """
+    return count_with_email(rows) >= max(1, int(min_with_email or 1))
+
+
 def wants_force_refresh(user_msg: str) -> bool:
     return bool(
         re.search(

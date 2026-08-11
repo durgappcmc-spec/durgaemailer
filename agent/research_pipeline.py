@@ -119,15 +119,19 @@ def enrich_one_org_on_zoominfo(
             "notes": ["skipped - no name/domain"],
         }
 
-    # Reuse saved prospect list for this org before ZoomInfo
+    # Reuse saved prospect list only when emails are already present
     try:
-        from core.prospect_list import find_by_company, save_prospects
+        from core.prospect_list import (
+            find_by_company,
+            save_prospects,
+            saved_contacts_are_usable,
+        )
 
         saved = find_by_company(name or domain, limit=contacts_per_org)
         if domain and not saved:
             saved = find_by_company(domain, limit=contacts_per_org)
-        if saved:
-            notes.append(f"prospect list hit ({len(saved)} saved)")
+        if saved and saved_contacts_are_usable(saved, min_with_email=1):
+            notes.append(f"prospect list hit ({len(saved)} saved with email)")
             contacts = []
             seen: set[str] = set()
             for r in saved:
@@ -164,6 +168,10 @@ def enrich_one_org_on_zoominfo(
                 "with_mobile": with_mobile,
                 "notes": notes,
             }
+        if saved:
+            notes.append(
+                f"prospect list had {len(saved)} without email — auto ZoomInfo"
+            )
     except Exception as e:
         notes.append(f"prospect list skip: {e}")
 
