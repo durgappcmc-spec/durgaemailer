@@ -1,9 +1,23 @@
-# NOTE: Shared draft inspector — preview, tracking pill, edit, send now.
+# NOTE: Shared draft inspector — WYSIWYG edit, attachments, preview, send.
 from __future__ import annotations
 
+import base64
 from typing import Any, Optional
 
 import streamlit as st
+
+# Quill toolbar: normal email formatting (bold / font / bullets / …)
+_QUILL_TOOLBAR = [
+    [{"header": [1, 2, 3, False]}],
+    [{"font": []}],
+    [{"size": ["small", False, "large", "huge"]}],
+    ["bold", "italic", "underline", "strike"],
+    [{"color": []}, {"background": []}],
+    [{"list": "ordered"}, {"list": "bullet"}],
+    [{"align": []}],
+    ["link"],
+    ["clean"],
+]
 
 
 def render_draft_inspector(
@@ -61,8 +75,20 @@ def render_draft_inspector(
         if title or company:
             bits = [b for b in (title, company) if b]
             st.caption(" · ".join(bits))
-        if draft.get("gmail_draft_id") or str(draft.get("draft_id") or "").startswith("gmail:"):
-            st.caption(f"Gmail draft · `{draft.get('gmail_draft_id') or draft.get('draft_id')}`")
+        if draft.get("gmail_draft_id") or str(draft.get("draft_id") or "").startswith(
+            "gmail:"
+        ):
+            st.caption(
+                f"Gmail draft · `{draft.get('gmail_draft_id') or draft.get('draft_id')}`"
+            )
+        atts = draft.get("attachments") or []
+        if atts:
+            names = [
+                str(a.get("name") or a.get("filename") or "file")
+                for a in atts
+                if isinstance(a, dict)
+            ]
+            st.caption("📎 " + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
     with cols[1]:
         if tid or has_pixel:
             st.markdown("🔒 **tracked** (open pixel)")
@@ -97,7 +123,6 @@ def render_draft_inspector(
                         f"Sent · message_id={result.get('message_id')} · "
                         f"tracking={result.get('tracking_id') or tid or '—'}"
                     )
-                    # mark drive copy sent
                     try:
                         from core import drive_db
 
@@ -181,9 +206,14 @@ def render_draft_inspector(
                     st.info(f"Evidence: {ref}")
         conf = draft.get("confidence")
         if conf is not None:
-            st.metric("Confidence", f"{float(conf):.0%}" if float(conf) <= 1 else str(conf))
+            st.metric(
+                "Confidence",
+                f"{float(conf):.0%}" if float(conf) <= 1 else str(conf),
+            )
         if not brief and not ledger:
-            st.caption("No intelligence brief attached (Chat/Gmail drafts are still sendable).")
+            st.caption(
+                "No intelligence brief attached (Chat/Gmail drafts are still sendable)."
+            )
 
     with tab_trace:
         events = trace or []
@@ -205,39 +235,243 @@ def render_draft_inspector(
                     st.json(ev)
 
     with tab_edit:
-        subject = st.text_input(
-            "Subject",
-            value=draft.get("subject") or "",
-            key=f"{key_prefix}_subj",
-        )
-        body = st.text_area(
-            "HTML body",
-            value=draft.get("body_html") or draft.get("html") or "",
-            height=280,
-            key=f"{key_prefix}_body",
-        )
-        if st.button("Save (re-inject tracking)", key=f"{key_prefix}_save"):
-            from core.tracking import inject_tracking
-            from core import drive_db
+        _render_edit_tab(draft, tid=tid, key_prefix=key_prefix)
 
-            html, new_tid = inject_tracking(
-                body,
-                tracking_id=tid or None,
-                recipient_email=draft.get("to") or draft.get("recipient") or "",
-                subject=subject,
-                register=False,
+
+def _render_edit_tab(
+    draft: dict[str, Any], *, tid: str, key_prefix: str
+) -> None:
+    from core.tracking import inject_tracking, strip_tracking
+    from core import drive_db
+    from gmail_client.attachments import files_to_attachments
+
+    st.caption(
+        "Edit like a normal email — bold, font, bullets, links. "
+        "Tracking pixel is re-added automatically on save."
+    )
+    draft_key = str(draft.get("draft_id") or "local").replace(":", "_")
+    k = f"{key_prefix}_{draft_key}"
+    subject = st.text_input(
+        "Subject",
+        value=draft.get("subject") or "",
+        key=f"{k}_subj",
+    )
+
+    raw_html = draft.get("body_html") or draft.get("html") or ""
+    try:
+        edit_html = strip_tracking(raw_html)
+    except Exception:
+        edit_html = raw_html
+
+    body_html = _rich_text_editor(
+        edit_html,
+        key=f"{k}_quill",
+    )
+
+    existing = list(draft.get("attachments") or [])
+    keep_flags: list[bool] = []
+    if existing:
+        st.markdown("**Current attachments**")
+        for i, att in enumerate(existing):
+            if not isinstance(att, dict):
+                keep_flags.append(False)
+                continue
+            label = (
+                f"{att.get('name') or att.get('filename') or 'file'} "
+                f"({_fmt_size(att.get('size'))})"
             )
-            draft["subject"] = subject
-            draft["body_html"] = html
-            draft["tracking_id"] = new_tid
-            draft["has_open_pixel"] = True
-            did = draft.get("draft_id")
-            if did:
-                drive_db.save_draft(did, draft)
-                st.success(f"Saved · tracking_id preserved ({new_tid[:8]}…)")
+            keep_flags.append(
+                st.checkbox(
+                    label,
+                    value=True,
+                    key=f"{k}_keep_att_{i}_{att.get('name') or i}",
+                )
+            )
+    else:
+        st.caption("No files attached yet.")
+
+    uploads = st.file_uploader(
+        "Attach files",
+        accept_multiple_files=True,
+        key=f"{k}_upload",
+        help="PDF, Word, Excel, images, etc. Included when you save / send.",
+    )
+
+    c1, c2 = st.columns(2)
+    save = c1.button("💾 Save draft", type="primary", key=f"{k}_save")
+    show_html = c2.checkbox(
+        "Show HTML (advanced)",
+        value=False,
+        key=f"{k}_show_html",
+    )
+    if show_html:
+        st.code(body_html or "", language="html")
+
+    if not save:
+        return
+
+    kept = [a for a, keep in zip(existing, keep_flags) if keep and isinstance(a, dict)]
+    new_atts = files_to_attachments(list(uploads) if uploads else [])
+    # Dedupe by filename — new uploads replace same-named existing
+    by_name: dict[str, dict] = {}
+    for a in kept:
+        by_name[str(a.get("name") or a.get("filename") or "").lower()] = a
+    for a in new_atts:
+        by_name[str(a.get("name") or "").lower()] = a
+    merged = list(by_name.values())
+    total = sum(int(a.get("size") or 0) for a in merged)
+    if total > 20 * 1024 * 1024:
+        st.error(
+            f"Attachments total {_fmt_size(total)} — keep under 20 MB for Gmail."
+        )
+        return
+
+    html, new_tid = inject_tracking(
+        body_html or "",
+        tracking_id=tid or None,
+        recipient_email=draft.get("to") or draft.get("recipient") or "",
+        subject=subject,
+        register=False,
+    )
+    draft["subject"] = subject
+    draft["body_html"] = html
+    draft["tracking_id"] = new_tid
+    draft["has_open_pixel"] = True
+    draft["attachments"] = _attachments_for_storage(merged)
+
+    did = draft.get("draft_id")
+    if did:
+        try:
+            drive_db.save_draft(did, draft)
+        except Exception as e:
+            st.error(f"Drive save failed: {e}")
+            return
+
+    gmail_id = draft.get("gmail_draft_id") or (
+        str(did).removeprefix("gmail:") if str(did or "").startswith("gmail:") else ""
+    )
+    if gmail_id:
+        try:
+            from gmail_client.drafts import _update_draft_html
+
+            _update_draft_html(
+                gmail_id,
+                draft,
+                html,
+                attachments=_attachments_for_send(merged) or None,
+                subject=subject,
+            )
+        except Exception as e:
+            st.warning(f"Saved to Drive; Gmail update failed: {e}")
+
+    st.success(
+        f"Saved · tracking `{str(new_tid)[:8]}…` · "
+        f"{len(merged)} attachment(s)"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+    st.rerun()
+
+
+def _rich_text_editor(html: str, *, key: str) -> str:
+    """WYSIWYG editor; falls back to text_area if Quill is unavailable."""
+    try:
+        from streamlit_quill import st_quill
+
+        result = st_quill(
+            value=html or "",
+            html=True,
+            toolbar=_QUILL_TOOLBAR,
+            key=key,
+            placeholder="Write your email…",
+        )
+        if result is None:
+            return html or ""
+        return str(result)
+    except Exception as e:
+        st.warning(
+            f"Rich editor unavailable ({e}). Editing as HTML — "
+            "install streamlit-quill for bold/bullets/fonts."
+        )
+        return st.text_area(
+            "Email body (HTML)",
+            value=html or "",
+            height=320,
+            key=f"{key}_fallback",
+        )
+
+
+def _fmt_size(n: Any) -> str:
+    try:
+        n = int(n or 0)
+    except Exception:
+        return "?"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _attachments_for_storage(atts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Persistable attachment rows (base64, no raw bytes)."""
+    out: list[dict[str, Any]] = []
+    for a in atts:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name") or a.get("filename") or "file"
+        mime = a.get("mime_type") or a.get("mimeType") or "application/octet-stream"
+        b64 = a.get("data_base64") or ""
+        data = a.get("data")
+        if not b64 and data:
+            if isinstance(data, str):
+                b64 = data
             else:
-                st.warning("No draft_id — local only")
-            st.markdown(html, unsafe_allow_html=True)
+                b64 = base64.b64encode(data).decode("ascii")
+        size = a.get("size")
+        if size is None and b64:
+            try:
+                size = len(base64.b64decode(b64))
+            except Exception:
+                size = 0
+        out.append(
+            {
+                "name": name,
+                "filename": name,
+                "mime_type": mime,
+                "mimeType": mime,
+                "size": int(size or 0),
+                "data_base64": b64,
+            }
+        )
+    return out
+
+
+def _attachments_for_send(atts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Binary attachments for Gmail MIME."""
+    out: list[dict[str, Any]] = []
+    for a in atts:
+        if not isinstance(a, dict):
+            continue
+        data = a.get("data")
+        if not data and a.get("data_base64"):
+            try:
+                data = base64.b64decode(a["data_base64"])
+            except Exception:
+                data = None
+        if not data:
+            continue
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        out.append(
+            {
+                "name": a.get("name") or a.get("filename") or "file",
+                "data": data,
+                "mime_type": a.get("mime_type")
+                or a.get("mimeType")
+                or "application/octet-stream",
+            }
+        )
+    return out
 
 
 def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
@@ -260,15 +494,20 @@ def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
             drive_db.save_draft(did, draft)
         except Exception:
             pass
-    # Also update Gmail draft MIME if applicable
     gmail_id = draft.get("gmail_draft_id") or (
-        str(did).removeprefix("gmail:") if str(did).startswith("gmail:") else ""
+        str(did).removeprefix("gmail:") if str(did or "").startswith("gmail:") else ""
     )
     if gmail_id:
         try:
             from gmail_client.drafts import _update_draft_html
 
-            _update_draft_html(gmail_id, draft, html)
+            _update_draft_html(
+                gmail_id,
+                draft,
+                html,
+                attachments=_attachments_for_send(draft.get("attachments") or [])
+                or None,
+            )
         except Exception:
             pass
     return {"body_html": html, "tracking_id": tid, "has_open_pixel": True}
@@ -281,13 +520,40 @@ def _send_draft_now(draft: dict[str, Any]) -> dict[str, Any]:
     if not gmail_id and did.startswith("gmail:"):
         gmail_id = did.removeprefix("gmail:")
 
-    # Prefer Gmail drafts.send so the existing MIME (with pixel) is used
-    if gmail_id:
+    send_atts = _attachments_for_send(draft.get("attachments") or [])
+
+    # Prefer Gmail drafts.send when no extra local-only attachments
+    if gmail_id and not send_atts:
         from gmail_client.drafts import send_gmail_draft
 
         return send_gmail_draft(gmail_id)
 
-    # Drive-only draft → send via Gmail API preserving tracking_id
+    # If we have attachments to add, refresh Gmail MIME first then send
+    if gmail_id and send_atts:
+        try:
+            from gmail_client.drafts import _update_draft_html, send_gmail_draft
+            from core.tracking import inject_tracking
+
+            html, tid = inject_tracking(
+                draft.get("body_html") or "",
+                tracking_id=draft.get("tracking_id") or None,
+                recipient_email=draft.get("to") or draft.get("recipient") or "",
+                subject=draft.get("subject") or "",
+                register=True,
+            )
+            _update_draft_html(
+                gmail_id,
+                draft,
+                html,
+                attachments=send_atts,
+                subject=draft.get("subject") or "",
+            )
+            draft["body_html"] = html
+            draft["tracking_id"] = tid
+            return send_gmail_draft(gmail_id)
+        except Exception:
+            pass
+
     from gmail_client.send import send_email
     from core.tracking import inject_tracking
 
@@ -310,5 +576,6 @@ def _send_draft_now(draft: dict[str, Any]) -> dict[str, Any]:
         source=draft.get("source") or "drafts_page_send",
         from_email=draft.get("from") or None,
         cc=draft.get("cc") or None,
-        include_signature=False,  # already in body if saved with sig
+        attachments=send_atts or None,
+        include_signature=False,
     )

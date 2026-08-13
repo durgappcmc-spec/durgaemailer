@@ -291,18 +291,27 @@ def _extract_tracking_id(html: str) -> Optional[str]:
         return m.group(1) if m else None
 
 
-def _update_draft_html(gmail_draft_id: str, draft: dict, body_html: str) -> None:
-    """Replace draft MIME with tracked HTML (best-effort)."""
+def _update_draft_html(
+    gmail_draft_id: str,
+    draft: dict,
+    body_html: str,
+    *,
+    attachments: Optional[list[dict[str, Any]]] = None,
+    subject: Optional[str] = None,
+) -> None:
+    """Replace draft MIME with tracked HTML (+ optional attachments)."""
     from gmail_client.send import _build_raw_message
 
     raw, _tid = _build_raw_message(
-        to=draft.get("to") or "",
-        subject=draft.get("subject") or "",
+        to=draft.get("to") or draft.get("recipient") or "",
+        subject=subject if subject is not None else (draft.get("subject") or ""),
         html_body=body_html,
+        attachments=attachments or None,
         instrument=False,
         include_signature=False,
         from_email=(draft.get("from") or None),
         cc=draft.get("cc") or None,
+        recipient_name=draft.get("recipient_name") or None,
     )
     svc = gmail_service()
     svc.users().drafts().update(
