@@ -322,3 +322,107 @@ def create_drafts(
             )
         )
     return results
+
+
+def send_bulk_serial(
+    jobs: list[dict[str, Any]],
+    *,
+    jitter_seconds: tuple[float, float] = (2.0, 5.0),
+) -> list[dict[str, Any]]:
+    """Send many emails serially with jitter; isolate per-draft failures.
+
+    Attachments may be Drive refs: {"drive_name": "...", "filename": "..."} —
+    bytes are streamed at send time (25 MB cap).
+    """
+    import random
+
+    results: list[dict[str, Any]] = []
+    for job in jobs:
+        to = (job.get("to") or job.get("recipient_email") or "").strip()
+        if not to:
+            results.append({"error": "missing recipient", "job_id": job.get("draft_id")})
+            continue
+        try:
+            attachments = _resolve_attachments(job.get("attachments") or [])
+            total = sum(len(a.get("data") or b"") for a in attachments)
+            if total > 25 * 1024 * 1024:
+                results.append(
+                    {
+                        "error": "attachments exceed 25 MB",
+                        "draft_id": job.get("draft_id"),
+                        "to": to,
+                    }
+                )
+                continue
+            # Preserve tracking_id by injecting before send when provided
+            html = job.get("html_body") or job.get("body_html") or job.get("body") or "<p></p>"
+            tracking_id = job.get("tracking_id")
+            if tracking_id:
+                from core.tracking import inject_tracking
+
+                html, tracking_id = inject_tracking(
+                    html,
+                    tracking_id=tracking_id,
+                    recipient_email=to,
+                    subject=job.get("subject") or "",
+                    register=False,
+                )
+            result = send_email(
+                to=to,
+                subject=job.get("subject") or "(no subject)",
+                html_body=html,
+                recipient_name=job.get("recipient_name") or job.get("name"),
+                attachments=attachments,
+                campaign=job.get("campaign"),
+                source=job.get("source") or "bulk_send",
+                from_email=job.get("from_email") or job.get("from"),
+                cc=job.get("cc") or job.get("cc_emails"),
+                include_signature=job.get("include_signature", True),
+            )
+            if tracking_id and not result.get("tracking_id"):
+                result["tracking_id"] = tracking_id
+            result["draft_id"] = job.get("draft_id")
+            results.append(result)
+        except Exception as e:
+            results.append(
+                {
+                    "error": str(e),
+                    "draft_id": job.get("draft_id"),
+                    "to": to,
+                }
+            )
+        lo, hi = jitter_seconds
+        time.sleep(random.uniform(lo, hi))
+    return results
+
+
+def _resolve_attachments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve Drive-backed or inline attachments to {filename, data, mime_type}."""
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("data"):
+            out.append(item)
+            continue
+        drive_name = item.get("drive_name") or item.get("drive_path")
+        if not drive_name:
+            continue
+        try:
+            from core import drive_store
+
+            payload = drive_store.download_json(drive_name)
+            # if stored as {filename, b64, mime_type}
+            if isinstance(payload, dict) and payload.get("b64"):
+                import base64 as b64
+
+                out.append(
+                    {
+                        "filename": item.get("filename") or payload.get("filename") or "file.bin",
+                        "data": b64.b64decode(payload["b64"]),
+                        "mime_type": item.get("mime_type") or payload.get("mime_type") or "application/octet-stream",
+                    }
+                )
+        except Exception as e:
+            print(f"[gmail] attachment resolve failed: {e}", file=sys.stderr)
+    return out

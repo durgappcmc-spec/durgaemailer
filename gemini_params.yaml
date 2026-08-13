@@ -1,0 +1,26 @@
+# The model itself is loaded from .env via the existing Gemini wrapper (core/llm.py).
+# This file only controls per-task-kind parameters. Hot-reloaded on mtime change.
+defaults:
+  temperature: 0.2
+  max_output_tokens: 2048
+  response_mime_type: "application/json"
+task_kinds:
+  contact_planner:
+    temperature: 0.1
+    max_output_tokens: 1024
+  draft_planner:
+    temperature: 0.1
+    max_output_tokens: 1024
+  org_brief_synth:
+    temperature: 0.3
+    max_output_tokens: 8192
+  compose_email:
+    temperature: 0.7
+    max_output_tokens: 4096
+    response_mime_type: "application/json"
+  grounding_check:
+    temperature: 0.0
+    max_output_tokens: 2048
+  quick_edit:
+    temperature: 0.5
+    max_output_tokens: 2048

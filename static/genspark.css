@@ -1,0 +1,47 @@
+/* Genspark-style soft cards — dark-mode aware */
+:root {
+  --gs-radius: 12px;
+  --gs-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+  --gs-border: rgba(128, 128, 128, 0.22);
+  --gs-accent: #1f6f5b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --gs-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+    --gs-border: rgba(255, 255, 255, 0.12);
+  }
+}
+
+.genspark-card {
+  border: 1px solid var(--gs-border);
+  border-radius: var(--gs-radius);
+  box-shadow: var(--gs-shadow);
+  padding: 0.85rem 1rem;
+  margin-bottom: 0.75rem;
+  background: var(--background-color, transparent);
+}
+
+.genspark-pill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--gs-border);
+}
+
+.genspark-tracked {
+  color: var(--gs-accent);
+  font-weight: 600;
+}
+
+div[data-testid="stExpander"] {
+  border-radius: var(--gs-radius);
+  border: 1px solid var(--gs-border);
+  box-shadow: var(--gs-shadow);
+}
+
+.genspark-rail h3 {
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}

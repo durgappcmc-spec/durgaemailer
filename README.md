@@ -129,9 +129,21 @@ Free Render instances sleep after idle; first open can take ~30–60s.
 
 ## Pages
 
-1. Chat — grounded Gemini answers
+1. Chat — grounded Gemini answers + `/enrich`, `/draft`, `/style-refresh` shortcuts
 2. Prospects — search / enrich / save
 3. Schedule — single, bulk, sequence, queue
 4. Tracking — opens, clicks, hot leads, replies
 5. Inbox Extract — structured Gmail extraction
 6. Memory — Chroma search + manual notes
+7. Bulk Enrich & Draft — two-phase agentic enrichment + drafting
+8. Drafts — Drive-backed draft list + inspector
+
+## Two-phase agentic bulk (delta)
+
+- **Phase 1** (`ContactAgent`): persona-matched contacts via tool registry (ZoomInfo + web fallbacks). Human review gate is mandatory.
+- **Phase 2** (`DraftAgent`): org brief + hyper-personalized grounded drafts + tracking inject + Drive save. Runs only on approved rows.
+- **Tool registry** (`core/tools/`): `phase_scope` filters Phase 1 vs Phase 2; `registry.call()` refuses out-of-scope tools.
+- **Single Gemini model**: ID from `GEMINI_MODEL` via existing `core/llm.py`. Per-task parameters in `gemini_params.yaml` (hot-reload). All new LLM calls go through `GeminiClient.generate(task_kind=...)`.
+- **Drive history**: `core/drive_db.py` under `DurgaEmailer/` on the Relay Memory Drive folder. Migrate with `python scripts/migrate_db_to_drive.py`.
+- **Scopes** (already in repo): `drive.file` (bootstrap/Sheets token), `gmail.readonly` (Gmail token).
+- **Tracking**: every draft save path uses `core.tracking.strip_tracking` → `inject_tracking`; `tracking_id` is immutable across edits.

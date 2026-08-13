@@ -15,6 +15,39 @@ if not require_login():
     st.stop()
 logout_button()
 
+# Genspark CSS + usage rail
+try:
+    from pathlib import Path
+
+    css = Path(__file__).resolve().parents[1] / "static" / "genspark.css"
+    if css.is_file():
+        st.markdown(f"<style>{css.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+except Exception:
+    pass
+
+with st.sidebar:
+    st.markdown('<div class="genspark-rail">', unsafe_allow_html=True)
+    st.subheader("Bulk jobs")
+    try:
+        from core import drive_db
+
+        for j in drive_db.list_bulk_jobs(limit=5):
+            st.caption(f"{j.get('job_id')} · {j.get('current_phase')}")
+        gm = drive_db.gemini_usage_mtd()
+        st.subheader("Gemini MTD")
+        st.caption(
+            f"calls={gm.get('totals', {}).get('calls', 0)} · "
+            f"in={gm.get('totals', {}).get('tokens_in', 0)} · "
+            f"out={gm.get('totals', {}).get('tokens_out', 0)}"
+        )
+        for kind, b in (gm.get("by_task_kind") or {}).items():
+            st.caption(f"{kind}: {b.get('calls', 0)}")
+        zi = drive_db.zoominfo_usage_mtd()
+        st.caption(f"ZI credits MTD: {zi.get('credits', 0)}")
+    except Exception:
+        st.caption("Drive usage unavailable")
+    st.markdown("</div>", unsafe_allow_html=True)
+
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
@@ -291,6 +324,56 @@ if prompt:
 
     if not user_text:
         user_text = "(see attached files)"
+
+    # Slash / NL shortcuts → Bulk Enrich page
+    _low = user_text.lower().strip()
+    import re as _re
+
+    def _shortcut_reply(content: str, routing: str) -> None:
+        st.session_state.messages.append({"role": "user", "content": user_text})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": content, "meta": {"routing": routing}}
+        )
+        st.session_state.run_active = False
+        try:
+            durable_store.save_chat_messages(st.session_state.messages)
+        except Exception:
+            pass
+        st.stop()
+
+    if _low.startswith("/enrich"):
+        rest = user_text[len("/enrich") :].strip(" :,-")
+        st.session_state.bulk_companies = rest.replace(",", "\n")
+        _shortcut_reply(
+            "Prefilled enrichment list. Go to **🚀 Bulk Enrich & Draft** and click Start Enrichment.",
+            "ENRICH_SHORTCUT",
+        )
+    if _low.startswith("/draft"):
+        _shortcut_reply(
+            "Use **🚀 Bulk Enrich & Draft** → approve rows → Start Drafting (Phase 2).",
+            "DRAFT_SHORTCUT",
+        )
+    if _low.startswith("/style-refresh"):
+        with st.spinner("Refreshing style profile…"):
+            from core.style_profile import build_style_profile
+
+            profile = build_style_profile()
+        _shortcut_reply(
+            f"Style profile refreshed ({profile.get('sample_count', 0)} samples).",
+            "STYLE_REFRESH",
+        )
+    _em = _re.match(
+        r"(?i)^\s*enrich(?:\s+these)?\s*:\s*(.+)$",
+        user_text,
+        flags=_re.S,
+    )
+    if _em:
+        names = [x.strip() for x in _re.split(r"[,;\n]+", _em.group(1)) if x.strip()]
+        st.session_state.bulk_companies = "\n".join(names)
+        _shortcut_reply(
+            f"Prefilled **{len(names)}** orgs for Phase 1. Open **🚀 Bulk Enrich & Draft** to start.",
+            "ENRICH_NL",
+        )
 
     file_names = [a.get("name") or "file" for a in attachments]
 

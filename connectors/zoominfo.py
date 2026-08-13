@@ -132,6 +132,16 @@ class ZoomInfoConnector(ProspectConnector):
             "or a valid ZOOMINFO_API_KEY in .env (never prompted in chat)."
         )
 
+    def health_check(self) -> dict[str, Any]:
+        """Return {ok: bool, detail: str} for sidebar status dot."""
+        if not self._configured():
+            return {"ok": False, "detail": "credentials not set"}
+        try:
+            self._authenticate()
+            return {"ok": True, "detail": "authenticated"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)[:200]}
+
     def _headers(self) -> dict[str, str]:
         token = self._authenticate()
         return {

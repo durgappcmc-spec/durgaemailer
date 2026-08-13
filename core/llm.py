@@ -240,6 +240,50 @@ def extract_json(
         return json.dumps({"error": str(e)})
 
 
+def generate_content_raw(
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    temperature: float = 0.2,
+    max_output_tokens: int = 2048,
+    response_mime_type: Optional[str] = None,
+    response_schema: Any = None,
+) -> dict[str, Any]:
+    """Low-level generate via the single shared client + settings.GEMINI_MODEL.
+
+    Used by core.agent.gemini_client.GeminiClient — tools/agents must call
+    GeminiClient.generate(task_kind=...), not this function directly.
+    Returns {"text": str, "tokens_in": int, "tokens_out": int}.
+    """
+    client = _get_client()
+    config_kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "max_output_tokens": max_output_tokens,
+        "system_instruction": system,
+    }
+    if response_mime_type:
+        config_kwargs["response_mime_type"] = response_mime_type
+    if response_schema is not None:
+        config_kwargs["response_schema"] = response_schema
+    config = types.GenerateContentConfig(**config_kwargs)
+    resp = client.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+        config=config,
+    )
+    text = (getattr(resp, "text", None) or "").strip()
+    tokens_in = 0
+    tokens_out = 0
+    try:
+        usage = getattr(resp, "usage_metadata", None)
+        if usage:
+            tokens_in = int(getattr(usage, "prompt_token_count", 0) or 0)
+            tokens_out = int(getattr(usage, "candidates_token_count", 0) or 0)
+    except Exception:
+        pass
+    return {"text": text, "tokens_in": tokens_in, "tokens_out": tokens_out}
+
+
 def describe_bytes(
     data: bytes,
     *,
