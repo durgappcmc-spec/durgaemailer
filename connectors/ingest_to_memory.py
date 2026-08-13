@@ -11,20 +11,35 @@ from core import memory
 
 def prospect_to_text(p: dict[str, Any]) -> str:
     """Flatten a normalized prospect into an embed-friendly multi-line string."""
+    name = (p.get("name") or "").strip()
+    email = (p.get("email") or "").strip()
+    title = (p.get("title") or p.get("designation") or "").strip()
+    location = (p.get("location") or "").strip()
+    # Chat-friendly one-liner matching earlier Sterlite CSR hits:
+    # Anupam Das (anupam.das@stl.tech) – Head CSR & Sustainability | Pune
+    if name or email:
+        who = name or "Unknown"
+        if email:
+            who = f"{who} ({email})"
+        bits = [b for b in (title, location) if b]
+        headline = who + (f" – {' | '.join(bits)}" if bits else "")
+    else:
+        headline = ""
     lines = [
-        f"Name: {p.get('name') or ''}",
-        f"Title: {p.get('title') or ''}",
+        headline,
+        f"Name: {name}",
+        f"Title: {title}",
         f"Company: {p.get('company') or ''}",
-        f"Email: {p.get('email') or ''}",
+        f"Email: {email}",
         f"Phone: {p.get('phone') or ''}",
         f"Mobile: {p.get('mobile') or ''}",
         f"LinkedIn: {p.get('linkedin_url') or ''}",
-        f"Location: {p.get('location') or ''}",
+        f"Location: {location}",
         f"Seniority: {p.get('seniority') or ''}",
         f"Department: {p.get('department') or ''}",
         f"Source: {p.get('source') or ''}",
     ]
-    return "\n".join(lines)
+    return "\n".join(l for l in lines if l is not None)
 
 
 def ingest_prospects(

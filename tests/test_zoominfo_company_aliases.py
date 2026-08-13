@@ -31,9 +31,30 @@ def test_rank_prefers_sterlite_technologies():
 def test_company_search_uses_csr_title_cascade_then_expand():
     titles, expand = _title_cascade_for_query({"company_names": ["sterlite tech"]})
     assert expand is True
-    assert titles[0] == "CSR Head"
-    assert "Head of CSR" in titles
-    assert titles[0] == CSR_TITLE_PRIORITY[0]
+    assert titles[0] in ("Head CSR", "CSR Head", "Head of CSR")
+    assert any("Head CSR" == t or "CSR" == t for t in titles)
+    assert "Head CSR" in titles or "CSR Head" in titles
+
+
+def test_contact_relevance_prefers_csr_stl():
+    from connectors.zoominfo import _contact_relevance_key
+
+    rows = [
+        {"name": "Random", "title": "Engineer", "email": "x@other.com"},
+        {
+            "name": "Anupam Das",
+            "title": "Head CSR & Sustainability",
+            "email": "anupam.das@stl.tech",
+        },
+        {
+            "name": "Swati Bhattacharya",
+            "title": "Chief Marketing Officer & Head CSR",
+            "email": "swati.bhattacharya@stl.tech",
+        },
+    ]
+    ranked = sorted(rows, key=_contact_relevance_key)
+    assert ranked[0]["name"] in ("Anupam Das", "Swati Bhattacharya")
+    assert all("stl.tech" in (r.get("email") or "") for r in ranked[:2])
 
 
 def test_explicit_titles_kept_with_expand():

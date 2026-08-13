@@ -191,23 +191,26 @@ class ZoomInfoConnector(ProspectConnector):
         if names or _is_nonprofit_query(query):
             company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
             company_hits = _rank_companies_for_query(company_hits, rank_needle)
-            if company_hits:
-                # Same cascade as Phase 1 / Bulk Enrich: try CSR (or NGO) titles
-                # in priority order, then expand to other contacts at the firm.
-                cascade_titles, expand = _title_cascade_for_query(query)
+            cascade_titles, expand = _title_cascade_for_query(query)
+            domains = query.get("company_domains") or query.get("domains") or []
+            if isinstance(domains, str):
+                domains = [domains] if domains.strip() else []
+            domain_list = [str(d) for d in domains if d]
+            if company_hits or domain_list:
                 results.extend(
                     self._contacts_for_companies(
-                        company_hits[:5],
+                        company_hits[:5] if company_hits else [],
                         limit=limit,
                         titles=cascade_titles,
                         expand=expand,
+                        domains=domain_list,
                     )
                 )
                 print(
                     f"[zoominfo] company-first: {len(company_hits)} firms → "
                     f"{len(results)} contacts (q={rank_needle!r}, "
                     f"titles={cascade_titles[:3]!r}{'…' if len(cascade_titles) > 3 else ''}, "
-                    f"expand={expand})",
+                    f"domains={domain_list!r}, expand={expand})",
                     file=sys.stderr,
                 )
 
@@ -273,13 +276,10 @@ class ZoomInfoConnector(ProspectConnector):
                 if not results:
                     return [{"source": self.name, "error": str(e)}]
 
-        # Dedupe; prefer rows that have email
+        # Dedupe; prefer CSR/Sustainability titles, then rows that have email
         seen: set[str] = set()
         merged: list[dict[str, Any]] = []
-        for p in sorted(
-            results,
-            key=lambda r: 0 if (r.get("email") or "").strip() else 1,
-        ):
+        for p in sorted(results, key=_contact_relevance_key):
             key = (
                 (p.get("email") or "").strip().lower()
                 or str(p.get("source_id") or "")
@@ -422,21 +422,66 @@ class ZoomInfoConnector(ProspectConnector):
         limit: int = 10,
         titles: Optional[list[str]] = None,
         expand: bool = True,
+        domains: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         """Pull contacts for company IDs — title priority first, then broaden.
 
         Mirrors Phase 1 `zoominfo_search_contact`: try each title in order
-        (e.g. CSR Head → Head of CSR → …). If still short and expand=True,
-        pull remaining contacts at the firm without a title filter.
+        (e.g. Head CSR → CSR & Sustainability → …). Prefer people whose title
+        actually looks like CSR/Sustainability (Anupam Das / Swati Bhattacharya
+        style hits), then expand to other contacts at the firm / domain.
         """
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         title_list = [str(t).strip() for t in (titles or []) if str(t).strip()]
+        domain_list = [str(d).strip().lower() for d in (domains or []) if str(d).strip()]
+
+        def _append_rows(
+            rows: list[dict[str, Any]],
+            *,
+            company_name: str = "",
+            job_title: Optional[str] = None,
+            prefer_csr: bool = False,
+        ) -> int:
+            nonlocal out
+            if len(out) >= limit:
+                return 0
+            ranked = sorted(
+                [r for r in rows if isinstance(r, dict)],
+                key=lambda c: (
+                    0 if _CSR_TITLE_RE.search(str(c.get("jobTitle") or "")) else 1,
+                    0 if c.get("hasEmail") else 1,
+                    0 if c.get("hasSupplementalEmail") else 1,
+                ),
+            )
+            if prefer_csr:
+                ranked = [
+                    r
+                    for r in ranked
+                    if _CSR_TITLE_RE.search(str(r.get("jobTitle") or ""))
+                ] or ranked
+            before = len(out)
+            batch = self._enrich_contact_rows(ranked, limit=limit - len(out))
+            for p in batch:
+                key = (
+                    p.get("email") or p.get("source_id") or p.get("name") or ""
+                ).lower()
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                if not p.get("company") and company_name:
+                    p["company"] = company_name
+                if job_title and not p.get("matched_on"):
+                    p["matched_on"] = f"{job_title} (ZI title priority)"
+                out.append(p)
+                if len(out) >= limit:
+                    break
+            return len(out) - before
 
         def _append_from_company(
-            co: dict[str, Any], *, job_title: Optional[str] = None
+            co: dict[str, Any], *, job_title: Optional[str] = None, prefer_csr: bool = False
         ) -> None:
-            nonlocal out
             if len(out) >= limit:
                 return
             cid = co.get("id") or co.get("companyId")
@@ -444,7 +489,7 @@ class ZoomInfoConnector(ProspectConnector):
                 return
             body: dict[str, Any] = {
                 "companyId": str(cid),
-                "rpp": min(25, max(5, limit - len(out))),
+                "rpp": min(25, max(5, limit - len(out) + 5)),
                 "page": 1,
             }
             if job_title:
@@ -458,13 +503,6 @@ class ZoomInfoConnector(ProspectConnector):
                 )
                 resp.raise_for_status()
                 rows = (resp.json() or {}).get("data") or []
-                rows = sorted(
-                    [r for r in rows if isinstance(r, dict)],
-                    key=lambda c: (
-                        0 if c.get("hasEmail") else 1,
-                        0 if c.get("hasSupplementalEmail") else 1,
-                    ),
-                )
             except Exception as e:
                 label = job_title or "(any)"
                 print(
@@ -472,60 +510,107 @@ class ZoomInfoConnector(ProspectConnector):
                     file=sys.stderr,
                 )
                 return
-            batch = self._enrich_contact_rows(rows, limit=limit - len(out))
-            for p in batch:
-                key = (
-                    p.get("email") or p.get("source_id") or p.get("name") or ""
-                ).lower()
-                if key and key in seen:
-                    continue
-                if key:
-                    seen.add(key)
-                if not p.get("company"):
-                    p["company"] = co.get("name") or ""
-                if job_title and not p.get("matched_on"):
-                    p["matched_on"] = f"{job_title} (ZI title priority)"
-                if co.get("city") and not p.get("location"):
-                    p["location"] = ", ".join(
-                        filter(
-                            None,
-                            [co.get("city"), co.get("state"), co.get("country")],
-                        )
-                    )
-                out.append(p)
-                if len(out) >= limit:
-                    return
+            added = _append_rows(
+                rows,
+                company_name=str(co.get("name") or ""),
+                job_title=job_title,
+                prefer_csr=prefer_csr,
+            )
+            if added:
+                print(
+                    f"[zoominfo] title hit {job_title!r} → +{added} "
+                    f"at {co.get('name') or co.get('id')}",
+                    file=sys.stderr,
+                )
 
-        # Phase A — persona titles in order (CSR Head, …)
-        # Cap fan-out: top firms × priority titles until we have a solid CSR set.
+        def _append_from_domain(
+            domain: str, *, job_title: Optional[str] = None, prefer_csr: bool = False
+        ) -> None:
+            if len(out) >= limit or not domain:
+                return
+            body: dict[str, Any] = {
+                "companyWebsite": domain,
+                "rpp": min(25, max(5, limit - len(out) + 5)),
+                "page": 1,
+            }
+            if job_title:
+                body["jobTitle"] = job_title
+            try:
+                resp = requests.post(
+                    f"{self.BASE}/search/contact",
+                    headers=self._headers(),
+                    json=body,
+                    timeout=45,
+                )
+                resp.raise_for_status()
+                rows = (resp.json() or {}).get("data") or []
+            except Exception as e:
+                print(
+                    f"[zoominfo] domain contact error ({domain!r}/{job_title!r}): {e}",
+                    file=sys.stderr,
+                )
+                return
+            added = _append_rows(
+                rows,
+                company_name=domain,
+                job_title=job_title or f"domain:{domain}",
+                prefer_csr=prefer_csr,
+            )
+            if added:
+                print(
+                    f"[zoominfo] domain hit {domain!r} title={job_title!r} → +{added}",
+                    file=sys.stderr,
+                )
+
+        def _csr_count() -> int:
+            return sum(
+                1
+                for p in out
+                if _CSR_TITLE_RE.search(str(p.get("title") or ""))
+            )
+
+        # Phase A — persona titles (require CSR-looking titles when possible)
         title_target = min(limit, max(3, (limit + 1) // 2))
-        for title in title_list[:8]:
-            if len(out) >= title_target:
+        for title in title_list[:12]:
+            if _csr_count() >= title_target:
                 break
-            for co in companies[:2]:
-                if len(out) >= title_target:
+            for co in companies[:3]:
+                if _csr_count() >= title_target:
                     break
-                before = len(out)
-                _append_from_company(co, job_title=title)
-                if len(out) > before:
-                    print(
-                        f"[zoominfo] title hit {title!r} → +{len(out) - before} "
-                        f"at {co.get('name') or co.get('id')}",
-                        file=sys.stderr,
-                    )
+                _append_from_company(co, job_title=title, prefer_csr=True)
+            for dom in domain_list[:2]:
+                if _csr_count() >= title_target:
+                    break
+                _append_from_domain(dom, job_title=title, prefer_csr=True)
 
-        # Phase B — broaden to other contacts at the same firms
+        # Phase A2 — broad CSR/Sustainability keyword on domain (catches
+        # "Head CSR & Sustainability" / "CMO & Head CSR" phrasing)
+        if _csr_count() < title_target:
+            for keyword in ("CSR", "Sustainability", "ESG"):
+                if _csr_count() >= title_target:
+                    break
+                for dom in domain_list[:2]:
+                    _append_from_domain(dom, job_title=keyword, prefer_csr=True)
+                for co in companies[:2]:
+                    _append_from_company(co, job_title=keyword, prefer_csr=True)
+
+        # Phase B — broaden to other contacts at the same firms / domains
         if expand and len(out) < limit:
             print(
                 f"[zoominfo] expanding beyond titles "
-                f"({len(out)}/{limit} so far)",
+                f"({len(out)}/{limit} so far, csr={_csr_count()})",
                 file=sys.stderr,
             )
             for co in companies:
                 if len(out) >= limit:
                     break
-                _append_from_company(co, job_title=None)
+                _append_from_company(co, job_title=None, prefer_csr=False)
+            for dom in domain_list[:2]:
+                if len(out) >= limit:
+                    break
+                _append_from_domain(dom, job_title=None, prefer_csr=False)
 
+        out.sort(key=_contact_relevance_key)
         return out[:limit]
 
     def _enrich_contact_rows(
@@ -1071,20 +1156,49 @@ def _is_nonprofit_query(query: dict[str, Any]) -> bool:
     )
 
 
-# Same persona ladder as Bulk Enrich / Phase 1 ContactAgent (CSR Head first).
+# Same persona ladder as Bulk Enrich / Phase 1 — tuned to ZoomInfo title phrasing
+# (e.g. "Head CSR & Sustainability", "CMO & Head CSR"), not only "CSR Head".
 CSR_TITLE_PRIORITY: list[str] = [
-    "CSR Head",
+    "Head CSR",
     "Head of CSR",
-    "CSR Manager",
-    "Head of Corporate Social Responsibility",
+    "CSR Head",
+    "CSR & Sustainability",
+    "Head CSR & Sustainability",
+    "CSR and Sustainability",
     "Corporate Social Responsibility",
     "Head of Sustainability",
     "Sustainability Head",
+    "Head of ESG",
+    "ESG Head",
+    "Chief Marketing Officer",
     "Head of Partnerships",
     "Director of Partnerships",
     "Head of Corporate Partnerships",
+    "CSR Manager",
+    "Sustainability",
     "CSR",
 ]
+
+_CSR_TITLE_RE = re.compile(
+    r"\bcsr\b|sustainab|esg\b|corporate\s+social|social\s+impact|"
+    r"partnerships?\b|community\s+(relations|development)|foundation\b",
+    re.I,
+)
+
+_STL_EMAIL_RE = re.compile(r"@(?:stl\.tech|sterlitetech\.com)\b", re.I)
+
+
+def _contact_relevance_key(row: dict[str, Any]) -> tuple:
+    """Sort key: CSR/Sustainability titles first, then stl.tech emails, then any email."""
+    title = str(row.get("title") or row.get("jobTitle") or "")
+    email = str(row.get("email") or "").strip().lower()
+    csr = 0 if _CSR_TITLE_RE.search(title) else 1
+    # Stronger boost when title literally has CSR (Anupam / Swati style)
+    csr_strong = 0 if re.search(r"\bcsr\b", title, re.I) else 1
+    stl = 0 if email and _STL_EMAIL_RE.search(email) else 1
+    has_email = 0 if email else 1
+    name = str(row.get("name") or "").lower()
+    return (csr, csr_strong, stl, has_email, name)
 
 NGO_TITLE_PRIORITY: list[str] = [
     "Founder",
@@ -1113,7 +1227,9 @@ def _titles_from_query(query: dict[str, Any]) -> list[str]:
 
 
 def _default_csr_titles() -> list[str]:
-    """Prefer Drive persona_targets CSR preset when present; else hardcoded ladder."""
+    """Merge Drive CSR persona titles with the hardcoded ZoomInfo-friendly ladder."""
+    base = list(CSR_TITLE_PRIORITY)
+    drive_titles: list[str] = []
     try:
         from core import drive_db
 
@@ -1124,10 +1240,21 @@ def _default_csr_titles() -> list[str]:
             label = str(p.get("label") or "").lower()
             titles = [str(t).strip() for t in (p.get("titles") or []) if str(t).strip()]
             if titles and ("csr" in pid or "csr" in label):
-                return titles
+                drive_titles = titles
+                break
     except Exception:
         pass
-    return list(CSR_TITLE_PRIORITY)
+    if not drive_titles:
+        return base
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in drive_titles + base:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
 
 
 def _title_cascade_for_query(query: dict[str, Any]) -> tuple[list[str], bool]:
@@ -1230,6 +1357,12 @@ def _rank_companies_for_query(
     def score(co: dict[str, Any]) -> tuple[int, str]:
         name = str(co.get("name") or co.get("companyName") or "").lower()
         name_n = re.sub(r"[^a-z0-9]+", " ", name).strip()
+        website = str(
+            co.get("website")
+            or co.get("companyWebsite")
+            or co.get("domain")
+            or ""
+        ).lower()
         sc = 0
         if needle_n and needle_n in name_n:
             sc += 100
@@ -1241,6 +1374,10 @@ def _rank_companies_for_query(
         # Prefer exact-ish brand hits over vague subsidiaries
         if "sterlite" in tokens and "sterlite" in name_n and "technolog" in name_n:
             sc += 50
+        if "stl.tech" in website or "sterlitetech.com" in website:
+            sc += 80
+        if re.search(r"\bstl\b", name_n) and "sterlite" in name_n:
+            sc += 30
         return (-sc, name)
 
     ranked = sorted([c for c in companies if isinstance(c, dict)], key=score)
@@ -1253,6 +1390,10 @@ def _rank_companies_for_query(
                 t in re.sub(r"[^a-z0-9]+", " ", str(c.get("name") or "").lower())
                 for t in tokens
             )
+            or "stl.tech"
+            in str(c.get("website") or c.get("companyWebsite") or "").lower()
+            or "sterlitetech.com"
+            in str(c.get("website") or c.get("companyWebsite") or "").lower()
         ]
         if kept:
             return kept
