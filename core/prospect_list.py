@@ -60,15 +60,15 @@ def _load() -> list[dict[str, Any]]:
     return _CACHE
 
 
-def _persist(rows: list[dict[str, Any]]) -> None:
+def _persist(rows: list[dict[str, Any]]) -> bool:
+    """Write prospect list to Drive (+ Sheets). Returns True if Drive sync ok."""
     global _CACHE, _LOADED
     _CACHE = rows
     _LOADED = True
     try:
         from core.durable_store import save_json_blob
 
-        # Sync to Drive — async-only saves were lost on Render restarts mid-upload
-        ok = save_json_blob("prospect_list", rows[-1000:])
+        ok = bool(save_json_blob("prospect_list", rows[-1000:]))
         print(
             f"[prospect_list] persist n={len(rows)} drive_ok={ok}",
             file=sys.stderr,
@@ -79,8 +79,10 @@ def _persist(rows: list[dict[str, Any]]) -> None:
                 "— contacts may be local-only until next successful save",
                 file=sys.stderr,
             )
+        return ok
     except Exception as e:
         print(f"[prospect_list] save failed: {e}", file=sys.stderr)
+        return False
 
 
 def reload_from_drive() -> int:
@@ -94,7 +96,12 @@ def reload_from_drive() -> int:
 
 
 def save_prospects(prospects: list[dict[str, Any]]) -> int:
-    """Merge prospects into the durable list. Returns count newly saved/updated."""
+    """Merge prospects into the durable list. Returns count newly saved/updated.
+
+    Always attempts Drive sync when anything changed. Callers should treat a
+    positive return as 'merged into list'; verify Drive via last persist logs
+    or save_prospects_to_drive().
+    """
     if not prospects:
         return 0
     from connectors import sanitize_prospect
@@ -120,6 +127,9 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
                 or (p.get("company") or "").strip()
             ):
                 continue
+            # Tag provider so Saved list can show ZoomInfo vs Gmail
+            if not (p.get("source") or "").strip():
+                p["source"] = "zoominfo"
             key = _prospect_key(p)
             row = {
                 **{k: v for k, v in p.items() if v not in (None, "", [], {})},
@@ -132,14 +142,43 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
                 for field in ("email", "phone", "mobile", "linkedin_url", "title", "name"):
                     if not (merged.get(field) or "").strip() and (old.get(field) or "").strip():
                         merged[field] = old[field]
+                # Prefer zoominfo over gmail when merging same email
+                if (old.get("source") or "") == "gmail" and (
+                    str(row.get("source") or "").startswith("zoom")
+                ):
+                    merged["source"] = row.get("source") or "zoominfo"
                 rows[idx] = sanitize_prospect(merged)
             else:
                 by_key[key] = len(rows)
                 rows.append(row)
             changed += 1
         if changed:
-            _persist(rows)
+            drive_ok = _persist(rows)
+            if not drive_ok:
+                # One retry after clearing Drive file-id cache
+                try:
+                    from core import drive_store
+
+                    drive_store.clear_file_cache()
+                except Exception:
+                    pass
+                drive_ok = _persist(rows)
+                print(
+                    f"[prospect_list] retry persist drive_ok={drive_ok}",
+                    file=sys.stderr,
+                )
         return changed
+
+
+def save_prospects_to_drive(prospects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Explicit ZoomInfo/search save with status for Chat UI."""
+    n = save_prospects(prospects)
+    total = 0
+    try:
+        total = len(all_prospects())
+    except Exception:
+        total = n
+    return {"upserted": n, "total": total}
 
 
 def repair_saved_prospects() -> int:

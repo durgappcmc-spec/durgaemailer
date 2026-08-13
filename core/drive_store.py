@@ -17,6 +17,13 @@ _LOCK = threading.Lock()
 _DRIVE = None
 
 
+def clear_file_cache() -> None:
+    """Drop cached Drive file ids (retry after a failed update)."""
+    global _FILE_IDS
+    with _LOCK:
+        _FILE_IDS = {}
+
+
 def _drive():
     global _DRIVE
     if _DRIVE is not None:

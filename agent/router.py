@@ -2560,6 +2560,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     q, providers=tuple(providers), limit_per_provider=limit
                 )
                 ok = [p for p in results if not p.get("error")]
+                # Ensure ZoomInfo rows are tagged for the Saved list
+                for p in ok:
+                    if not (p.get("source") or "").strip():
+                        p["source"] = "zoominfo"
+                    elif str(p.get("source") or "").lower() in ("zi", "zoom", "zoom info"):
+                        p["source"] = "zoominfo"
                 if cached:
                     seen = {
                         (

@@ -455,10 +455,24 @@ if prompt:
             with_email = sum(
                 1 for p in meta["prospects"] if (p.get("email") or "").strip()
             )
-            st.caption(
-                f"Saved {len(meta['prospects'])} prospects "
-                f"({with_email} with email) for bulk draft/send."
-            )
+            list_n = 0
+            try:
+                from core.prospect_list import save_prospects_to_drive
+
+                status = save_prospects_to_drive(meta["prospects"])
+                list_n = int(status.get("upserted") or 0)
+                st.caption(
+                    f"Saved {len(meta['prospects'])} prospects "
+                    f"({with_email} with email) · "
+                    f"**{list_n}** upserted to Drive list "
+                    f"(total **{status.get('total', '?')}**)."
+                )
+            except Exception as e:
+                st.caption(
+                    f"Saved {len(meta['prospects'])} prospects "
+                    f"({with_email} with email) for bulk draft/send "
+                    f"— Drive list save failed: {e}"
+                )
 
         sources = meta.get("sources") or []
         if sources:
