@@ -2,7 +2,8 @@
 streamlit>=1.36
 google-genai>=0.3.0
 google-api-python-client>=2.140
-google-auth-oauthlib>=1.2`r`ngoogle-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2.0
 beautifulsoup4>=4.12
 requests>=2.32
 pandas>=2.2
