@@ -542,6 +542,17 @@ class ZoomInfoConnector(ProspectConnector):
                 match_input["lastName"] = last
             if company:
                 match_input["companyName"] = company
+            domain = (
+                identifier.get("company_domain")
+                or identifier.get("company_domains")
+                or identifier.get("domain")
+                or ""
+            )
+            if isinstance(domain, list):
+                domain = domain[0] if domain else ""
+            domain = str(domain or "").strip().lower().removeprefix("www.")
+            if domain and "." in domain:
+                match_input["companyWebsite"] = domain
             # Try LinkedIn field when account supports it (ignored/invalid on some plans)
             if linkedin and not match_input.get("emailAddress") and not (
                 first and last and company

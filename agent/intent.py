@@ -634,6 +634,65 @@ def parse_contact_search_company(user_msg: str) -> str:
     return company
 
 
+_NAMED_PERSON_CONTACT_RE = re.compile(
+    r"\b(?:check|search|find|look\s*up|get|fetch|enrich|locate)\s+"
+    r"(?:(?:for|me)\s+)?(?:the\s+)?"
+    r"(?:contact|email|details?|info(?:rmation)?|profile)\s+"
+    r"(?:of|for)\s+"
+    r"([A-Za-z][A-Za-z.'\-]+(?:\s+[A-Za-z][A-Za-z.'\-]+){0,3})\s+"
+    r"(?:from|at|@|of|with)\s+"
+    r"("
+    r"[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}"  # domain
+    r"|[A-Za-z0-9][A-Za-z0-9&.\'\- ]{1,60}"  # company name
+    r")"
+    r"(?=\s*[.?!;,]|$|\s+and\b|\s+please\b|\s+thanks?\b)",
+    re.I,
+)
+
+# Fallback: "Saswati Swain from soprasteria.com" with a check/find verb elsewhere
+_NAMED_FROM_ORG_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z.'\-]+(?:\s+[A-Za-z][A-Za-z.'\-]+){1,3})\s+"
+    r"(?:from|at)\s+"
+    r"([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})\b",
+    re.I,
+)
+
+
+def parse_named_person_contact(user_msg: str) -> dict[str, str]:
+    """Parse 'check for contact of Saswati Swain from soprasteria.com' → person + org."""
+    msg = (user_msg or "").strip()
+    if not msg:
+        return {}
+    m = _NAMED_PERSON_CONTACT_RE.search(msg)
+    if not m and re.search(
+        r"\b(check|search|find|look\s*up|get|enrich|contact)\b", msg, re.I
+    ):
+        m = _NAMED_FROM_ORG_RE.search(msg)
+    if not m:
+        return {}
+    full_name = re.sub(r"\s+", " ", (m.group(1) or "").strip(" .,;:-"))
+    org = re.sub(r"\s+", " ", (m.group(2) or "").strip(" .,;:-"))
+    if len(full_name) < 3 or len(org) < 2:
+        return {}
+    parts = [p for p in full_name.split(" ") if p]
+    first = parts[0] if parts else ""
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    out: dict[str, str] = {
+        "name": full_name,
+        "first_name": first,
+        "last_name": last,
+    }
+    if "." in org and " " not in org:
+        # domain
+        out["company_domain"] = org.lower().removeprefix("www.")
+        # humanized company hint from domain label
+        label = out["company_domain"].split(".")[0].replace("-", " ").strip()
+        out["company"] = label.title() if label else org
+    else:
+        out["company"] = org
+    return out
+
+
 def wants_contact_search(user_msg: str) -> bool:
     """True when user wants ZoomInfo/prospect contact lookup, not an email draft."""
     msg = user_msg or ""
@@ -647,12 +706,14 @@ def wants_contact_search(user_msg: str) -> bool:
         re.I,
     ):
         return False
+    if parse_named_person_contact(msg):
+        return True
     if parse_contact_search_company(msg):
         return True
     return bool(
         re.search(
-            r"\b(?:search|find|look\s*up)\b.{0,40}\b(?:contacts?|prospects?)\b"
-            r".{0,40}\b(?:from|at|in|for)\b",
+            r"\b(?:search|find|look\s*up|check)\b.{0,40}\b(?:contacts?|prospects?)\b"
+            r".{0,60}\b(?:from|at|in|for|of)\b",
             msg,
             re.I,
         )
@@ -737,6 +798,11 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         action = "send_email" if send and not draft else "draft_email"
         agents = ["gmail", "web_research"]
         draft = action == "draft_email"
+    elif parse_named_person_contact(msg):
+        action = "prospect_enrich"
+        agents = ["zoominfo"]
+        draft = False
+        send = False
     elif wants_contact_search(msg):
         action = "prospect_search"
         agents = ["zoominfo"]
@@ -926,7 +992,10 @@ Return JSON:
     to_emails = _uniq(llm_to + roles.to + base.to_emails, exclude=exclude)
 
     action = str(data.get("action") or base.action).strip().lower()
-    if wants_contact_search(user_msg):
+    named = parse_named_person_contact(user_msg)
+    if named:
+        action = "prospect_enrich"
+    elif wants_contact_search(user_msg):
         action = "prospect_search"
     elif action == "research_then_zoom" and not looks_like_mission_org_discovery(
         user_msg
@@ -939,13 +1008,13 @@ Return JSON:
     if not isinstance(agents, list) or not agents:
         agents = list(base.agents)
     agents = [str(a).lower() for a in agents]
-    if wants_contact_search(user_msg):
+    if named or wants_contact_search(user_msg):
         agents = ["zoominfo"]
-        action = "prospect_search"
+        action = "prospect_enrich" if named else "prospect_search"
 
     draft = bool(data.get("draft")) if "draft" in data else base.draft
     send = bool(data.get("send")) if "send" in data else base.send
-    if wants_contact_search(user_msg):
+    if named or wants_contact_search(user_msg):
         draft = False
         send = False
     elif action in ("draft_email", "research_then_zoom") and not send:

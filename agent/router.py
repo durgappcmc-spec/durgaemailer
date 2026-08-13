@@ -23,6 +23,7 @@ from agent.intent import (
     parse_gmail_message_id,
     parse_like_sent_request,
     parse_mailbox_list_index,
+    parse_named_person_contact,
     plan_request,
     plan_summary,
     resolve_like_sent_from_history,
@@ -1484,8 +1485,23 @@ def answer(
         "chat": "CHAT",
     }
     planned_prefix = action_to_prefix.get(plan.action, "CHAT")
-    # Contact search must never be overridden into a draft
-    if wants_contact_search(user_msg or "") or planned_prefix == "PROSPECT_SEARCH":
+    named_person = parse_named_person_contact(user_msg or "")
+    # Named person lookup → enrich (internal first, then ZoomInfo)
+    if named_person or planned_prefix == "PROSPECT_ENRICH":
+        ident: dict[str, Any] = {}
+        if routing.startswith("PROSPECT_ENRICH:"):
+            ident = _parse_json_tail(routing, "PROSPECT_ENRICH:") or {}
+            if not isinstance(ident, dict):
+                ident = {}
+        if named_person:
+            ident = {**ident, **{k: v for k, v in named_person.items() if v}}
+        if ident.get("company_domain") and not ident.get("company"):
+            ident["company"] = str(ident["company_domain"]).split(".")[0]
+        if ident:
+            routing = "PROSPECT_ENRICH:" + json.dumps(ident, ensure_ascii=False)
+            meta_routing = routing
+    # Company-level contact search must never be overridden into a draft
+    elif wants_contact_search(user_msg or "") or planned_prefix == "PROSPECT_SEARCH":
         company = parse_contact_search_company(user_msg or "")
         q: dict[str, Any] = {
             "providers": ["zoominfo"],
@@ -2246,12 +2262,24 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     ident.setdefault("last_name", l)
             if not ident.get("company"):
                 company_m = re.search(
-                    r"\b(?:at|@|company)\s+([A-Za-z0-9&.\- ]{2,60})",
+                    r"\b(?:at|@|company|from)\s+([A-Za-z0-9&.\- ]{2,60})",
                     user_msg or "",
                     re.I,
                 )
                 if company_m:
                     ident["company"] = company_m.group(1).strip(" .,")
+            # Domain like soprasteria.com
+            if not ident.get("company_domain"):
+                dom_m = re.search(
+                    r"\b(?:from|at|@)\s+([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})\b",
+                    user_msg or "",
+                    re.I,
+                )
+                if dom_m:
+                    ident["company_domain"] = dom_m.group(1).lower().removeprefix("www.")
+            if ident.get("company_domain") and not ident.get("company"):
+                label = str(ident["company_domain"]).split(".")[0].replace("-", " ")
+                ident["company"] = label.title()
             if not ident:
                 ident = {"name": user_msg}
 
@@ -2274,9 +2302,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 )
                 or ""
             )
+            company_hint = str(
+                ident.get("company") or ident.get("company_domain") or ""
+            )
             if name_hint and not wants_force_refresh(user_msg or ""):
                 cached_people = find_by_person(
-                    name_hint, company=str(ident.get("company") or ""), limit=5
+                    name_hint, company=company_hint, limit=5
                 )
                 if cached_people:
                     best = next((p for p in cached_people if has_email(p)), None)
@@ -2289,11 +2320,19 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     else:
                         yield (
                             f"Saved **{cached_people[0].get('name') or 'contact'}** "
-                            "has no email — checking ZoomInfo automatically…\n"
+                            "has no email — checking ZoomInfo…\n"
                         )
+                else:
+                    yield (
+                        f"Not on your saved list — searching **ZoomInfo** for "
+                        f"**{name_hint}**"
+                        + (f" @ {company_hint}" if company_hint else "")
+                        + "…\n"
+                    )
 
             if result is None:
-                yield "Enriching contact…\n"
+                if not name_hint or wants_force_refresh(user_msg or ""):
+                    yield "Enriching contact via ZoomInfo…\n"
                 result = enrich_fallthrough(ident)
             if result and not result.get("error"):
                 prospect_out = [result]
