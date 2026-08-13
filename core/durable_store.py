@@ -318,16 +318,37 @@ def save_json_blob(
     if not sync_sheets:
         return True
     if key in _DRIVE_KEYS:
+        drive_ok = False
+        to_upload: Any = payload
         try:
             from core.drive_store import upload_json
 
             to_upload = _protect_drive_upload(key, payload, allow_empty=allow_empty)
             if to_upload is None:
-                return True
-            return upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
+                drive_ok = True  # intentionally skipped (protect cloud)
+            else:
+                drive_ok = bool(
+                    upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
+                )
         except Exception as e:
             print(f"[durable] drive save {key} failed: {e}", file=sys.stderr)
-            return False
+            drive_ok = False
+        # Second durable store: Sheets AppState (survives if Drive folder drifts)
+        if key in ("prospect_list", "memory_rows", "contact_aliases", "chat_messages"):
+            try:
+                if to_upload is not None and (
+                    not _is_empty_payload(to_upload) or allow_empty
+                ):
+                    text = json.dumps(to_upload, ensure_ascii=False, default=str)
+                    sheets_ok = _write_appstate_key(key, text)
+                    if sheets_ok:
+                        print(
+                            f"[durable] mirrored {key} to Sheets AppState",
+                            file=sys.stderr,
+                        )
+            except Exception as e:
+                print(f"[durable] sheets mirror {key} failed: {e}", file=sys.stderr)
+        return drive_ok
     try:
         text = json.dumps(payload, ensure_ascii=False, default=str)
         return _write_appstate_key(key, text)
@@ -340,25 +361,14 @@ def save_json_blob_async(
     key: str, payload: Any, *, allow_empty: bool = False
 ) -> None:
     """Non-blocking Drive/Sheets backup after local save."""
-    _save_local(key, payload)
-
+    # Reuse sync path so Drive + Sheets mirror stay consistent
     def _run() -> None:
         try:
-            if key in _DRIVE_KEYS:
-                from core.drive_store import upload_json
-
-                to_upload = _protect_drive_upload(
-                    key, payload, allow_empty=allow_empty
-                )
-                if to_upload is None:
-                    return
-                upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
-            else:
-                text = json.dumps(payload, ensure_ascii=False, default=str)
-                _write_appstate_key(key, text)
+            save_json_blob(key, payload, allow_empty=allow_empty)
         except Exception as e:
             print(f"[durable] async save {key} failed: {e}", file=sys.stderr)
 
+    _save_local(key, payload)
     threading.Thread(target=_run, daemon=True, name=f"durable-{key}").start()
 
 
@@ -413,11 +423,12 @@ def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
             return local
         data = json.loads(raw)
         if not _is_empty_payload(data):
+            print(f"[durable] restored {key} from Sheets AppState", file=sys.stderr)
             _save_local(key, data)
             return data
         return local if local is not None else data
     except Exception as e:
-        print(f"[durable] load {key} failed: {e}", file=sys.stderr)
+        print(f"[durable] sheets load {key} failed: {e}", file=sys.stderr)
         return local
 
 

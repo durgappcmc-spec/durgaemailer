@@ -265,6 +265,23 @@ def create_draft(
         return result
     except Exception as e:
         print(f"[gmail] create_draft error: {e}", file=sys.stderr)
+        # Still land on Drafts page via Drive so composed emails are not lost
+        fallback = _save_drive_only_draft(
+            to=to,
+            subject=subject,
+            html_body=instrumented_html,
+            recipient_name=recipient_name,
+            recipient_title=recipient_title,
+            company=company,
+            from_email=from_addr,
+            cc=cc,
+            tracking_id=tracking_id,
+            source=src,
+            gmail_error=str(e),
+        )
+        if fallback.get("draft_id"):
+            fallback["gmail_error"] = str(e)
+            return fallback
         return {
             "error": str(e),
             "tracking_id": tracking_id,
@@ -320,6 +337,69 @@ def _mirror_draft_to_drive(
         )
     except Exception as e:
         print(f"[gmail] drive draft mirror skipped: {e}", file=sys.stderr)
+
+
+def _save_drive_only_draft(
+    *,
+    to: str,
+    subject: str,
+    html_body: str,
+    recipient_name: Optional[str] = None,
+    recipient_title: Optional[str] = None,
+    company: Optional[str] = None,
+    from_email: Optional[str] = None,
+    cc: Optional[str | list[str]] = None,
+    tracking_id: Optional[str] = None,
+    source: str = "",
+    gmail_error: str = "",
+) -> dict[str, Any]:
+    """Persist a draft to Drive when Gmail create is unavailable."""
+    import uuid
+
+    try:
+        from core import drive_db
+
+        drive_id = f"draft_{uuid.uuid4().hex[:12]}"
+        title = (recipient_title or "").strip()
+        co = (company or "").strip()
+        payload = {
+            "draft_id": drive_id,
+            "to": to or "",
+            "recipient": to or "",
+            "recipient_name": recipient_name or "",
+            "title": title,
+            "designation": title,
+            "company": co,
+            "cc": _normalize_cc(cc),
+            "subject": subject or "(no subject)",
+            "body_html": html_body or "",
+            "tracking_id": tracking_id or "",
+            "status": "draft",
+            "source": source or "drive_fallback_draft",
+            "from": from_email or "",
+            "gmail_error": (gmail_error or "")[:500],
+        }
+        drive_db.save_draft(drive_id, payload)
+        return {
+            "draft_id": drive_id,
+            "tracking_id": tracking_id or "",
+            "tracked": bool(tracking_id),
+            "from": from_email or "",
+            "to": to or "",
+            "cc": _normalize_cc(cc),
+            "subject": subject or "(no subject)",
+            "body_html": html_body or "",
+            "title": title,
+            "company": co,
+            "drive_only": True,
+        }
+    except Exception as e:
+        print(f"[gmail] drive-only draft save failed: {e}", file=sys.stderr)
+        return {"error": str(e)}
+
+
+# Public alias for chat/router fallbacks
+save_drive_only_draft = _save_drive_only_draft
 
 
 def send_email(

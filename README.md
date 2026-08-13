@@ -99,7 +99,22 @@ Repo: [github.com/durgappcmc-spec/durgaemailer](https://github.com/durgappcmc-sp
 2. Uses `Dockerfile` + `render.yaml` → service `durgaemailer-relay`
 3. Set env vars in Render: `GEMINI_API_KEY`, sheet/tracking URLs, and for Gmail
    `GMAIL_OAUTH_JSON` + `GMAIL_TOKEN_JSON` (paste JSON file contents)
-4. Public app URL: `https://durgaemailer-relay.onrender.com` (exact host shown in Render)
+4. **Required for prospects to survive deploys** — pin Drive memory:
+   - `BOOTSTRAP_TOKEN_JSON` = contents of `credentials/bootstrap_token.json`
+     (must include `drive.file` + `spreadsheets` scopes)
+   - `RELAY_DRIVE_FOLDER_ID` = Google Drive folder id for **Relay Memory**
+     (from `https://drive.google.com/drive/folders/<ID>`)
+   - Or run from this repo (needs a Render API key):
+
+```powershell
+# one-time: API key from https://dashboard.render.com/u/settings#api-keys
+# (also store as RENDER_API_KEY in local .env — never commit .env)
+powershell -File scripts/sync_render_drive_env.ps1 -Deploy
+```
+
+   Render CLI (v2.22+) is installed under `%LOCALAPPDATA%\Programs\render-cli`
+   (`render.exe`). Add that folder to PATH, then `render login` for interactive use.
+5. Public app URL: `https://durgaemailer-relay.onrender.com` (exact host shown in Render)
 
 Wire Netlify portal (no tunnel):
 
@@ -123,6 +138,9 @@ Free Render instances sleep after idle; first open can take ~30–60s.
 
 - **Gemini quota exceeded** — wait for daily reset or upgrade billing in AI Studio.
 - **Gmail token expired** — delete `credentials/gmail_token.json` and rerun; browser consent will refresh.
+- **Prospects wiped after Render deploy** — local disk is ephemeral. Set `BOOTSTRAP_TOKEN_JSON` +
+  `RELAY_DRIVE_FOLDER_ID` on the service (see Setup §10), then
+  `powershell -File scripts/sync_render_drive_env.ps1 -Deploy`. Prospects also mirror to Sheets AppState.
 - **Apps Script permission prompts** — click Advanced → Go to &lt;project&gt; (unsafe) → Allow.
 - **Netlify HTTPS delay** — custom domains can take up to ~5 minutes to provision certs.
 - **Chroma on Streamlit Cloud** — local disk is not durable; use Chroma Cloud or Supabase pgvector for production.

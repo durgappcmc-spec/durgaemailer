@@ -153,18 +153,20 @@ div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) butt
     unsafe_allow_html=True,
 )
 
+# Drive first so the page is not blank while Gmail metadata loads
+try:
+    with st.spinner("Loading Drive drafts…"):
+        drive_rows = drive_db.list_drafts(limit=5000, offset=0)
+except Exception as e:
+    st.error(f"Could not load Drive drafts index: {e}")
+    drive_rows = []
+
 with st.spinner("Loading Gmail drafts…"):
     gmail_rows = list_gmail_drafts(limit=50)
 gmail_err = next((r for r in gmail_rows if r.get("error")), None)
 if gmail_err:
     st.warning(f"Gmail drafts unavailable: {gmail_err.get('error')}")
     gmail_rows = []
-
-try:
-    drive_rows = drive_db.list_drafts(limit=5000, offset=0)
-except Exception as e:
-    st.error(f"Could not load Drive drafts index: {e}")
-    drive_rows = []
 
 by_id: dict[str, Any] = {}
 for r in drive_rows:

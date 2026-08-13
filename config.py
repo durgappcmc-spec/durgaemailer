@@ -141,6 +141,6 @@ if settings.GMAIL_TOKEN_JSON:
         token_path.write_text(settings.GMAIL_TOKEN_JSON, encoding="utf-8")
 if settings.BOOTSTRAP_TOKEN_JSON:
     boot_path = Path(settings.BOOTSTRAP_TOKEN_PATH)
-    if not boot_path.exists():
-        boot_path.parent.mkdir(parents=True, exist_ok=True)
-        boot_path.write_text(settings.BOOTSTRAP_TOKEN_JSON, encoding="utf-8")
+    boot_path.parent.mkdir(parents=True, exist_ok=True)
+    # Always rewrite from env so Render deploys don't keep a stale empty file
+    boot_path.write_text(settings.BOOTSTRAP_TOKEN_JSON, encoding="utf-8")

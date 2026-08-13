@@ -79,6 +79,8 @@ Actions (pick one):
 Critical:
 - "search for contact from RateGain" / "find contacts at Acme" → prospect_search only.
   Never draft_email unless they also ask to draft/write/send an email.
+- "search contacts from Sterlite Tech and create draft like email@…" → prospect_search
+  with draft=true + like_sent_to (ZoomInfo first, then draft). Do NOT skip ZoomInfo.
 - csr@karunamedia.org / "from CSR" / "as CSR" means the SENDER identity, NOT a search for CSR NGOs.
 - If they already have contacts/prospects/list and ask to draft, use draft_email (agents: gmail).
 - Put every CC address in cc (array). Never drop the second CC.
@@ -478,6 +480,11 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
         explicit = parse_explicit_draft_company(msg)
         if explicit and explicit.lower() != reference.lower():
             return explicit
+        # "search contacts from Sterlite … and draft like email@" → Sterlite is target
+        contact_co = parse_contact_search_company(msg)
+        if contact_co and contact_co.lower() != (reference or "").lower():
+            if "@" not in contact_co:
+                return contact_co
         for fm in re.finditer(
             rf"\b(?:for|about|targeting)\s+{company}",
             msg,
@@ -695,7 +702,8 @@ _CONTACT_SEARCH_RE = re.compile(
     r"(?:who\s+(?:is|are)\s+(?:the\s+)?(?:contacts?|csr|partnerships?)\s+(?:at|from|in)\s+)"
     r")"
     r"([A-Za-z0-9][A-Za-z0-9&.\'\- ]{1,80}?)(?="
-    r"\s*[.?!]|$|\s+and\s+(?:draft|email|send)|"
+    r"\s*[.?!]|$|"
+    r"\s+and\s+(?:then\s+)?(?:create|write|compose|make|draft|email|send)\b|"
     r"\s+(?:then|please|thanks|thank you)\b"
     r")",
     re.I,
@@ -711,9 +719,10 @@ def parse_contact_search_company(user_msg: str) -> str:
     if not m:
         return ""
     company = (m.group(1) or "").strip(" .,;:-")
-    # Drop trailing junk
+    # Drop trailing junk / draft verbs that leaked past the lookahead
     company = re.sub(
-        r"\b(please|thanks|thank you|contacts?|emails?|people)\b.*$",
+        r"\b(please|thanks|thank you|contacts?|emails?|people|"
+        r"and\s+(?:then\s+)?(?:create|write|compose|make|draft).*)\b.*$",
         "",
         company,
         flags=re.I,
@@ -795,11 +804,24 @@ def wants_saved_list_only(user_msg: str) -> bool:
 
 
 def wants_contact_search(user_msg: str) -> bool:
-    """True when user wants ZoomInfo/prospect contact lookup, not an email draft."""
+    """True when user wants ZoomInfo/prospect contact lookup (possibly before draft)."""
     msg = user_msg or ""
+    company = parse_contact_search_company(msg)
+    # Same-turn: "search contacts from X and create draft like …" → ZoomInfo first
+    if company and (
+        parse_like_sent_request(msg)
+        or re.search(
+            r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b"
+            r"|\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b.{0,80}"
+            r"\b(?:search|find|look\s*up)\b.{0,40}\b(?:contacts?|prospects?)\b",
+            msg,
+            re.I | re.S,
+        )
+    ):
+        return True
     if parse_like_sent_request(msg):
         return False
-    # Explicit draft/send in the same message → not search-only
+    # Explicit draft/send without a contact-search phrase → not search
     if re.search(
         r"\b(draft|compose|write|send\s+now|create\s+(an?\s+)?email|"
         r"outreach\s+email|mail\s+them)\b",
@@ -809,7 +831,7 @@ def wants_contact_search(user_msg: str) -> bool:
         return False
     if parse_named_person_contact(msg):
         return True
-    if parse_contact_search_company(msg):
+    if company:
         return True
     return bool(
         re.search(
@@ -817,6 +839,22 @@ def wants_contact_search(user_msg: str) -> bool:
             r".{0,60}\b(?:from|at|in|for|of)\b",
             msg,
             re.I,
+        )
+    )
+
+
+def wants_search_then_draft(user_msg: str) -> bool:
+    """Contact search + draft/like-sent in one message → ZoomInfo then draft."""
+    msg = user_msg or ""
+    if not parse_contact_search_company(msg):
+        return False
+    if parse_like_sent_request(msg):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b",
+            msg,
+            re.I | re.S,
         )
     )
 
@@ -893,6 +931,9 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     like_sent_for = (like_sent or {}).get("target") or ""
     if not like_sent_for:
         like_sent_for = parse_explicit_draft_company(msg)
+    contact_company = parse_contact_search_company(msg)
+    if not like_sent_for and contact_company:
+        like_sent_for = contact_company
     like_sent_message_id = parse_gmail_message_id(msg)
     clone_from_hist = looks_like_history_email_clone(msg)
     clone_from_index = parse_mailbox_list_index(msg) is not None and bool(
@@ -904,7 +945,20 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     if like_sent_to and "@" in like_sent_to:
         to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
 
-    if like_sent_to or like_sent_message_id or clone_from_hist or clone_from_index:
+    # ZoomInfo first when user asks to search contacts AND draft/like-sent
+    if contact_company and (
+        like_sent_to
+        or like_sent_message_id
+        or wants_search_then_draft(msg)
+        or (
+            draft
+            and re.search(r"\b(search|find|look\s*up)\b.{0,40}\b(contacts?|prospects?)\b", msg, re.I)
+        )
+    ):
+        action = "prospect_search"
+        agents = ["zoominfo", "gmail", "web_research"]
+        draft = True
+    elif like_sent_to or like_sent_message_id or clone_from_hist or clone_from_index:
         action = "send_email" if send and not draft else "draft_email"
         agents = ["gmail", "web_research"]
         draft = action == "draft_email"

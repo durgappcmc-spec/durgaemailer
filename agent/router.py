@@ -33,6 +33,7 @@ from agent.intent import (
     wants_live_zoominfo_search,
     wants_previous_chat_recipient,
     wants_prospect_list_recipients,
+    wants_search_then_draft,
 )
 from agent.research_pipeline import (
     discover_orgs_from_web,
@@ -99,6 +100,8 @@ Rules:
   PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":50}
   "search for contact from RateGain Travel Technologies" →
   PROSPECT_SEARCH:{"company_names":["RateGain Travel Technologies"],"providers":["zoominfo"],"limit":25}
+  Same-turn: "search contacts from Sterlite Tech and create draft like email@…" →
+  PROSPECT_SEARCH with company_names + draft:true + like_sent_to (ZoomInfo first, then draft).
   Do NOT choose DRAFT_EMAIL for search-for-contact requests.
   Default limit 50; allow up to 100 when the user asks for a large list.
   Never ask the user for ZoomInfo credentials.
@@ -888,6 +891,92 @@ def _deliver_job(
     if do_send:
         return send_email(**kwargs), True
     return create_draft(**kwargs, track=True), False
+
+
+def _should_draft_after_prospect_search(
+    user_msg: str,
+    plan: IntentPlan,
+    search_opts: Optional[dict[str, Any]] = None,
+) -> bool:
+    """True when PROSPECT_SEARCH should continue into like-sent / draft."""
+    opts = search_opts or {}
+    if opts.get("draft") or opts.get("like_sent_to") or opts.get("like_sent_message_id"):
+        return True
+    if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
+        return True
+    if wants_search_then_draft(user_msg or ""):
+        return True
+    if parse_like_sent_request(user_msg or ""):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b",
+            user_msg or "",
+            re.I | re.S,
+        )
+    )
+
+
+def _draft_followup_message(user_msg: str, plan: IntentPlan) -> str:
+    """Rewrite search+draft into a draft-only follow-up (avoids re-running ZoomInfo)."""
+    like = parse_like_sent_request(user_msg or "") or {}
+    ref = (
+        (like.get("reference") or "").strip()
+        or (plan.like_sent_to or "").strip()
+        or ""
+    )
+    company = (
+        (like.get("target") or "").strip()
+        or (plan.like_sent_for or "").strip()
+        or parse_contact_search_company(user_msg or "")
+        or parse_explicit_draft_company(user_msg or "")
+        or ""
+    )
+    if ref and company:
+        return (
+            f"draft emails to these prospects for {company} like {ref} to above"
+        )
+    if ref:
+        return f"draft emails to these prospects like {ref} to above"
+    if company:
+        return f"draft personalized emails to these {company} prospects to above"
+    return "draft personalized emails to all these prospects"
+
+
+def _iter_draft_after_search(
+    *,
+    user_msg: str,
+    history: Optional[list[dict[str, str]]],
+    context: Optional[dict[str, Any]],
+    plan: IntentPlan,
+    prospects: list[dict[str, Any]],
+) -> Generator[str | dict[str, Any], None, None]:
+    """Continue into DRAFT_EMAIL using freshly searched contacts."""
+    with_email = [p for p in prospects if (p.get("email") or "").strip()]
+    if not with_email:
+        yield (
+            "\nNo emails on these contacts yet — cannot draft. "
+            "Try enriching, or ask again after ZoomInfo returns emails.\n"
+        )
+        return
+    draft_msg = _draft_followup_message(user_msg, plan)
+    yield (
+        f"\n**Next — drafting** for **{len(with_email)}** contacts "
+        f"(ZoomInfo search done)…\n"
+    )
+    draft_ctx = {
+        **(context or {}),
+        "prospects": with_email,
+        "_after_prospect_search": True,
+    }
+    for chunk in answer(draft_msg, history=history, context=draft_ctx):
+        if isinstance(chunk, dict) and "__meta__" in chunk:
+            # Parent answer emits the final meta — skip nested meta
+            continue
+        # Skip nested plan summary noise — keep draft progress lines
+        if isinstance(chunk, str) and chunk.startswith("**Plan:**"):
+            continue
+        yield chunk
 
 
 def _reference_org_for_swap(
@@ -1731,15 +1820,30 @@ def answer(
         if ident:
             routing = "PROSPECT_ENRICH:" + json.dumps(ident, ensure_ascii=False)
             meta_routing = routing
-    # Company-level contact search must never be overridden into a draft
-    elif wants_contact_search(user_msg or "") or planned_prefix == "PROSPECT_SEARCH":
-        company = parse_contact_search_company(user_msg or "")
+    # Company-level contact search must never be overridden into a draft-only path
+    # (search + like-sent still starts here, then continues to draft after ZoomInfo)
+    elif (
+        wants_contact_search(user_msg or "")
+        or wants_search_then_draft(user_msg or "")
+        or planned_prefix == "PROSPECT_SEARCH"
+    ):
+        company = parse_contact_search_company(user_msg or "") or (
+            plan.like_sent_for or ""
+        )
         q: dict[str, Any] = {
             "providers": ["zoominfo"],
             "limit": int(plan.search_limit or 25),
         }
         if company:
             q["company_names"] = [company]
+        if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
+            q["draft"] = True
+        if plan.like_sent_to:
+            q["like_sent_to"] = plan.like_sent_to
+        if plan.like_sent_for or company:
+            q["like_sent_for"] = plan.like_sent_for or company
+        if plan.like_sent_message_id:
+            q["like_sent_message_id"] = plan.like_sent_message_id
         # If classifier already produced PROSPECT_SEARCH JSON, merge company_names
         if routing.startswith("PROSPECT_SEARCH:"):
             existing = _parse_json_tail(routing, "PROSPECT_SEARCH:") or {}
@@ -1754,6 +1858,8 @@ def answer(
                 q = {**q, **existing}
                 if company:
                     q["company_names"] = [company]
+                if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
+                    q["draft"] = True
         routing = "PROSPECT_SEARCH:" + json.dumps(q, ensure_ascii=False)
         meta_routing = routing
     # Prefer planner over RESEARCH_THEN_ZOOM false positives (CSR-as-sender → NGO list)
@@ -2219,6 +2325,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     )
                     jobs = apply_email_cap(jobs, email_limit=email_cap)
                 ok_n = 0
+                fail_n = 0
                 for job in jobs:
                     if _stop_now():
                         yield stopped_message()
@@ -2233,19 +2340,36 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         out, did_send = _deliver_job(
                             job, want_send=want_send, user_msg=user_msg
                         )
+                        if out.get("error"):
+                            fail_n += 1
+                            yield (
+                                f"- Failed → **{job.get('recipient_email')}**: "
+                                f"{out.get('error')}\n"
+                            )
+                            continue
                         ok_n += 1
                         cc_note = f" cc {out.get('cc')}" if out.get("cc") else ""
+                        did = f"draft_id={out.get('draft_id')}" if out.get("draft_id") else ""
                         yield (
                             f"- {'Sent' if did_send else 'Drafted'} → "
                             f"**{job.get('recipient_email')}** "
-                            f"(from {out.get('from') or headers['from_email']}{cc_note})\n"
+                            f"(from {out.get('from') or headers['from_email']}{cc_note}"
+                            + (f"; {did}" if did else "")
+                            + ")\n"
                         )
                     except Exception as e:
+                        fail_n += 1
                         yield f"- Failed {job.get('recipient_email')}: {e}\n"
                 yield (
                     f"\nDone: **{ok_n}** "
-                    f"{'emails sent' if want_send else 'new tracked Gmail drafts created for review'}.\n"
+                    f"{'emails sent' if want_send else 'new tracked drafts for review'}"
+                    + (f", **{fail_n}** failed" if fail_n else "")
+                    + ".\n"
                 )
+                if ok_n and not want_send:
+                    yield (
+                        "Open **Drafts** (or Gmail → Drafts) to review, then send.\n"
+                    )
                 if chat_attachments and not email_atts:
                     yield (
                         _attach_note(
@@ -2372,23 +2496,37 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 yield "\n".join(ctx_lines)
                 if saved_ids:
                     yield f"\n\nKept **{len(saved_ids)}** contacts on your list."
-                yield (
-                    "\n\nNext: `draft emails to all these prospects` or "
-                    "`send personalized emails to this list`."
-                )
+                draft_after = _should_draft_after_prospect_search(
+                    user_msg or "", plan, q
+                ) and not (context or {}).get("_after_prospect_search")
+                if draft_after:
+                    for chunk in _iter_draft_after_search(
+                        user_msg=user_msg or "",
+                        history=history,
+                        context=context,
+                        plan=plan,
+                        prospects=ok,
+                    ):
+                        yield chunk
+                else:
+                    yield (
+                        "\n\nNext: `draft emails to all these prospects` or "
+                        "`send personalized emails to this list`."
+                    )
                 system = (
                     "Summarize these saved prospect list results for the user. "
                     "Highlight emails when present.\n\n" + "\n\n".join(ctx_lines)
                 )
                 if used_docs:
                     system += "\n\nUploaded file context:\n" + doc_context
-                for chunk in chat_grounded(
-                    user_msg, history=history, system=system, use_search=False
-                ):
-                    if isinstance(chunk, dict) and "__meta__" in chunk:
-                        sources = chunk["__meta__"].get("sources") or []
-                    else:
-                        yield chunk
+                if not draft_after:
+                    for chunk in chat_grounded(
+                        user_msg, history=history, system=system, use_search=False
+                    ):
+                        if isinstance(chunk, dict) and "__meta__" in chunk:
+                            sources = chunk["__meta__"].get("sources") or []
+                        else:
+                            yield chunk
                 sources.append(
                     {
                         "title": "prospect_list",
@@ -2463,10 +2601,23 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             f"\n\nSaved **{len(saved_ids)}** contacts to your prospect list "
                             f"(reused when email is on file; missing email auto-checks ZoomInfo)."
                         )
-                    yield (
-                        "\n\nNext: `draft emails to all these prospects` or "
-                        "`send personalized emails to this ZoomInfo list`."
-                    )
+                    draft_after = _should_draft_after_prospect_search(
+                        user_msg or "", plan, q
+                    ) and not (context or {}).get("_after_prospect_search")
+                    if draft_after:
+                        for chunk in _iter_draft_after_search(
+                            user_msg=user_msg or "",
+                            history=history,
+                            context=context,
+                            plan=plan,
+                            prospects=ok,
+                        ):
+                            yield chunk
+                    else:
+                        yield (
+                            "\n\nNext: `draft emails to all these prospects` or "
+                            "`send personalized emails to this ZoomInfo list`."
+                        )
                 system = (
                     "Summarize these prospect search results for the user. "
                     "Highlight emails when present. If emails exist, remind them they can "
@@ -2475,13 +2626,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 )
                 if used_docs:
                     system += "\n\nUploaded file context:\n" + doc_context
-                for chunk in chat_grounded(
-                    user_msg, history=history, system=system, use_search=False
-                ):
-                    if isinstance(chunk, dict) and "__meta__" in chunk:
-                        sources = chunk["__meta__"].get("sources") or []
-                    else:
-                        yield chunk
+                draft_after_live = bool(ok) and _should_draft_after_prospect_search(
+                    user_msg or "", plan, q
+                ) and not (context or {}).get("_after_prospect_search")
+                if not draft_after_live:
+                    for chunk in chat_grounded(
+                        user_msg, history=history, system=system, use_search=False
+                    ):
+                        if isinstance(chunk, dict) and "__meta__" in chunk:
+                            sources = chunk["__meta__"].get("sources") or []
+                        else:
+                            yield chunk
                 sources.append(
                     {
                         "title": "prospect_search",
@@ -2675,10 +2830,16 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         out, did_send = _deliver_job(
                             job, want_send=want_send, user_msg=user_msg
                         )
-                        yield (
-                            f"- {'Sent' if did_send else 'Drafted'}: "
-                            f"{json.dumps(out, default=str)}\n"
-                        )
+                        if out.get("error"):
+                            yield (
+                                f"- Failed for {job.get('recipient_email')}: "
+                                f"{out.get('error')}\n"
+                            )
+                        else:
+                            yield (
+                                f"- {'Sent' if did_send else 'Drafted'}: "
+                                f"{json.dumps(out, default=str)}\n"
+                            )
                     except Exception as e:
                         yield f"- Failed for {job.get('recipient_email')}: {e}\n"
                 if chat_attachments and not email_atts:
@@ -3492,15 +3653,51 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         action = "send" if want_send else "draft"
 
                         if not jobs:
-                            yield (
-                                f"I wrote a **{like_ref}**-style email for "
-                                f"**{target_company or 'your current org'}**, but need the "
-                                "**To** address from your chat (not the Sent template). "
-                                "Say e.g. `draft to person@currentorg.org` or "
-                                "`use the previous email from chat`.\n\n"
-                                f"**Subject:** {payload.get('subject')}\n\n"
-                                f"{payload.get('html_body')}\n"
-                            )
+                            # Still save the composed email to Drafts for review
+                            # (common when prospect list was empty after a redeploy).
+                            saved = False
+                            try:
+                                from gmail_client.send import save_drive_only_draft
+
+                                body = payload.get("html_body") or ""
+                                subj = payload.get("subject") or "(no subject)"
+                                if body.strip():
+                                    fb = save_drive_only_draft(
+                                        to="",
+                                        subject=subj,
+                                        html_body=body,
+                                        company=target_company or "",
+                                        from_email=headers.get("from_email"),
+                                        cc=headers.get("cc"),
+                                        source="like_sent_needs_to",
+                                        gmail_error="missing recipient",
+                                    )
+                                    if fb.get("draft_id"):
+                                        saved = True
+                                        yield (
+                                            f"I wrote a **{like_ref}**-style email for "
+                                            f"**{target_company or 'your current org'}**, "
+                                            f"but need a **To** address. Saved to "
+                                            f"**Drafts** (`{fb.get('draft_id')}`) — "
+                                            f"open it, set To, then send.\n\n"
+                                            f"Or say e.g. `draft to person@currentorg.org` "
+                                            f"or search contacts for that company first.\n"
+                                        )
+                            except Exception as e:
+                                print(
+                                    f"[router] like_sent drive fallback: {e}",
+                                    file=sys.stderr,
+                                )
+                            if not saved:
+                                yield (
+                                    f"I wrote a **{like_ref}**-style email for "
+                                    f"**{target_company or 'your current org'}**, but need the "
+                                    "**To** address from your chat (not the Sent template). "
+                                    "Say e.g. `draft to person@currentorg.org` or "
+                                    "`use the previous email from chat`.\n\n"
+                                    f"**Subject:** {payload.get('subject')}\n\n"
+                                    f"{payload.get('html_body')}\n"
+                                )
                         else:
                             yield (
                                 f"{'Sending' if want_send else 'Creating Gmail draft(s)'} "
@@ -3565,7 +3762,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 )
                             if not want_send and ok:
                                 yield (
-                                    "\nOpen Gmail → Drafts to review, then send. "
+                                    "\nOpen **Drafts** (or Gmail → Drafts) to review, then send. "
                                     "Tracking is embedded for 📬 Tracking after send.\n"
                                 )
                             for r in fail[:10]:
@@ -3740,7 +3937,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         yield f"_…and {len(ok) - 100} more._\n"
                     if not want_send:
                         yield (
-                            "\nOpen Gmail → Drafts to review, then send. "
+                            "\nOpen **Drafts** (or Gmail → Drafts) to review, then send. "
                             "Open/click tracking is already embedded "
                             "(visible in 📬 Tracking after send).\n"
                         )

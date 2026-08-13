@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import re
 import sys
-from email import message_from_bytes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 from gmail_client.auth import gmail_service
@@ -13,7 +13,11 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 
 def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
-    """Return lightweight Gmail draft rows (id, to, subject, snippet, updated)."""
+    """Return lightweight Gmail draft rows (id, to, subject, snippet, updated).
+
+    Uses metadata-only fetches (no full MIME) and parallelizes so the Drafts
+    page does not sit blank for tens of seconds.
+    """
     try:
         svc = gmail_service()
         res = (
@@ -26,31 +30,64 @@ def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
         print(f"[gmail] list drafts failed: {e}", file=sys.stderr)
         return [{"error": str(e)}]
 
-    out: list[dict[str, Any]] = []
-    for row in res.get("drafts") or []:
-        did = row.get("id") or ""
-        msg = row.get("message") or {}
-        mid = msg.get("id") or ""
-        # list payload is thin — fetch metadata for headers when possible
-        meta = _draft_headers(did) if did else {}
-        out.append(
-            {
-                "draft_id": f"gmail:{did}",
-                "gmail_draft_id": did,
-                "gmail_message_id": mid or meta.get("message_id") or "",
-                "recipient": meta.get("to") or "",
-                "to": meta.get("to") or "",
-                "cc": meta.get("cc") or "",
-                "subject": meta.get("subject") or "(no subject)",
-                "snippet": meta.get("snippet") or msg.get("snippet") or "",
-                "updated_at": meta.get("internal_date") or "",
-                "status": "draft",
-                "source": "gmail",
-                "tracking_id": meta.get("tracking_id") or "",
-                "has_open_pixel": bool(meta.get("has_open_pixel")),
-            }
-        )
-    return out
+    draft_ids = [
+        (row.get("id") or "")
+        for row in (res.get("drafts") or [])
+        if row.get("id")
+    ]
+    if not draft_ids:
+        return []
+
+    out_by_id: dict[str, dict[str, Any]] = {}
+
+    def _one(did: str) -> tuple[str, dict[str, Any]]:
+        meta = _draft_headers(did, format_="metadata")
+        mid = meta.get("message_id") or ""
+        return did, {
+            "draft_id": f"gmail:{did}",
+            "gmail_draft_id": did,
+            "gmail_message_id": mid,
+            "recipient": meta.get("to") or "",
+            "to": meta.get("to") or "",
+            "cc": meta.get("cc") or "",
+            "subject": meta.get("subject") or "(no subject)",
+            "snippet": meta.get("snippet") or "",
+            "updated_at": meta.get("internal_date") or "",
+            "status": "draft",
+            "source": "gmail",
+            "tracking_id": meta.get("tracking_id") or "",
+            "has_open_pixel": bool(meta.get("has_open_pixel")),
+        }
+
+    workers = min(8, max(1, len(draft_ids)))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, did) for did in draft_ids]
+            for fut in as_completed(futures):
+                try:
+                    did, row = fut.result()
+                    out_by_id[did] = row
+                except Exception as e:
+                    print(f"[gmail] draft meta failed: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[gmail] parallel draft list failed: {e}", file=sys.stderr)
+        for did in draft_ids:
+            try:
+                _, row = _one(did)
+                out_by_id[did] = row
+            except Exception:
+                out_by_id[did] = {
+                    "draft_id": f"gmail:{did}",
+                    "gmail_draft_id": did,
+                    "recipient": "",
+                    "to": "",
+                    "subject": "(gmail draft)",
+                    "status": "draft",
+                    "source": "gmail",
+                }
+
+    # Preserve Gmail list order
+    return [out_by_id[did] for did in draft_ids if did in out_by_id]
 
 
 def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
@@ -148,15 +185,19 @@ def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         return {"error": str(e), "gmail_draft_id": did, "tracking_id": tid}
 
 
-def _draft_headers(gmail_draft_id: str) -> dict[str, Any]:
+def _draft_headers(
+    gmail_draft_id: str, *, format_: str = "metadata"
+) -> dict[str, Any]:
     try:
         svc = gmail_service()
-        full = (
-            svc.users()
-            .drafts()
-            .get(userId="me", id=gmail_draft_id, format="full")
-            .execute()
-        )
+        kwargs: dict[str, Any] = {
+            "userId": "me",
+            "id": gmail_draft_id,
+            "format": format_,
+        }
+        if format_ == "metadata":
+            kwargs["metadataHeaders"] = ["To", "Cc", "Subject", "From"]
+        full = svc.users().drafts().get(**kwargs).execute()
     except Exception:
         return {}
     msg = full.get("message") or {}
@@ -164,8 +205,10 @@ def _draft_headers(gmail_draft_id: str) -> dict[str, Any]:
         h["name"].lower(): h["value"]
         for h in (msg.get("payload") or {}).get("headers") or []
     }
-    html, _text = _extract_bodies(msg.get("payload") or {})
-    tid = _extract_tracking_id(html or "")
+    html = ""
+    if format_ == "full":
+        html, _text = _extract_bodies(msg.get("payload") or {})
+    tid = _extract_tracking_id(html or "") if html else None
     to = headers.get("to") or ""
     to_email = (_EMAIL_RE.findall(to) or [to])[0] if to else ""
     internal = msg.get("internalDate")
