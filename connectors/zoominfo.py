@@ -173,12 +173,33 @@ class ZoomInfoConnector(ProspectConnector):
         limit = min(max(int(limit), 1), 100)
         results: list[dict[str, Any]] = []
 
-        # NGO / nonprofit geo searches: company-first, then direct contact search.
-        # (Free-text location/city fields 400 on this ZoomInfo tenant.)
-        if _is_nonprofit_query(query):
-            company_hits = self._search_companies(query, limit=min(limit, 100))
+        # Expand short aliases ("sterlite tech" → "Sterlite Technologies") so
+        # company + contact search hit the right firm.
+        query = _with_company_name_aliases(query)
+
+        # Company-first: resolve firm via /search/company, then contacts by
+        # companyId. Free-text companyName on /search/contact is unreliable for
+        # short names like "sterlite tech" (often 0 hits after we stopped
+        # merging polluted Saved-list rows).
+        cn_list = query.get("company_names") or []
+        if isinstance(cn_list, list) and cn_list:
+            rank_needle = str(cn_list[0])
+            names = _join(cn_list)
+        else:
+            names = _join(cn_list)
+            rank_needle = names
+        if names or _is_nonprofit_query(query):
+            company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
+            company_hits = _rank_companies_for_query(company_hits, rank_needle)
             if company_hits:
-                results.extend(self._contacts_for_companies(company_hits, limit=limit))
+                results.extend(
+                    self._contacts_for_companies(company_hits[:5], limit=limit)
+                )
+                print(
+                    f"[zoominfo] company-first: {len(company_hits)} firms → "
+                    f"{len(results)} contacts (q={rank_needle!r})",
+                    file=sys.stderr,
+                )
 
         body = _build_contact_search_body(query, limit=limit)
         if not body and not results:
@@ -265,48 +286,28 @@ class ZoomInfoConnector(ProspectConnector):
     def _search_companies(
         self, query: dict[str, Any], limit: int = 10
     ) -> list[dict[str, Any]]:
-        body: dict[str, Any] = {"rpp": min(max(int(limit), 1), 100), "page": 1}
-        names = _join(query.get("company_names") or "")
-        keywords = _join(query.get("keywords") or "")
-        blob = f"{names} {keywords}".lower()
-        if names and not re.search(r"\bngo\b|\bnonprofit\b|\bnon-profit\b", names, re.I):
-            body["companyName"] = names
+        raw = query.get("company_names") or query.get("companies") or query.get("company") or ""
+        if isinstance(raw, list):
+            name_candidates = [str(v).strip() for v in raw if str(v).strip()]
         else:
-            body["companyName"] = "NGO"
-        if re.search(r"foundation|trust|nonprofit|non-profit|ngo", blob):
-            body["companyDescription"] = "NGO OR nonprofit OR foundation OR trust"
+            joined = _join(raw)
+            name_candidates = [joined] if joined else []
+        keywords = _join(query.get("keywords") or "")
+        nonprofit = _is_nonprofit_query(query)
+        if not name_candidates and nonprofit:
+            name_candidates = ["NGO"]
+        if not name_candidates and not keywords and not query.get("company_domains"):
+            return []
+
         geo = _geo_filters(query)
-        body.update(geo)
-        if query.get("company_domains"):
-            body["companyWebsite"] = _join(query["company_domains"])
-        try:
-            resp = requests.post(
-                f"{self.BASE}/search/company",
-                headers=self._headers(),
-                json=body,
-                timeout=45,
-            )
-            if resp.status_code == 400:
-                body.pop("zipCode", None)
-                body.pop("city", None)
-                body.pop("location", None)
-                body.pop("state", None)
-                if "country" not in body:
-                    body["country"] = _guess_country(query) or "India"
-                resp = requests.post(
-                    f"{self.BASE}/search/company",
-                    headers=self._headers(),
-                    json=body,
-                    timeout=45,
-                )
-            resp.raise_for_status()
-            rows = (resp.json() or {}).get("data") or []
-            # Prefer companies actually in the requested city when ZoomInfo returns city
-            want_cities = {
-                c
-                for c in _CITY_ZIPS
-                if re.search(rf"\b{re.escape(c)}\b", _query_blob(query))
-            }
+        want_cities = {
+            c
+            for c in _CITY_ZIPS
+            if re.search(rf"\b{re.escape(c)}\b", _query_blob(query))
+        }
+        by_id: dict[str, dict] = {}
+
+        def _ingest(rows: list) -> None:
             if want_cities:
                 local = [
                     r
@@ -318,10 +319,92 @@ class ZoomInfoConnector(ProspectConnector):
                 ]
                 if local:
                     rows = local
-            return [r for r in rows if isinstance(r, dict)]
-        except Exception as e:
-            print(f"[zoominfo] company search error: {e}", file=sys.stderr)
-            return []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                cid = str(r.get("id") or r.get("companyId") or "").strip()
+                key = cid or f"name:{(r.get('name') or r.get('companyName') or '')}"
+                if key and key not in by_id:
+                    by_id[key] = r
+
+        def _post_company(body: dict[str, Any], label: str) -> None:
+            try:
+                resp = requests.post(
+                    f"{self.BASE}/search/company",
+                    headers=self._headers(),
+                    json=body,
+                    timeout=45,
+                )
+                if resp.status_code == 400:
+                    body = dict(body)
+                    body.pop("zipCode", None)
+                    body.pop("city", None)
+                    body.pop("location", None)
+                    body.pop("state", None)
+                    if "country" not in body:
+                        body["country"] = _guess_country(query) or "India"
+                    resp = requests.post(
+                        f"{self.BASE}/search/company",
+                        headers=self._headers(),
+                        json=body,
+                        timeout=45,
+                    )
+                if resp.status_code >= 400:
+                    print(
+                        f"[zoominfo] company search {resp.status_code} for {label!r}: "
+                        f"{(resp.text or '')[:200]}",
+                        file=sys.stderr,
+                    )
+                    return
+                _ingest((resp.json() or {}).get("data") or [])
+            except Exception as e:
+                print(f"[zoominfo] company search error ({label!r}): {e}", file=sys.stderr)
+
+        # One companyName per request — comma-joining aliases confuses ZoomInfo.
+        # Do not AND website on the same request; domain is a separate fallback.
+        for names in (name_candidates or [""])[:6]:
+            body: dict[str, Any] = {
+                "rpp": min(max(int(limit), 1), 100),
+                "page": 1,
+            }
+            if names and not re.search(
+                r"\bngo\b|\bnonprofit\b|\bnon-profit\b", names, re.I
+            ):
+                body["companyName"] = names
+            elif nonprofit or not names:
+                body["companyName"] = names or "NGO"
+            else:
+                body["companyName"] = names
+            blob = f"{names} {keywords}".lower()
+            if re.search(r"foundation|trust|nonprofit|non-profit|ngo", blob):
+                body["companyDescription"] = "NGO OR nonprofit OR foundation OR trust"
+            if keywords and "companyName" not in body:
+                body["companyKeywords"] = keywords
+            body.update(geo)
+            _post_company(body, names)
+            if len(by_id) >= max(limit, 10):
+                break
+
+        if not by_id and query.get("company_domains"):
+            for dom in (
+                query["company_domains"]
+                if isinstance(query["company_domains"], list)
+                else [_join(query["company_domains"])]
+            )[:3]:
+                d = str(dom or "").strip()
+                if not d:
+                    continue
+                body = {
+                    "rpp": min(max(int(limit), 1), 100),
+                    "page": 1,
+                    "companyWebsite": d,
+                }
+                body.update(geo)
+                _post_company(body, f"domain:{d}")
+                if by_id:
+                    break
+
+        return list(by_id.values())
 
     def _contacts_for_companies(
         self, companies: list[dict[str, Any]], limit: int = 10
@@ -920,6 +1003,107 @@ def _is_nonprofit_query(query: dict[str, Any]) -> bool:
     )
 
 
+# Short user phrases → ZoomInfo-friendly legal / brand names
+_COMPANY_ALIASES: dict[str, list[str]] = {
+    "sterlite tech": ["Sterlite Technologies", "Sterlite Technologies Limited", "STL"],
+    "sterlite technology": ["Sterlite Technologies", "Sterlite Technologies Limited"],
+    "sterlite technologies": ["Sterlite Technologies", "Sterlite Technologies Limited"],
+    "sterlite": ["Sterlite Technologies", "Sterlite Technologies Limited"],
+}
+
+# Optional website domains to help company match
+_COMPANY_DOMAINS: dict[str, list[str]] = {
+    "sterlite tech": ["sterlitetech.com", "stl.tech"],
+    "sterlite technology": ["sterlitetech.com", "stl.tech"],
+    "sterlite technologies": ["sterlitetech.com", "stl.tech"],
+    "sterlite": ["sterlitetech.com", "stl.tech"],
+}
+
+
+def _with_company_name_aliases(query: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow-copied query with expanded company_names for better ZI hits."""
+    names = query.get("company_names") or query.get("companies") or query.get("company")
+    if isinstance(names, str):
+        names_list = [names]
+    elif isinstance(names, list):
+        names_list = [str(x) for x in names if x]
+    else:
+        return query
+    if not names_list:
+        return query
+    expanded: list[str] = []
+    seen: set[str] = set()
+    domain_extra: list[str] = []
+    for raw in names_list:
+        key = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        for cand in [raw] + _COMPANY_ALIASES.get(key, []):
+            c = str(cand).strip()
+            if not c:
+                continue
+            lk = c.lower()
+            if lk in seen:
+                continue
+            seen.add(lk)
+            expanded.append(c)
+        for d in _COMPANY_DOMAINS.get(key, []):
+            if d and d not in domain_extra:
+                domain_extra.append(d)
+    out = dict(query)
+    if expanded != names_list:
+        out["company_names"] = expanded
+    if domain_extra:
+        existing = out.get("company_domains") or out.get("domains") or []
+        if isinstance(existing, str):
+            existing = [existing] if existing.strip() else []
+        elif not isinstance(existing, list):
+            existing = []
+        merged_doms = list(existing)
+        for d in domain_extra:
+            if d not in merged_doms:
+                merged_doms.append(d)
+        out["company_domains"] = merged_doms
+    return out
+
+
+def _rank_companies_for_query(
+    companies: list[dict[str, Any]], needle: str
+) -> list[dict[str, Any]]:
+    """Prefer firms whose name matches the user query (Sterlite Technologies > noise)."""
+    needle_n = re.sub(r"[^a-z0-9]+", " ", (needle or "").lower()).strip()
+    tokens = [t for t in needle_n.split() if len(t) >= 4]
+
+    def score(co: dict[str, Any]) -> tuple[int, str]:
+        name = str(co.get("name") or co.get("companyName") or "").lower()
+        name_n = re.sub(r"[^a-z0-9]+", " ", name).strip()
+        sc = 0
+        if needle_n and needle_n in name_n:
+            sc += 100
+        if name_n and needle_n and name_n in needle_n:
+            sc += 40
+        for t in tokens:
+            if t in name_n:
+                sc += 20
+        # Prefer exact-ish brand hits over vague subsidiaries
+        if "sterlite" in tokens and "sterlite" in name_n and "technolog" in name_n:
+            sc += 50
+        return (-sc, name)
+
+    ranked = sorted([c for c in companies if isinstance(c, dict)], key=score)
+    # Drop zero-signal firms when we have a distinctive token
+    if tokens:
+        kept = [
+            c
+            for c in ranked
+            if any(
+                t in re.sub(r"[^a-z0-9]+", " ", str(c.get("name") or "").lower())
+                for t in tokens
+            )
+        ]
+        if kept:
+            return kept
+    return ranked
+
+
 def _guess_country(query: dict[str, Any]) -> str:
     if query.get("country"):
         return str(query["country"]).strip()
@@ -1012,7 +1196,14 @@ def _build_contact_search_body(query: dict[str, Any], limit: int = 10) -> dict[s
     if titles:
         body["jobTitle"] = titles
 
-    names = _join(query.get("company_names") or "")
+    raw_names = query.get("company_names") or ""
+    if isinstance(raw_names, list):
+        # Prefer the longest alias (e.g. "Sterlite Technologies Limited") over
+        # short nicknames when doing direct /search/contact.
+        cands = [str(x).strip() for x in raw_names if str(x).strip()]
+        names = max(cands, key=len) if cands else ""
+    else:
+        names = _join(raw_names)
     if names:
         body["companyName"] = names
     elif _is_nonprofit_query(query):
