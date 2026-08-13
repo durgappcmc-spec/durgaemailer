@@ -67,7 +67,9 @@ Actions (pick one):
 - memory: recall saved notes/prospects
 - research_then_zoom: ONLY when they want to DISCOVER orgs matching a mission
   (e.g. find NGOs for girls 16+ skilling) then ZoomInfo contacts / drafts
-- prospect_search: ZoomInfo/Apollo search with known company/title filters
+- prospect_search: ZoomInfo/Apollo search with known company/title filters.
+  Use this when they say "search for contact(s) from/at COMPANY" or
+  "find contacts at COMPANY" — do NOT draft an email.
 - prospect_enrich: enrich one person (LinkedIn URL or name+company)
 - gmail_extract: read inbox/sent
 - draft_email: create Gmail draft(s) for review
@@ -75,6 +77,8 @@ Actions (pick one):
 - schedule_email: queue for later
 
 Critical:
+- "search for contact from RateGain" / "find contacts at Acme" → prospect_search only.
+  Never draft_email unless they also ask to draft/write/send an email.
 - csr@karunamedia.org / "from CSR" / "as CSR" means the SENDER identity, NOT a search for CSR NGOs.
 - If they already have contacts/prospects/list and ask to draft, use draft_email (agents: gmail).
 - Put every CC address in cc (array). Never drop the second CC.
@@ -589,6 +593,72 @@ def org_label_from_email(email: str) -> str:
     return base or email
 
 
+_CONTACT_SEARCH_RE = re.compile(
+    r"\b(?:"
+    r"(?:search|find|look\s*up|get|pull|fetch)\s+"
+    r"(?:(?:for|me)\s+)?"
+    r"(?:a\s+|the\s+|any\s+)?"
+    r"(?:contacts?|people|prospects?|persons?)\s+"
+    r"(?:from|at|in|of|for)\s+"
+    r"|"
+    r"(?:contacts?|people|prospects?)\s+(?:from|at|in|of)\s+"
+    r"|"
+    r"(?:who\s+(?:is|are)\s+(?:the\s+)?(?:contacts?|csr|partnerships?)\s+(?:at|from|in)\s+)"
+    r")"
+    r"([A-Za-z0-9][A-Za-z0-9&.\'\- ]{1,80}?)(?="
+    r"\s*[.?!]|$|\s+and\s+(?:draft|email|send)|"
+    r"\s+(?:then|please|thanks|thank you)\b"
+    r")",
+    re.I,
+)
+
+
+def parse_contact_search_company(user_msg: str) -> str:
+    """Extract company when user asks to search contacts at a named org."""
+    msg = (user_msg or "").strip()
+    if not msg:
+        return ""
+    m = _CONTACT_SEARCH_RE.search(msg)
+    if not m:
+        return ""
+    company = (m.group(1) or "").strip(" .,;:-")
+    # Drop trailing junk
+    company = re.sub(
+        r"\b(please|thanks|thank you|contacts?|emails?|people)\b.*$",
+        "",
+        company,
+        flags=re.I,
+    ).strip(" .,;:-")
+    if len(company) < 2:
+        return ""
+    return company
+
+
+def wants_contact_search(user_msg: str) -> bool:
+    """True when user wants ZoomInfo/prospect contact lookup, not an email draft."""
+    msg = user_msg or ""
+    if parse_like_sent_request(msg):
+        return False
+    # Explicit draft/send in the same message → not search-only
+    if re.search(
+        r"\b(draft|compose|write|send\s+now|create\s+(an?\s+)?email|"
+        r"outreach\s+email|mail\s+them)\b",
+        msg,
+        re.I,
+    ):
+        return False
+    if parse_contact_search_company(msg):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:search|find|look\s*up)\b.{0,40}\b(?:contacts?|prospects?)\b"
+            r".{0,40}\b(?:from|at|in|for)\b",
+            msg,
+            re.I,
+        )
+    )
+
+
 def looks_like_mission_org_discovery(user_msg: str) -> bool:
     """True only when user wants to discover mission-fit orgs (not CSR-as-sender)."""
     msg = user_msg or ""
@@ -667,6 +737,11 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         action = "send_email" if send and not draft else "draft_email"
         agents = ["gmail", "web_research"]
         draft = action == "draft_email"
+    elif wants_contact_search(msg):
+        action = "prospect_search"
+        agents = ["zoominfo"]
+        draft = False
+        send = False
     elif looks_like_mission_org_discovery(msg):
         action = "research_then_zoom"
         agents = ["web_research", "zoominfo"]
@@ -686,12 +761,18 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         if draft or send or re.search(r"\b(email|mail|outreach)\b", msg, re.I):
             agents.append("gmail")
             draft = draft or not send
-    elif re.search(r"\b(zoom\s*info|zoominfo|apollo|rocketreach|prospect)\b", msg, re.I):
+    elif re.search(
+        r"\b(zoom\s*info|zoominfo|apollo|rocketreach|prospect|"
+        r"search\s+(for\s+)?(contacts?|people)|find\s+(contacts?|people))\b",
+        msg,
+        re.I,
+    ):
         action = "prospect_search"
         agents = ["zoominfo"]
     elif draft or send or to_emails or re.search(
-        r"\b(email|outreach|follow[- ]?up)\b", msg, re.I
+        r"\b(draft|compose|write|outreach|follow[- ]?up)\b", msg, re.I
     ):
+        # "email" alone is too broad (e.g. "search contact email at X") — require draft verbs
         action = "send_email" if send and not draft else "draft_email"
         agents = ["gmail"]
         draft = action == "draft_email"
@@ -845,7 +926,9 @@ Return JSON:
     to_emails = _uniq(llm_to + roles.to + base.to_emails, exclude=exclude)
 
     action = str(data.get("action") or base.action).strip().lower()
-    if action == "research_then_zoom" and not looks_like_mission_org_discovery(
+    if wants_contact_search(user_msg):
+        action = "prospect_search"
+    elif action == "research_then_zoom" and not looks_like_mission_org_discovery(
         user_msg
     ):
         action = "draft_email" if (base.draft or data.get("draft")) else base.action
@@ -856,10 +939,16 @@ Return JSON:
     if not isinstance(agents, list) or not agents:
         agents = list(base.agents)
     agents = [str(a).lower() for a in agents]
+    if wants_contact_search(user_msg):
+        agents = ["zoominfo"]
+        action = "prospect_search"
 
     draft = bool(data.get("draft")) if "draft" in data else base.draft
     send = bool(data.get("send")) if "send" in data else base.send
-    if action in ("draft_email", "research_then_zoom") and not send:
+    if wants_contact_search(user_msg):
+        draft = False
+        send = False
+    elif action in ("draft_email", "research_then_zoom") and not send:
         draft = True
 
     vol = parse_research_limits(user_msg)

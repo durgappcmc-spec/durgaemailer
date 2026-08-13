@@ -19,6 +19,7 @@ from agent.intent import (
     classify_email_roles,
     filter_recipient_emails,
     org_label_from_email,
+    parse_contact_search_company,
     parse_gmail_message_id,
     parse_like_sent_request,
     parse_mailbox_list_index,
@@ -26,6 +27,7 @@ from agent.intent import (
     plan_summary,
     resolve_like_sent_from_history,
     resolve_to_emails_from_history,
+    wants_contact_search,
     wants_previous_chat_recipient,
 )
 from agent.research_pipeline import (
@@ -91,6 +93,9 @@ Rules:
   JSON keys may include titles, company_names, company_domains, locations, seniorities, keywords, providers (array), limit.
   Prefer ZoomInfo when the user says ZoomInfo / ZI. Example:
   PROSPECT_SEARCH:{"titles":["CEO"],"company_names":["Acme"],"providers":["zoominfo"],"limit":50}
+  "search for contact from RateGain Travel Technologies" →
+  PROSPECT_SEARCH:{"company_names":["RateGain Travel Technologies"],"providers":["zoominfo"],"limit":25}
+  Do NOT choose DRAFT_EMAIL for search-for-contact requests.
   Default limit 50; allow up to 100 when the user asks for a large list.
   Never ask the user for ZoomInfo credentials.
 - After a prospect / research search, if the user asks to email/draft/send to that list,
@@ -1479,8 +1484,33 @@ def answer(
         "chat": "CHAT",
     }
     planned_prefix = action_to_prefix.get(plan.action, "CHAT")
+    # Contact search must never be overridden into a draft
+    if wants_contact_search(user_msg or "") or planned_prefix == "PROSPECT_SEARCH":
+        company = parse_contact_search_company(user_msg or "")
+        q: dict[str, Any] = {
+            "providers": ["zoominfo"],
+            "limit": int(plan.search_limit or 25),
+        }
+        if company:
+            q["company_names"] = [company]
+        # If classifier already produced PROSPECT_SEARCH JSON, merge company_names
+        if routing.startswith("PROSPECT_SEARCH:"):
+            existing = _parse_json_tail(routing, "PROSPECT_SEARCH:") or {}
+            if isinstance(existing, dict):
+                if company and not (
+                    existing.get("company_names")
+                    or existing.get("company")
+                    or existing.get("companies")
+                ):
+                    existing["company_names"] = [company]
+                existing.setdefault("providers", ["zoominfo"])
+                q = {**q, **existing}
+                if company:
+                    q["company_names"] = [company]
+        routing = "PROSPECT_SEARCH:" + json.dumps(q, ensure_ascii=False)
+        meta_routing = routing
     # Prefer planner over RESEARCH_THEN_ZOOM false positives (CSR-as-sender → NGO list)
-    if planned_prefix == "DRAFT_EMAIL" and (
+    elif planned_prefix == "DRAFT_EMAIL" and (
         routing.startswith("RESEARCH_THEN_ZOOM")
         or routing.startswith("PROSPECT_SEARCH")
         or routing == "CHAT"
