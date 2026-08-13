@@ -268,6 +268,28 @@ def hydrate_from_cloud() -> None:
     _restore_memory_from_cloud()
 
 
+def _build_meta(
+    source: str,
+    source_id: Optional[str],
+    title: Optional[str],
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {"source": source}
+    if source_id:
+        meta["source_id"] = str(source_id)
+    if title:
+        meta["title"] = title
+    if metadata:
+        for k, v in metadata.items():
+            if isinstance(v, (list, dict)):
+                meta[k] = str(v)
+            elif v is None:
+                continue
+            else:
+                meta[k] = v
+    return meta
+
+
 def add(
     texts: list[str] | str,
     source: str,
@@ -284,22 +306,37 @@ def add(
         # Stable id so re-sync overwrites instead of duplicating
         stable = str(source_id or uuid.uuid4().hex)
         doc_id = f"{source}:{stable}" if i == 0 else f"{source}:{stable}:{i}"
-        meta: dict[str, Any] = {"source": source}
-        if source_id:
-            meta["source_id"] = str(source_id)
-        if title:
-            meta["title"] = title
-        if metadata:
-            for k, v in metadata.items():
-                if isinstance(v, (list, dict)):
-                    meta[k] = str(v)
-                elif v is None:
-                    continue
-                else:
-                    meta[k] = v
         ids.append(doc_id)
-        metadatas.append(meta)
+        metadatas.append(_build_meta(source, source_id, title, metadata))
 
+    return _upsert_docs(ids, texts, metadatas)
+
+
+def add_batch(items: list[dict[str, Any]]) -> list[str]:
+    """Upsert many independent docs in one JSONL/Drive write (avoids SSL thrash)."""
+    if not items:
+        return []
+    ids: list[str] = []
+    texts: list[str] = []
+    metadatas: list[dict[str, Any]] = []
+    for item in items:
+        source = str(item.get("source") or "memory")
+        source_id = item.get("source_id")
+        title = item.get("title")
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else None
+        text = str(item.get("text") or "")
+        stable = str(source_id or uuid.uuid4().hex)
+        ids.append(f"{source}:{stable}")
+        texts.append(text)
+        metadatas.append(_build_meta(source, source_id, title, metadata))
+    return _upsert_docs(ids, texts, metadatas)
+
+
+def _upsert_docs(
+    ids: list[str],
+    texts: list[str],
+    metadatas: list[dict[str, Any]],
+) -> list[str]:
     col = _get_collection()
     if col is not None:
         try:

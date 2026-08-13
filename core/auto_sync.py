@@ -41,8 +41,14 @@ def _save_state(state: dict[str, Any]) -> None:
 
 
 def ingest_mailbox_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
-    """Save raw emails + derived contacts into memory. Idempotent via upsert ids."""
-    email_ids: list[str] = []
+    """Save raw emails + derived contacts into memory. Idempotent via upsert ids.
+
+    Does NOT write mailbox contacts into the durable ZoomInfo prospect list —
+    that list is reserved for provider search hits. Writing Gmail noise there
+    flooded relay_prospects.json and triggered heavy Drive traffic (and a
+    process segfault) on every Render boot.
+    """
+    email_batch: list[dict[str, Any]] = []
     for r in messages or []:
         mid = str(r.get("message_id") or "").strip()
         if not mid:
@@ -59,18 +65,38 @@ def ingest_mailbox_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
             },
             default=str,
         )
-        added = memory.add(
-            texts=text,
-            source="gmail_extract",
-            source_id=mid,
-            title=r.get("subject") or "email",
-            metadata={
-                "from": r.get("from") or "",
-                "to": r.get("to") or "",
-                "mailbox": r.get("mailbox") or "",
-            },
+        email_batch.append(
+            {
+                "text": text,
+                "source": "gmail_extract",
+                "source_id": mid,
+                "title": r.get("subject") or "email",
+                "metadata": {
+                    "from": r.get("from") or "",
+                    "to": r.get("to") or "",
+                    "mailbox": r.get("mailbox") or "",
+                },
+            }
         )
-        email_ids.extend(added)
+    email_ids: list[str] = []
+    if email_batch:
+        try:
+            email_ids = memory.add_batch(email_batch)
+        except Exception as e:
+            print(f"[auto_sync] email memory batch failed: {e}", file=sys.stderr)
+            for item in email_batch:
+                try:
+                    email_ids.extend(
+                        memory.add(
+                            texts=item["text"],
+                            source=item["source"],
+                            source_id=item.get("source_id"),
+                            title=item.get("title"),
+                            metadata=item.get("metadata"),
+                        )
+                    )
+                except Exception:
+                    continue
 
     contacts = contacts_from_mailbox(messages, prefer="auto")
     prospects: list[dict[str, Any]] = []
@@ -96,7 +122,10 @@ def ingest_mailbox_messages(messages: list[dict[str, Any]]) -> dict[str, int]:
                 }
             )
         )
-    contact_ids = ingest_prospects(prospects, source_tag="gmail_contacts")
+    # Memory only — never merge Gmail into relay_prospects.json
+    contact_ids = ingest_prospects(
+        prospects, source_tag="gmail_contacts", persist_list=False
+    )
     return {
         "emails": len(email_ids),
         "contacts": len(contact_ids),

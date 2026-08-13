@@ -24,9 +24,9 @@ def clear_file_cache() -> None:
         _FILE_IDS = {}
 
 
-def _drive():
+def _drive(*, force_new: bool = False):
     global _DRIVE
-    if _DRIVE is not None:
+    if _DRIVE is not None and not force_new:
         return _DRIVE
     creds = sheets_credentials()
     if not creds:
@@ -46,6 +46,56 @@ def _drive():
         return None
 
 
+def _reset_drive() -> None:
+    """Drop cached Drive client after SSL / transport failures."""
+    global _DRIVE
+    with _LOCK:
+        _DRIVE = None
+
+
+def _is_transient_drive_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    needles = (
+        "ssl",
+        "record layer",
+        "connection reset",
+        "broken pipe",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "503",
+        "429",
+        "backend error",
+        "internal error",
+    )
+    return any(n in msg for n in needles)
+
+
+def _with_drive_retry(op_name: str, fn, *, attempts: int = 3):
+    """Retry Drive calls; rebuild the client after SSL/transport failures."""
+    import time
+
+    last: Optional[BaseException] = None
+    for i in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            transient = _is_transient_drive_error(e)
+            print(
+                f"[drive] {op_name} failed"
+                f"{' (retry)' if transient and i + 1 < attempts else ''}: {e}",
+                file=sys.stderr,
+            )
+            if not transient or i + 1 >= attempts:
+                break
+            _reset_drive()
+            time.sleep(0.4 * (i + 1))
+    if last is not None:
+        raise last
+    return None
+
+
 def _pinned_folder_id() -> str:
     try:
         from config import settings
@@ -57,10 +107,13 @@ def _pinned_folder_id() -> str:
 
 def _probe_file_id(name: str, folder_id: str) -> Optional[str]:
     """Look up a file id in a folder without touching the process cache."""
-    svc = _drive()
-    if not svc or not folder_id:
+    if not folder_id:
         return None
-    try:
+
+    def _op():
+        svc = _drive()
+        if not svc:
+            return None
         q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
         res = (
             svc.files()
@@ -70,16 +123,23 @@ def _probe_file_id(name: str, folder_id: str) -> Optional[str]:
         files = res.get("files") or []
         if files:
             return files[0]["id"]
+        return None
+
+    try:
+        return _with_drive_retry(f"probe {name}", _op)
     except Exception as e:
         print(f"[drive] probe {name} failed: {e}", file=sys.stderr)
-    return None
+        return None
 
 
 def _probe_file_size(name: str, folder_id: str) -> int:
-    svc = _drive()
-    if not svc or not folder_id:
+    if not folder_id:
         return 0
-    try:
+
+    def _op():
+        svc = _drive()
+        if not svc:
+            return 0
         q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
         res = (
             svc.files()
@@ -90,6 +150,9 @@ def _probe_file_size(name: str, folder_id: str) -> int:
         if not files:
             return 0
         return int(files[0].get("size") or 0)
+
+    try:
+        return int(_with_drive_retry(f"size {name}", _op) or 0)
     except Exception:
         return 0
 
@@ -240,8 +303,7 @@ def upload_json(name: str, payload: Any) -> bool:
     from googleapiclient.http import MediaIoBaseUpload
 
     folder = _ensure_folder()
-    svc = _drive()
-    if not folder or not svc:
+    if not folder:
         return False
     try:
         raw = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -253,36 +315,47 @@ def upload_json(name: str, payload: Any) -> bool:
             else:
                 print(f"[drive] skip oversized {name}", file=sys.stderr)
                 return False
-        media = MediaIoBaseUpload(
-            io.BytesIO(raw), mimetype="application/json", resumable=False
-        )
-        with _LOCK:
-            file_id = _find_file(name, folder)
-            if file_id:
-                svc.files().update(fileId=file_id, media_body=media).execute()
-            else:
-                meta = (
-                    svc.files()
-                    .create(
-                        body={"name": name, "parents": [folder]},
-                        media_body=media,
-                        fields="id",
+
+        def _op():
+            svc = _drive()
+            if not svc:
+                raise RuntimeError("drive client unavailable")
+            media = MediaIoBaseUpload(
+                io.BytesIO(raw), mimetype="application/json", resumable=False
+            )
+            with _LOCK:
+                file_id = _find_file(name, folder)
+                if file_id:
+                    svc.files().update(fileId=file_id, media_body=media).execute()
+                else:
+                    meta = (
+                        svc.files()
+                        .create(
+                            body={"name": name, "parents": [folder]},
+                            media_body=media,
+                            fields="id",
+                        )
+                        .execute()
                     )
-                    .execute()
-                )
-                _FILE_IDS[name] = meta["id"]
-        return True
+                    _FILE_IDS[name] = meta["id"]
+            return True
+
+        return bool(_with_drive_retry(f"upload {name}", _op))
     except Exception as e:
         print(f"[drive] upload {name} failed: {e}", file=sys.stderr)
+        _reset_drive()
         return False
 
 
 def download_json(name: str) -> Optional[Any]:
     folder = _ensure_folder()
-    svc = _drive()
-    if not folder or not svc:
+    if not folder:
         return None
-    try:
+
+    def _op():
+        svc = _drive()
+        if not svc:
+            raise RuntimeError("drive client unavailable")
         file_id = _find_file(name, folder)
         if not file_id:
             return None
@@ -292,8 +365,12 @@ def download_json(name: str) -> Optional[Any]:
         else:
             text = str(raw)
         return json.loads(text)
+
+    try:
+        return _with_drive_retry(f"download {name}", _op)
     except Exception as e:
         print(f"[drive] download {name} failed: {e}", file=sys.stderr)
+        _reset_drive()
         return None
 
 

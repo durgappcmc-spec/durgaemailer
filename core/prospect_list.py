@@ -85,6 +85,16 @@ def _persist(rows: list[dict[str, Any]]) -> bool:
         return False
 
 
+def _is_mailbox_noise(p: dict[str, Any]) -> bool:
+    """Gmail-derived rows must not live in the ZoomInfo Saved prospect list."""
+    src = str(p.get("source") or "").strip().lower()
+    return src in ("gmail", "gmail_contacts", "gmail_extract")
+
+
+def _scrub_mailbox_noise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in rows if isinstance(r, dict) and not _is_mailbox_noise(r)]
+
+
 def reload_from_drive() -> int:
     """Invalidate cache and pull contacts from Google Drive. Returns count."""
     global _CACHE, _LOADED
@@ -92,6 +102,15 @@ def reload_from_drive() -> int:
         _LOADED = False
         _CACHE = None
         rows = _load()
+        cleaned = _scrub_mailbox_noise(rows)
+        if len(cleaned) != len(rows):
+            print(
+                f"[prospect_list] scrubbed {len(rows) - len(cleaned)} "
+                f"gmail mailbox rows from Saved list",
+                file=sys.stderr,
+            )
+            _persist(cleaned)
+            rows = cleaned
         return len(rows)
 
 
@@ -108,18 +127,20 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
 
     with _LOCK:
         global _CACHE, _LOADED
-        rows = list(_load())
+        rows = _scrub_mailbox_noise(list(_load()))
         # Safety: if in-memory list is empty, re-pull Drive before merge/upload
         if not rows:
             _LOADED = False
             _CACHE = None
-            rows = list(_load())
+            rows = _scrub_mailbox_noise(list(_load()))
         by_key = {_prospect_key(r): i for i, r in enumerate(rows)}
         changed = 0
         for p in prospects:
             if not p or p.get("error") or p.get("research_only"):
                 continue
             p = sanitize_prospect(p)
+            if _is_mailbox_noise(p):
+                continue
             # Need at least a name or email or company signal
             if not (
                 (p.get("email") or "").strip()

@@ -30,11 +30,16 @@ def prospect_to_text(p: dict[str, Any]) -> str:
 def ingest_prospects(
     prospects: list[dict[str, Any]],
     source_tag: str = "prospects",
+    *,
+    persist_list: bool = True,
 ) -> list[str]:
     """Add prospects to the durable Drive list first, then Chroma/JSONL memory.
 
     Drive persistence must not depend on memory/Chroma succeeding — otherwise
     ZoomInfo hits appear in chat but never land in relay_prospects.json.
+
+    Set persist_list=False for mailbox-derived contacts so Gmail noise does not
+    overwrite the ZoomInfo prospect list (and thrash Drive during boot sync).
     """
     clean: list[dict[str, Any]] = []
     for p in prospects:
@@ -42,7 +47,7 @@ def ingest_prospects(
             continue
         clean.append(p)
 
-    if clean:
+    if clean and persist_list:
         try:
             from core.prospect_list import save_prospects
 
@@ -57,31 +62,54 @@ def ingest_prospects(
                 f"[ingest] prospect_list save FAILED ({source_tag}): {e}",
                 file=sys.stderr,
             )
+    elif clean and not persist_list:
+        print(
+            f"[ingest] memory-only {len(clean)} rows (source={source_tag}, "
+            f"skip prospect_list)",
+            file=sys.stderr,
+        )
 
     ids: list[str] = []
+    batch: list[dict[str, Any]] = []
     for p in clean:
         text = prospect_to_text(p)
         title = f"{p.get('name') or 'Unknown'} @ {p.get('company') or '?'}"
-        try:
-            added = memory.add(
-                texts=text,
-                source=source_tag,
-                source_id=str(p.get("source_id") or p.get("email") or ""),
-                title=title,
-                metadata={
+        batch.append(
+            {
+                "text": text,
+                "source": source_tag,
+                "source_id": str(p.get("source_id") or p.get("email") or ""),
+                "title": title,
+                "metadata": {
                     "email": p.get("email") or "",
                     "company": p.get("company") or "",
                     "provider": p.get("source") or "",
                     "name": p.get("name") or "",
                 },
-            )
-            ids.extend(added)
+            }
+        )
+    if batch:
+        try:
+            ids = memory.add_batch(batch)
         except Exception as e:
-            print(
-                f"[ingest] memory add skipped for "
-                f"{p.get('email') or p.get('name') or '?'}: {e}",
-                file=sys.stderr,
-            )
+            print(f"[ingest] memory batch add skipped ({source_tag}): {e}", file=sys.stderr)
+            for item in batch:
+                try:
+                    ids.extend(
+                        memory.add(
+                            texts=item["text"],
+                            source=item["source"],
+                            source_id=item.get("source_id"),
+                            title=item.get("title"),
+                            metadata=item.get("metadata"),
+                        )
+                    )
+                except Exception as e2:
+                    print(
+                        f"[ingest] memory add skipped for "
+                        f"{(item.get('metadata') or {}).get('email') or '?'}: {e2}",
+                        file=sys.stderr,
+                    )
     return ids
 
 
