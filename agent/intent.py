@@ -347,8 +347,16 @@ def resolve_like_sent_from_history(
     need_hist = (
         looks_like_history_email_clone(user_msg or "")
         or bool(out["message_id"])
-        or bool(out["target"])
         or bool(out["reference"])
+        # Do NOT use target alone — "search contacts from Sterlite" used to set
+        # like_sent_for=Sterlite and then pull IndiaMART / message ids from history.
+        or (
+            bool(out["target"])
+            and bool(
+                parse_like_sent_request(user_msg or "")
+                or looks_like_history_email_clone(user_msg or "")
+            )
+        )
     )
     if not need_hist or not history:
         return out
@@ -932,9 +940,34 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     if not like_sent_for:
         like_sent_for = parse_explicit_draft_company(msg)
     contact_company = parse_contact_search_company(msg)
-    if not like_sent_for and contact_company:
+    # Only attach company as like_sent_for when this turn is actually a draft/clone
+    if (
+        not like_sent_for
+        and contact_company
+        and (
+            like_sent_to
+            or wants_search_then_draft(msg)
+            or (
+                draft
+                and re.search(
+                    r"\b(search|find|look\s*up)\b.{0,40}\b(contacts?|prospects?)\b",
+                    msg,
+                    re.I,
+                )
+            )
+        )
+    ):
         like_sent_for = contact_company
     like_sent_message_id = parse_gmail_message_id(msg)
+    # UUID in an unrelated prior paste must not count — only if like-sent/draft intent
+    if like_sent_message_id and not (
+        like_sent_to
+        or like_sent_for
+        or wants_search_then_draft(msg)
+        or looks_like_history_email_clone(msg)
+        or draft
+    ):
+        like_sent_message_id = ""
     clone_from_hist = looks_like_history_email_clone(msg)
     clone_from_index = parse_mailbox_list_index(msg) is not None and bool(
         re.search(r"\b(draft|create|compose|like|based|using)\b", msg, re.I)
@@ -967,11 +1000,18 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         agents = ["zoominfo"]
         draft = False
         send = False
+        like_sent_to = ""
+        like_sent_for = ""
+        like_sent_message_id = ""
     elif wants_contact_search(msg):
         action = "prospect_search"
         agents = ["zoominfo"]
         draft = False
         send = False
+        # Pure contact search — never carry draft/like-sent fields
+        like_sent_to = ""
+        like_sent_for = ""
+        like_sent_message_id = ""
     elif looks_like_mission_org_discovery(msg):
         action = "research_then_zoom"
         agents = ["web_research", "zoominfo"]
@@ -1172,13 +1212,24 @@ Return JSON:
     if not isinstance(agents, list) or not agents:
         agents = list(base.agents)
     agents = [str(a).lower() for a in agents]
-    if named or wants_contact_search(user_msg):
+    if named:
         agents = ["zoominfo"]
-        action = "prospect_enrich" if named else "prospect_search"
+        action = "prospect_enrich"
+    elif wants_contact_search(user_msg):
+        action = "prospect_search"
+        if wants_search_then_draft(user_msg) or parse_like_sent_request(user_msg):
+            agents = ["zoominfo", "gmail", "web_research"]
+        else:
+            agents = ["zoominfo"]
 
     draft = bool(data.get("draft")) if "draft" in data else base.draft
     send = bool(data.get("send")) if "send" in data else base.send
-    if named or wants_contact_search(user_msg):
+    if named:
+        draft = False
+        send = False
+    elif wants_contact_search(user_msg) and not (
+        wants_search_then_draft(user_msg) or parse_like_sent_request(user_msg)
+    ):
         draft = False
         send = False
     elif action in ("draft_email", "research_then_zoom") and not send:
@@ -1212,18 +1263,41 @@ Return JSON:
     like_sent_message_id = str(
         data.get("like_sent_message_id") or base.like_sent_message_id or ""
     ).strip()
-    resolved = resolve_like_sent_from_history(
-        user_msg,
-        history,
-        like_sent_to=like_sent_to,
-        like_sent_for=like_sent_for,
-        like_sent_message_id=like_sent_message_id,
+
+    # Pure contact search must not inherit like-sent / draft from earlier turns
+    # (LLM + history otherwise attach IndiaMART templates to "search Sterlite").
+    pure_contact_search = bool(
+        wants_contact_search(user_msg)
+        and not wants_search_then_draft(user_msg)
+        and not parse_like_sent_request(user_msg)
+        and not looks_like_history_email_clone(user_msg)
+        and not re.search(
+            r"\b(draft|compose|write|create\s+(an?\s+)?email|like\s+sent)\b",
+            user_msg or "",
+            re.I,
+        )
     )
-    like_sent_to = resolved.get("reference") or like_sent_to
-    like_sent_for = resolved.get("target") or like_sent_for
-    if not like_sent_for:
-        like_sent_for = parse_explicit_draft_company(user_msg)
-    like_sent_message_id = resolved.get("message_id") or like_sent_message_id
+    if pure_contact_search:
+        like_sent_to = ""
+        like_sent_for = ""
+        like_sent_message_id = ""
+        draft = False
+        send = False
+        action = "prospect_search"
+        agents = ["zoominfo"]
+    else:
+        resolved = resolve_like_sent_from_history(
+            user_msg,
+            history,
+            like_sent_to=like_sent_to,
+            like_sent_for=like_sent_for,
+            like_sent_message_id=like_sent_message_id,
+        )
+        like_sent_to = resolved.get("reference") or like_sent_to
+        like_sent_for = resolved.get("target") or like_sent_for
+        if not like_sent_for:
+            like_sent_for = parse_explicit_draft_company(user_msg)
+        like_sent_message_id = resolved.get("message_id") or like_sent_message_id
     if like_sent_to and "@" in like_sent_to:
         to_emails = [
             e for e in to_emails if e.lower() != like_sent_to.lower()
@@ -1231,7 +1305,9 @@ Return JSON:
         exclude.add(like_sent_to.lower())
 
     # Named company target (e.g. Sterlite) → never pull Magic Bus To from history
-    explicit_company = parse_explicit_draft_company(user_msg) or like_sent_for
+    explicit_company = parse_explicit_draft_company(user_msg) or (
+        like_sent_for if not pure_contact_search else ""
+    )
     if explicit_company or wants_prospect_list_recipients(user_msg):
         to_emails = []
     # For like-sent / "previous recipient as per chat", take To from recent history
@@ -1241,8 +1317,10 @@ Return JSON:
         to_emails = resolve_to_emails_from_history(history, exclude=exclude)
 
     if (
-        like_sent_to or like_sent_message_id or looks_like_history_email_clone(user_msg)
-    ) and action in ("chat", "research_then_zoom", "gmail_extract"):
+        not pure_contact_search
+        and (like_sent_to or like_sent_message_id or looks_like_history_email_clone(user_msg))
+        and action in ("chat", "research_then_zoom", "gmail_extract")
+    ):
         action = "draft_email" if not send else "send_email"
         draft = action == "draft_email"
         if "gmail" not in agents:

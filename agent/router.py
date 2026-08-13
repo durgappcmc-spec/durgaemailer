@@ -899,22 +899,30 @@ def _should_draft_after_prospect_search(
     search_opts: Optional[dict[str, Any]] = None,
 ) -> bool:
     """True when PROSPECT_SEARCH should continue into like-sent / draft."""
-    opts = search_opts or {}
-    if opts.get("draft") or opts.get("like_sent_to") or opts.get("like_sent_message_id"):
-        return True
-    if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
-        return True
+    # Current message must ask for draft — ignore stale plan.like_sent_* from history
     if wants_search_then_draft(user_msg or ""):
         return True
     if parse_like_sent_request(user_msg or ""):
         return True
-    return bool(
-        re.search(
-            r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b",
+    if re.search(
+        r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b",
+        user_msg or "",
+        re.I | re.S,
+    ):
+        return True
+    opts = search_opts or {}
+    # Only trust opts when they came from THIS turn's attach_draft path
+    if opts.get("draft") and (
+        opts.get("like_sent_to")
+        or opts.get("like_sent_message_id")
+        or re.search(
+            r"\b(draft|compose|write|create\s+(an?\s+)?email)\b",
             user_msg or "",
-            re.I | re.S,
+            re.I,
         )
-    )
+    ):
+        return True
+    return False
 
 
 def _draft_followup_message(user_msg: str, plan: IntentPlan) -> str:
@@ -1836,14 +1844,28 @@ def answer(
         }
         if company:
             q["company_names"] = [company]
-        if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
+        # Only attach draft/like-sent when THIS message asks for it — never from
+        # leftover planner fields inherited from earlier chat turns.
+        attach_draft = bool(
+            wants_search_then_draft(user_msg or "")
+            or parse_like_sent_request(user_msg or "")
+            or (
+                plan.draft
+                and re.search(
+                    r"\b(draft|compose|write|create\s+(an?\s+)?email)\b",
+                    user_msg or "",
+                    re.I,
+                )
+            )
+        )
+        if attach_draft:
             q["draft"] = True
-        if plan.like_sent_to:
-            q["like_sent_to"] = plan.like_sent_to
-        if plan.like_sent_for or company:
-            q["like_sent_for"] = plan.like_sent_for or company
-        if plan.like_sent_message_id:
-            q["like_sent_message_id"] = plan.like_sent_message_id
+            if plan.like_sent_to:
+                q["like_sent_to"] = plan.like_sent_to
+            if plan.like_sent_for or company:
+                q["like_sent_for"] = plan.like_sent_for or company
+            if plan.like_sent_message_id:
+                q["like_sent_message_id"] = plan.like_sent_message_id
         # If classifier already produced PROSPECT_SEARCH JSON, merge company_names
         if routing.startswith("PROSPECT_SEARCH:"):
             existing = _parse_json_tail(routing, "PROSPECT_SEARCH:") or {}
@@ -1855,10 +1877,14 @@ def answer(
                 ):
                     existing["company_names"] = [company]
                 existing.setdefault("providers", ["zoominfo"])
+                # Strip inherited draft/like-sent unless this turn asked for them
+                if not attach_draft:
+                    for k in ("draft", "like_sent_to", "like_sent_for", "like_sent_message_id"):
+                        existing.pop(k, None)
                 q = {**q, **existing}
                 if company:
                     q["company_names"] = [company]
-                if plan.draft or plan.like_sent_to or plan.like_sent_message_id:
+                if attach_draft:
                     q["draft"] = True
         routing = "PROSPECT_SEARCH:" + json.dumps(q, ensure_ascii=False)
         meta_routing = routing

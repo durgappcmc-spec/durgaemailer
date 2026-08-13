@@ -68,24 +68,36 @@ def test_draft_still_drafts():
     assert _heuristic_plan(msg).action == "draft_email"
 
 
-def test_search_then_like_sent_draft_goes_zoominfo_first():
+def test_pure_sterlite_search_no_like_sent_bleed():
+    """Earlier IndiaMART like-sent in history must not attach to a plain search."""
+    msg = "search contacts from sterlite tech"
+    plan = _heuristic_plan(msg)
+    assert plan.action == "prospect_search"
+    assert plan.draft is False
+    assert plan.like_sent_to == ""
+    assert plan.like_sent_for == ""
+    assert plan.like_sent_message_id == ""
+    assert plan.agents == ["zoominfo"]
+
+
+def test_search_then_like_sent_still_keeps_draft_flags():
     msg = (
         "search contacts from sterlite tech and create draft email "
         "like khurshidalam.qureshi@indiamart.com"
     )
     assert wants_contact_search(msg)
     assert wants_search_then_draft(msg)
-    assert wants_live_zoominfo_search(msg)
     assert parse_contact_search_company(msg).lower().startswith("sterlite")
     like = parse_like_sent_request(msg)
     assert like is not None
     assert like["reference"].lower() == "khurshidalam.qureshi@indiamart.com"
-    assert "sterlite" in (like.get("target") or "").lower()
     plan = _heuristic_plan(msg)
     assert plan.action == "prospect_search"
     assert plan.draft is True
     assert plan.like_sent_to.lower() == "khurshidalam.qureshi@indiamart.com"
     assert "sterlite" in (plan.like_sent_for or "").lower()
+    assert "gmail" in plan.agents
+
 
 
 def test_pure_like_sent_still_drafts():
