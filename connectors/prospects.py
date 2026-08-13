@@ -73,7 +73,8 @@ def enrich_fallthrough(
 ) -> dict[str, Any]:
     """Try providers in order; return first result that has an email."""
     if order is None:
-        order = ("zoominfo",)    errors: list[dict[str, str]] = []
+        order = ("zoominfo",)
+    errors: list[dict[str, str]] = []
     last_without_email: Optional[dict[str, Any]] = None
     for name in order:
         try:
