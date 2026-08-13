@@ -932,6 +932,12 @@ def _deliver_job(
         first_name=first,
         title=str(title),
     )
+    try:
+        from gmail_client.html_format import normalize_email_html
+
+        html_body = normalize_email_html(html_body)
+    except Exception:
+        pass
     kwargs = {
         "to": job["recipient_email"],
         "subject": job.get("subject") or "(no subject)",
@@ -1381,61 +1387,17 @@ def _full_reference_text(body_text: str, body_html: str) -> str:
 
 
 def _linkify_plain(text: str) -> str:
-    """Escape HTML then turn URLs into anchors."""
-    safe = (
-        (text or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-    return re.sub(
-        r"(https?://[^\s<]+)",
-        r'<a href="\1">\1</a>',
-        safe,
-    )
+    """Escape HTML, render **bold** / *italic*, then turn URLs into anchors."""
+    from gmail_client.html_format import apply_inline_markdown
+
+    return apply_inline_markdown(text or "", escape_html=True)
 
 
 def _full_text_to_html(text: str) -> str:
-    """Convert a full plain-text email to HTML, keeping every section and line."""
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not text:
-        return ""
-    blocks = re.split(r"\n\s*\n+", text)
-    parts: list[str] = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        lines = [ln.strip() for ln in block.split("\n")]
-        lines = [ln for ln in lines if ln]
-        if not lines:
-            continue
-        # Multi-line block (e.g. YouTube list): keep line breaks
-        if len(lines) > 1:
-            inner = "<br>\n".join(_linkify_plain(ln) for ln in lines)
-            parts.append(f"<p>{inner}</p>")
-        else:
-            line = lines[0]
-            # Section headers — keep emphasis
-            if (
-                len(line) < 120
-                and not line.endswith(".")
-                and not line.lower().startswith("http")
-                and (
-                    line.endswith(":")
-                    or "—" in line
-                    or re.match(
-                        r"^(The opportunity|Why |What your|See our|Success stories|"
-                        r"AI-integrated|Craft &|Full channel|Next step|Thanks,?)",
-                        line,
-                        re.I,
-                    )
-                )
-            ):
-                parts.append(f"<p><strong>{_linkify_plain(line)}</strong></p>")
-            else:
-                parts.append(f"<p>{_linkify_plain(line)}</p>")
-    return "\n".join(parts)
+    """Convert a full plain-text/markdown email to HTML (bold, lists, links)."""
+    from gmail_client.html_format import plain_or_markdown_to_html
+
+    return plain_or_markdown_to_html(text or "")
 
 
 def _reference_still_present(text: str, reference_company: str) -> bool:
@@ -1673,6 +1635,19 @@ def _compose_like_sent_email(
         swapped = _replace_company_names(
             swapped, reference_company, target, extra_phrases=phrases
         )
+
+    # Drop cloned Gmail signature so append_signature adds it once later;
+    # also render any leftover **markdown** inside HTML.
+    try:
+        from gmail_client.html_format import (
+            normalize_email_html,
+            strip_trailing_signature_block,
+        )
+
+        html_out = strip_trailing_signature_block(html_out)
+        html_out = normalize_email_html(html_out)
+    except Exception:
+        pass
 
     alignment = ""
     if research_notes.strip():

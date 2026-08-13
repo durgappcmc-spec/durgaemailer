@@ -76,12 +76,16 @@ def get_signature(send_as_email: Optional[str] = None) -> str:
 
 
 def append_signature(html_body: str, *, from_email: Optional[str] = None) -> str:
-    """Append the Gmail send-as signature if not already present."""
-    body = html_body or "<p></p>"
+    """Append the Gmail send-as signature once — never duplicate."""
+    from gmail_client.html_format import body_looks_signed, normalize_email_html
+
+    body = normalize_email_html(html_body or "<p></p>")
     sig = get_signature(from_email)
     if not sig:
         return body
-    # Avoid duplicating if body already contains a chunk of the signature
+    if body_looks_signed(body, sig):
+        return body
+    # Legacy short-needle check
     needle = re.sub(r"\s+", "", sig[:80]).lower()
     compact_body = re.sub(r"\s+", "", body).lower()
     if needle and needle in compact_body:
@@ -203,15 +207,23 @@ def create_draft(
     URLs in the draft so Netlify tracking URLs are not visible while reviewing;
     clicks are wrapped at send time.
     """
+    from gmail_client.html_format import normalize_email_html
+
     from_addr = from_email or default_from_email()
     src = (source or "relay_draft").strip() or "relay_draft"
     if track and "draft" not in src.lower():
         src = f"{src}_draft"
+
+    # Normalize markdown → HTML once, then append signature at most once
+    body = normalize_email_html(html_body or "")
+    if include_signature:
+        body = append_signature(body, from_email=from_addr)
+
     # Drafts: open pixel only — never rewrite hrefs to Netlify click URLs
     raw, tracking_id = _build_raw_message(
         to,
         subject,
-        html_body,
+        body,
         recipient_name=recipient_name,
         attachments=attachments,
         instrument=track,
@@ -221,19 +233,17 @@ def create_draft(
         source=src,
         from_email=from_addr,
         cc=cc,
-        include_signature=include_signature,
+        include_signature=False,  # already applied above — do not double-insert
     )
-    # Keep the instrumented HTML for Drive mirror / Drafts page preview
-    instrumented_html = html_body
-    if track and tracking_id:
+    # Drive mirror uses the same signed body (no second append_signature)
+    instrumented_html = body
+    if track:
         try:
             from core.tracking import inject_tracking
 
             instrumented_html, tracking_id = inject_tracking(
-                append_signature(html_body, from_email=from_addr)
-                if include_signature
-                else html_body,
-                tracking_id=tracking_id,
+                body,
+                tracking_id=tracking_id or None,
                 recipient_email=to,
                 subject=subject,
                 register=False,

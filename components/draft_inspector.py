@@ -107,12 +107,18 @@ def render_draft_inspector(
             st.info("No HTML body stored for this draft.")
         else:
             try:
+                from gmail_client.html_format import normalize_email_html
                 from core.tracking import html_for_preview
 
-                # Never show Netlify open/click URLs in the preview
-                preview_body = html_for_preview(body)
+                # Render leftover markdown (**bold**) and hide Netlify URLs
+                preview_body = html_for_preview(normalize_email_html(body))
             except Exception:
-                preview_body = body
+                try:
+                    from core.tracking import html_for_preview
+
+                    preview_body = html_for_preview(body)
+                except Exception:
+                    preview_body = body
             st.markdown(preview_body, unsafe_allow_html=True)
             if tid or has_pixel:
                 st.caption("🔒 Open tracking is embedded (hidden). Links shown as originals.")
@@ -266,9 +272,14 @@ def _render_edit_tab(
 
     raw_html = draft.get("body_html") or draft.get("html") or ""
     try:
-        edit_html = strip_tracking(raw_html)
+        from gmail_client.html_format import normalize_email_html
+
+        edit_html = normalize_email_html(strip_tracking(raw_html))
     except Exception:
-        edit_html = raw_html
+        try:
+            edit_html = strip_tracking(raw_html)
+        except Exception:
+            edit_html = raw_html
 
     body_html = _rich_text_editor(
         edit_html,
@@ -333,8 +344,14 @@ def _render_edit_tab(
         )
         return
 
+    try:
+        from gmail_client.html_format import normalize_email_html
+
+        body_to_save = normalize_email_html(body_html or "")
+    except Exception:
+        body_to_save = body_html or ""
     html, new_tid = inject_tracking(
-        body_html or "",
+        body_to_save,
         tracking_id=tid or None,
         recipient_email=draft.get("to") or draft.get("recipient") or "",
         subject=subject,
