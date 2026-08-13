@@ -16,7 +16,7 @@ from connectors import ProspectConnector, normalize
 
 _JWT_CACHE = _DATA / "zoominfo_jwt.cache"
 _LINKEDIN_RE = re.compile(
-    r"https?://(?:[\w.-]+\.)?linkedin\.com/in/([\w\-%]+)/?",
+    r"(?:https?://)?(?:[\w.-]+\.)?linkedin\.com/in/([\w\-%]+)",
     re.I,
 )
 
@@ -943,9 +943,28 @@ class ZoomInfoConnector(ProspectConnector):
         return _flatten_enrich_rows(enr.json())
 
 
+def extract_linkedin_urls(text: str, *, limit: int = 100) -> list[str]:
+    """Return unique LinkedIn /in/ profile URLs found in text (paste-safe)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _LINKEDIN_RE.finditer(text or ""):
+        slug = (m.group(1) or "").strip().strip("/")
+        if not slug:
+            continue
+        key = slug.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"https://www.linkedin.com/in/{slug}")
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
 def extract_linkedin_url(text: str) -> str:
     """Return the first LinkedIn profile URL found in text, or ''."""
-    return _first_linkedin(text or "")
+    urls = extract_linkedin_urls(text or "", limit=1)
+    return urls[0] if urls else ""
 
 
 def names_from_linkedin_url(url: str) -> tuple[str, str]:
@@ -974,12 +993,7 @@ def names_from_linkedin_url(url: str) -> tuple[str, str]:
 
 
 def _first_linkedin(text: Any) -> str:
-    if not text:
-        return ""
-    m = _LINKEDIN_RE.search(str(text))
-    if not m:
-        return ""
-    return f"https://www.linkedin.com/in/{m.group(1)}"
+    return extract_linkedin_url(str(text or ""))
 
 
 def _flatten_enrich_rows(enr_data: dict[str, Any]) -> list[dict[str, Any]]:

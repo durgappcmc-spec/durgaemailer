@@ -70,14 +70,17 @@ Actions (pick one):
 - prospect_search: ZoomInfo/Apollo search with known company/title filters.
   Use this when they say "search for contact(s) from/at COMPANY" or
   "find contacts at COMPANY" — do NOT draft an email.
-- prospect_enrich: enrich one person (LinkedIn URL or name+company)
+- prospect_enrich: enrich people from LinkedIn profile URL(s) or name+company.
+  When they paste one or more linkedin.com/in/ URLs, or say "get contacts for
+  these linkedin profiles", look up EACH URL on ZoomInfo (do not keep only the first).
 - gmail_extract: read inbox/sent
 - draft_email: create Gmail draft(s) for review
 - send_email: send now (rare)
 - schedule_email: queue for later
 
 Critical:
-- "search for contact from RateGain" / "find contacts at Acme" → prospect_search only.
+- "get contacts for these linkedin profiles" + pasted linkedin.com/in/ URLs →
+  prospect_enrich (ZoomInfo each profile). Then they can bulk-draft per org.
   Never draft_email unless they also ask to draft/write/send an email.
 - "search contacts from Sterlite Tech and create draft like email@…" → prospect_search
   with draft=true + like_sent_to (ZoomInfo first, then draft). Do NOT skip ZoomInfo.
@@ -811,6 +814,40 @@ def wants_saved_list_only(user_msg: str) -> bool:
     )
 
 
+def wants_linkedin_contact_lookup(user_msg: str) -> bool:
+    """True when the user wants ZoomInfo contacts from pasted LinkedIn profile URLs."""
+    from connectors.zoominfo import extract_linkedin_urls
+
+    msg = user_msg or ""
+    urls = extract_linkedin_urls(msg)
+    if len(urls) >= 2:
+        return True
+    asks = bool(
+        re.search(
+            r"\b(?:get|find|search|look\s*up|pull|fetch|enrich|check|grab)\b.{0,100}"
+            r"\b(?:contacts?|people|prospects?|profiles?)\b.{0,100}\blinkedin\b"
+            r"|"
+            r"\blinkedin\b.{0,80}\b(?:contacts?|profiles?)\b.{0,40}"
+            r"\b(?:get|find|search|look\s*up|pull|fetch|enrich)\b"
+            r"|"
+            r"\b(?:get|find|search|look\s*up|pull|fetch)\s+"
+            r"(?:contacts?|people|prospects?)\s+for\s+(?:these|those|the)\s+"
+            r"linkedin",
+            msg,
+            re.I | re.S,
+        )
+    )
+    if asks:
+        return True
+    return bool(urls) and bool(
+        re.search(
+            r"\b(?:get|find|search|look\s*up|pull|fetch|enrich|contacts?|profiles?)\b",
+            msg,
+            re.I,
+        )
+    )
+
+
 def wants_contact_search(user_msg: str) -> bool:
     """True when user wants ZoomInfo/prospect contact lookup (possibly before draft)."""
     msg = user_msg or ""
@@ -829,6 +866,8 @@ def wants_contact_search(user_msg: str) -> bool:
         return True
     if parse_like_sent_request(msg):
         return False
+    if wants_linkedin_contact_lookup(msg):
+        return True
     # Explicit draft/send without a contact-search phrase → not search
     if re.search(
         r"\b(draft|compose|write|send\s+now|create\s+(an?\s+)?email|"
@@ -854,6 +893,16 @@ def wants_contact_search(user_msg: str) -> bool:
 def wants_search_then_draft(user_msg: str) -> bool:
     """Contact search + draft/like-sent in one message → ZoomInfo then draft."""
     msg = user_msg or ""
+    asks_draft = bool(
+        parse_like_sent_request(msg)
+        or re.search(
+            r"\b(?:and|then)\b.{0,40}\b(?:draft|compose|write|create\s+(?:an?\s+)?email)\b",
+            msg,
+            re.I | re.S,
+        )
+    )
+    if wants_linkedin_contact_lookup(msg) and asks_draft:
+        return True
     if not parse_contact_search_company(msg):
         return False
     if parse_like_sent_request(msg):
@@ -978,8 +1027,30 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     if like_sent_to and "@" in like_sent_to:
         to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
 
+    try:
+        from connectors.zoominfo import extract_linkedin_urls as _li_urls
+    except Exception:
+        _li_urls = lambda _t: []  # noqa: E731
+
+    # Pasted LinkedIn profile URL(s) → ZoomInfo enrich each, then optional draft
+    if wants_linkedin_contact_lookup(msg) or (
+        _li_urls(msg)
+        and not contact_company
+        and not parse_named_person_contact(msg)
+    ):
+        action = "prospect_enrich"
+        agents = ["zoominfo"]
+        if draft or send or wants_search_then_draft(msg):
+            agents.append("gmail")
+            draft = draft or not send
+        else:
+            draft = False
+            send = False
+            like_sent_to = ""
+            like_sent_for = ""
+            like_sent_message_id = ""
     # ZoomInfo first when user asks to search contacts AND draft/like-sent
-    if contact_company and (
+    elif contact_company and (
         like_sent_to
         or like_sent_message_id
         or wants_search_then_draft(msg)
