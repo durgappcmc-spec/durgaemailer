@@ -50,12 +50,16 @@ class SaveDraftTool:
             recipient_email=(draft.get("to") or draft.get("recipient") or ""),
             subject=draft.get("subject") or "",
             register=False,
+            track_clicks=False,
+            track_opens=True,
         )
         if extract_tracking_id(html) != tid and tid:
             html, tid = inject_tracking(
                 html,
                 tracking_id=tid,
                 register=False,
+                track_clicks=False,
+                track_opens=True,
             )
         draft_id = draft.get("draft_id") or f"draft_{uuid.uuid4().hex[:12]}"
         payload = {

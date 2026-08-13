@@ -216,6 +216,12 @@ def create_draft(
 
     # Normalize markdown → HTML once, then append signature at most once
     body = normalize_email_html(html_body or "")
+    try:
+        from core.tracking import strip_tracking, strip_visible_tracking_urls
+
+        body = strip_visible_tracking_urls(strip_tracking(body))
+    except Exception:
+        pass
     if include_signature:
         body = append_signature(body, from_email=from_addr)
 

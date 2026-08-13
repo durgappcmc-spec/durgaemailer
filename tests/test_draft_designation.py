@@ -12,6 +12,22 @@ def test_ensure_designation_in_greeting():
     assert "Hi Priya (CSR Head)" in out
 
 
+def test_greeting_replaces_cloned_khushid():
+    html = "<p>Hi Khushid,</p><p>Hope you are well.</p>"
+    out = _ensure_designation_in_greeting(
+        html, first_name="Priya", title="CSR Head"
+    )
+    assert "Hi Priya (CSR Head)" in out
+    assert "Khushid" not in out
+
+
+def test_greeting_rewrites_name_without_title():
+    html = "<p>Dear Khushid,</p><p>Quick note.</p>"
+    out = _ensure_designation_in_greeting(html, first_name="Anupam", title="")
+    assert "Dear Anupam," in out
+    assert "Khushid" not in out
+
+
 def test_apply_template_name_with_title():
     out = _apply_template(
         "Hi {name_with_title}, at {company}",

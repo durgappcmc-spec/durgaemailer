@@ -50,6 +50,51 @@ def extract_tracking_id(html: str) -> Optional[str]:
     return None
 
 
+_VISIBLE_TRACKING_URL_RE = re.compile(
+    r"(?:&lt;|<)?https?://[^\s<>\"']*?"
+    r"(?:durgaemailer-tracking\.netlify\.app|"
+    r"/\.netlify/functions/(?:click|open)|/t/[co]/)"
+    r"[^\s<>\"']*(?:&gt;|>)?",
+    re.I,
+)
+
+
+def is_tracking_url(url: str) -> bool:
+    href = (url or "").strip()
+    if not href:
+        return False
+    if any(m in href for m in _OPEN_MARKERS + _CLICK_MARKERS):
+        return True
+    if "durgaemailer-tracking.netlify.app" in href.lower():
+        return True
+    base = _tracking_base()
+    return bool(base) and base in href and ("click" in href or "open" in href)
+
+
+def strip_visible_tracking_urls(text: str) -> str:
+    """Remove tracking URLs that leaked into visible body text, including <url> autolinks.
+
+    Gmail's text/plain part of a sent email often looks like:
+    `our program <https://durgaemailer-tracking.netlify.app/.netlify/functions/click?id=…>`
+    Cloning that into a new draft must not show the Netlify URL to the reviewer.
+    """
+    if not text:
+        return text or ""
+    out = _VISIBLE_TRACKING_URL_RE.sub("", text)
+    base = _tracking_base()
+    if base:
+        out = re.sub(
+            rf"(?:&lt;|<)?{re.escape(base)}[^\s<>\"']*(?:&gt;|>)?",
+            "",
+            out,
+            flags=re.I,
+        )
+    out = re.sub(r"[ \t]*<[ \t]*>", "", out)
+    out = re.sub(r"\(\s*\)", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out
+
+
 def strip_tracking(html: str) -> str:
     """Remove open pixels and unwrap click-tracked hrefs back to originals.
 
@@ -67,24 +112,43 @@ def strip_tracking(html: str) -> str:
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
-        is_click = any(m in href for m in _CLICK_MARKERS) or (
-            bool(base) and base in href and "click" in href
+        is_click = is_tracking_url(href) and (
+            any(m in href for m in _CLICK_MARKERS)
+            or (bool(base) and base in href and "click" in href)
+            or "durgaemailer-tracking.netlify.app" in href.lower()
         )
         if not is_click:
             continue
         original = a.get("data-original-url")
-        if original:
+        if original and not is_tracking_url(original):
             a["href"] = original
             if a.has_attr("data-original-url"):
                 del a["data-original-url"]
             continue
         # No original stored — drop the broken Netlify href rather than show it
         # (keep link text so the email still reads naturally)
+        label = a.get_text(" ", strip=True)
+        if is_tracking_url(label):
+            a.decompose()
+            continue
         a["href"] = "#"
         if a.has_attr("data-original-url"):
             del a["data-original-url"]
 
-    return str(soup)
+    from bs4 import NavigableString
+
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is None or parent.name in ("script", "style", "code", "pre"):
+            continue
+        raw = str(node)
+        cleaned = strip_visible_tracking_urls(raw)
+        if cleaned != raw:
+            node.replace_with(cleaned)
+
+    return strip_visible_tracking_urls(str(soup))
 
 
 def inject_tracking(
@@ -186,4 +250,4 @@ def _inject_local(
 
 def html_for_preview(html: str) -> str:
     """Draft/UI preview without Netlify tracking URLs visible."""
-    return strip_tracking(html or "")
+    return strip_visible_tracking_urls(strip_tracking(html or ""))

@@ -20,7 +20,7 @@ class InjectTrackingOutput(BaseModel):
 
 class InjectTrackingTool:
     name = "inject_tracking"
-    description = "Strip then inject open pixel + click rewrites (idempotent)"
+    description = "Strip then inject hidden open pixel (no click-URL rewrite in drafts)"
     input_schema = InjectTrackingInput
     output_schema = InjectTrackingOutput
     cost_hint = {}
@@ -36,6 +36,8 @@ class InjectTrackingTool:
             recipient_email=inputs.recipient_email or "unknown@example.com",
             subject=inputs.subject or "",
             register=False,
+            track_clicks=False,
+            track_opens=True,
         )
         return ToolResult(
             ok=True,

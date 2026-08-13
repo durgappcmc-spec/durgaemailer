@@ -9,11 +9,90 @@ _MD_BOLD_US = re.compile(r"__(.+?)__")
 _MD_ITALIC = re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])")
 _MD_ITALIC_US = re.compile(r"(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?![\w_])")
 _URL_RE = re.compile(r"(https?://[^\s<]+)")
+_TRACKING_URL_RE = re.compile(
+    r"(?:/\.netlify/functions/(?:click|open)|/t/[co]/|durgaemailer-tracking\.netlify\.app)",
+    re.I,
+)
+_HTML_GREETING_RE = re.compile(
+    r"(<(?:p|div)[^>]*>\s*)(Dear|Hi|Hello)(\s+)([^,<\n]{1,80}?)(?=\s*[,:<])",
+    re.I,
+)
+_PLAIN_GREETING_RE = re.compile(
+    r"(^|\n)(Dear|Hi|Hello)(\s+)([^,\n<]{1,80}?)(?=\s*[,:\n]|$)",
+    re.I,
+)
+
+
+def _is_tracking_url(url: str) -> bool:
+    return bool(url) and bool(_TRACKING_URL_RE.search(url))
+
+
+def rewrite_opening_greeting(html: str, *, first_name: str = "") -> str:
+    """Point the first Dear/Hi/Hello line at this recipient, not a cloned name."""
+    body = html or ""
+    first = (first_name or "").strip()
+    if not body or not first:
+        return body
+
+    def _already_this_person(old: str) -> bool:
+        core = re.sub(r"\s*\([^)]*\)\s*", " ", old or "").strip()
+        if not core:
+            return False
+        token = core.split()[0].strip(".,;:")
+        return token.lower() == first.lower() or core.lower().startswith(first.lower())
+
+    def _repl(m: re.Match) -> str:
+        old = m.group(4)
+        if _already_this_person(old):
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{first}"
+
+    updated, n = _HTML_GREETING_RE.subn(_repl, body, count=1)
+    if n:
+        return updated
+    updated, n = _PLAIN_GREETING_RE.subn(_repl, body, count=1)
+    return updated if n else body
+
+
+def ensure_designation_in_greeting(
+    html: str,
+    *,
+    first_name: str = "",
+    title: str = "",
+) -> str:
+    """Rewrite the opening greeting to this recipient, then add (designation)."""
+    body = rewrite_opening_greeting(html or "", first_name=first_name)
+    title = (title or "").strip()
+    first = (first_name or "").strip()
+    if not body or not title:
+        return body
+    greet = body[:800]
+    if first and f"{first} ({title})" in greet:
+        return body
+    if first:
+        pat = (
+            rf"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)"
+            rf"({re.escape(first)})(\b)"
+        )
+        updated, n = re.subn(pat, rf"\1\2 ({title})\3", body, count=1, flags=re.I)
+        if n:
+            return updated
+    pat2 = r"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)([^,<]{1,60}?)(\s*,)"
+    updated, n = re.subn(
+        pat2, rf"\1\2 ({title})\3", body, count=1, flags=re.I
+    )
+    return updated if n else body
 
 
 def apply_inline_markdown(text: str, *, escape_html: bool = True) -> str:
     """Turn **bold** / *italic* into HTML; optionally escape first."""
     s = text or ""
+    try:
+        from core.tracking import strip_visible_tracking_urls
+
+        s = strip_visible_tracking_urls(s)
+    except Exception:
+        pass
     if escape_html:
         s = (
             s.replace("&", "&amp;")
@@ -24,7 +103,14 @@ def apply_inline_markdown(text: str, *, escape_html: bool = True) -> str:
     s = _MD_BOLD_US.sub(r"<strong>\1</strong>", s)
     s = _MD_ITALIC.sub(r"<em>\1</em>", s)
     s = _MD_ITALIC_US.sub(r"<em>\1</em>", s)
-    s = _URL_RE.sub(r'<a href="\1">\1</a>', s)
+
+    def _linkify(m: re.Match) -> str:
+        url = m.group(1)
+        if _is_tracking_url(url):
+            return ""
+        return f'<a href="{url}">{url}</a>'
+
+    s = _URL_RE.sub(_linkify, s)
     return s
 
 

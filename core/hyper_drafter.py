@@ -5,7 +5,7 @@ import json
 from typing import Any, Optional
 
 COMPOSER_SYSTEM = """You are an expert CSR partnership email writer for Karuna Media.
-Follow this 10-rule grounding contract:
+Follow this grounding contract:
 1. Never invent facts about the recipient organisation.
 2. Every factual claim must appear in the org_brief (programs, signals, mission, HQ, industry).
 3. If a needed detail is missing, use {{PLACEHOLDER:...}} — never fabricate.
@@ -16,6 +16,8 @@ Follow this 10-rule grounding contract:
 8. Include a single clear CTA.
 9. Output strict JSON: {subject, body_html, personalization_ledger, confidence}.
 10. personalization_ledger is a list of {claim, evidence_ref, source_tool} — evidence_ref must point into org_brief or source_email.
+11. Greet the approved contact by their first name (and title if present). Never greet a name from source_email.
+12. Never include tracking, Netlify, or click-redirect URLs in the body text or link labels.
 """
 
 
@@ -62,6 +64,23 @@ def compose_email(
     draft["to"] = contact.get("email") or ""
     draft["recipient"] = contact.get("email") or contact.get("name") or ""
     draft["recipient_name"] = contact.get("name") or ""
+    name = str(contact.get("name") or "").strip()
+    first = str(contact.get("first_name") or "").strip() or (
+        name.split(None, 1)[0] if name else ""
+    )
+    title = str(contact.get("title") or contact.get("designation") or "").strip()
+    if first and draft.get("body_html"):
+        try:
+            from gmail_client.html_format import ensure_designation_in_greeting
+            from core.tracking import strip_visible_tracking_urls
+
+            draft["body_html"] = strip_visible_tracking_urls(
+                ensure_designation_in_greeting(
+                    draft["body_html"], first_name=first, title=title
+                )
+            )
+        except Exception:
+            pass
     cost = {
         "gemini_tokens_in": resp.tokens_in,
         "gemini_tokens_out": resp.tokens_out,

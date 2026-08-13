@@ -57,6 +57,29 @@ def test_draft_mode_hides_netlify_click_urls():
     assert "karuna.org/program" in preview
 
 
+def test_visible_click_autolink_is_stripped():
+    """Gmail plain-text clones must not show Netlify click URLs to the reviewer."""
+    from core.tracking import html_for_preview, strip_visible_tracking_urls
+    from gmail_client.html_format import plain_or_markdown_to_html
+
+    leaked = (
+        "See our work "
+        "<https://durgaemailer-tracking.netlify.app/.netlify/functions/"
+        "click?id=94a2ee50-3415-4466-afed-a4c1e3cb3081>"
+    )
+    cleaned = strip_visible_tracking_urls(leaked)
+    assert "netlify" not in cleaned.lower()
+    assert "click?id=" not in cleaned
+    assert "See our work" in cleaned
+
+    html = plain_or_markdown_to_html(leaked)
+    assert "netlify" not in html.lower()
+    assert "click?id=" not in html
+    preview = html_for_preview(f"<p>{leaked}</p>")
+    assert "netlify" not in preview.lower()
+    assert "click?id=" not in preview
+
+
 @pytest.mark.parametrize("surface", ["bulk_grid", "chat_inspector", "drafts_inspector"])
 def test_save_path_reinjects(surface, monkeypatch, tmp_path):
     """Every save surface must strip→inject with same tracking_id."""

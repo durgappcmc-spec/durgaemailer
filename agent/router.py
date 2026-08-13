@@ -303,28 +303,12 @@ def _ensure_designation_in_greeting(
     first_name: str = "",
     title: str = "",
 ) -> str:
-    """Inject (designation) into the opening Dear/Hi/Hello line when missing."""
-    body = html or ""
-    title = (title or "").strip()
-    first = (first_name or "").strip()
-    if not body or not title:
-        return body
-    if title.lower() in body[:1200].lower():
-        return body
-    if first:
-        pat = (
-            rf"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)"
-            rf"({re.escape(first)})(\b)"
-        )
-        updated, n = re.subn(pat, rf"\1\2 ({title})\3", body, count=1, flags=re.I)
-        if n:
-            return updated
-    # Fallback: Dear Name, → Dear Name (Title),
-    pat2 = r"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)([^,<]{1,60}?)(\s*,)"
-    updated, n = re.subn(
-        pat2, rf"\1\2 ({title})\3", body, count=1, flags=re.I
+    """Rewrite the opening greeting to this recipient, then add (designation)."""
+    from gmail_client.html_format import ensure_designation_in_greeting
+
+    return ensure_designation_in_greeting(
+        html, first_name=first_name, title=title
     )
-    return updated if n else body
 
 
 def _prospects_with_email(prospects: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -1063,10 +1047,30 @@ def _reference_org_for_swap(
         m_name = re.match(r'\s*"?([^"<]+?)"?\s*<', to_hdr)
         if m_name:
             display = m_name.group(1).strip()
-            if display and "@" not in display and len(display) > 1:
+            if (
+                display
+                and "@" not in display
+                and len(display) > 1
+                and not _looks_like_person_name(display)
+            ):
                 return display
         return org_label_from_email(ref) or ref
     return ref or "prior organization"
+
+
+def _looks_like_person_name(display: str) -> bool:
+    """True for 'Khurshidalam Qureshi'; false for 'Magic Bus India'."""
+    parts = [p for p in re.split(r"\s+", (display or "").strip()) if p]
+    if len(parts) < 2:
+        return False
+    if re.search(
+        r"\b(inc|ltd|llc|pvt|limited|foundation|trust|org|group|"
+        r"corp|company|team|bus|media|technologies|tech)\b",
+        display,
+        re.I,
+    ):
+        return False
+    return True
 
 
 def _infer_like_sent_target(
@@ -1338,9 +1342,15 @@ def _replace_company_names(
 
 
 def _strip_email_noise(html: str) -> str:
-    """Remove scripts/styles/tracking pixels; keep real content."""
+    """Remove scripts/styles/tracking pixels; keep real content and original hrefs."""
     if not (html or "").strip():
         return ""
+    try:
+        from core.tracking import strip_tracking
+
+        html = strip_tracking(html)
+    except Exception:
+        pass
     try:
         from bs4 import BeautifulSoup
 
@@ -1369,8 +1379,10 @@ def _strip_email_noise(html: str) -> str:
 
 
 def _full_reference_text(body_text: str, body_html: str) -> str:
-    """Return the complete plain-text email body (no truncation)."""
-    text = (body_text or "").strip()
+    """Return the complete plain-text email body (no truncation, no tracking URLs)."""
+    from core.tracking import strip_visible_tracking_urls
+
+    text = strip_visible_tracking_urls((body_text or "").strip())
     html = _strip_email_noise(body_html or "")
     html_text = ""
     if html:
@@ -1380,6 +1392,7 @@ def _full_reference_text(body_text: str, body_html: str) -> str:
             html_text = BeautifulSoup(html, "html.parser").get_text("\n").strip()
         except Exception:
             html_text = html
+        html_text = strip_visible_tracking_urls(html_text)
     # Prefer whichever source is more complete
     if len(html_text) > len(text) + 80:
         return html_text
@@ -1637,15 +1650,19 @@ def _compose_like_sent_email(
         )
 
     # Drop cloned Gmail signature so append_signature adds it once later;
-    # also render any leftover **markdown** inside HTML.
+    # also render any leftover **markdown** inside HTML and hide tracking URLs.
     try:
         from gmail_client.html_format import (
             normalize_email_html,
             strip_trailing_signature_block,
         )
+        from core.tracking import strip_tracking, strip_visible_tracking_urls
 
+        html_out = strip_visible_tracking_urls(html_out)
+        html_out = strip_tracking(html_out)
         html_out = strip_trailing_signature_block(html_out)
         html_out = normalize_email_html(html_out)
+        html_out = strip_visible_tracking_urls(html_out)
     except Exception:
         pass
 
@@ -3673,8 +3690,16 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 em = (job.get("recipient_email") or "").strip().lower()
                                 pctx = by_email.get(em) or {
                                     "name": job.get("recipient_name") or "",
+                                    "first_name": (
+                                        str(job.get("first_name") or "").strip()
+                                        or str(job.get("recipient_name") or "")
+                                        .split(None, 1)[0]
+                                    ),
                                     "email": job.get("recipient_email") or "",
                                     "recipient_email": job.get("recipient_email") or "",
+                                    "title": job.get("title")
+                                    or job.get("designation")
+                                    or "",
                                     "company": target_company
                                     or job.get("company")
                                     or "",

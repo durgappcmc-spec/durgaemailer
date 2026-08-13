@@ -100,3 +100,36 @@ def test_personalize_scrubs_magic_bus_for_sterlite():
     assert "sterlite" in blob
     assert "magic bus" not in blob
     assert "magicbus" not in blob.replace("sterlite", "")
+
+
+def test_personalize_rewrites_khushid_greeting():
+    out = _personalize_like_sent_job(
+        subject="Partnership",
+        html_body="<p>Hi Khushid,</p><p>We would love to partner.</p>",
+        prospect={
+            "name": "Priya Sharma",
+            "first_name": "Priya",
+            "title": "CSR Head",
+            "company": "Sterlite Tech",
+            "email": "priya@sterlite.com",
+        },
+        scrub_names=["IndiaMART", "indiamart"],
+    )
+    assert "Hi Priya (CSR Head)" in out["html_body"]
+    assert "Khushid" not in out["html_body"]
+
+
+def test_like_sent_clone_drops_click_tracking_autolink():
+    from agent.router import _full_reference_text, _full_text_to_html
+
+    text = (
+        "Hi Khushid,\n\nSee our work "
+        "<https://durgaemailer-tracking.netlify.app/.netlify/functions/"
+        "click?id=94a2ee50-3415-4466-afed-a4c1e3cb3081>\n"
+    )
+    cleaned = _full_reference_text(text, "")
+    assert "netlify" not in cleaned.lower()
+    assert "click?id=" not in cleaned
+    html = _full_text_to_html(cleaned)
+    assert "netlify" not in html.lower()
+    assert "click?id=" not in html
