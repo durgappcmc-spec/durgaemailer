@@ -150,6 +150,8 @@ _TEMPLATE_KEYS = (
     "first_name",
     "name",
     "title",
+    "designation",
+    "name_with_title",
     "company",
     "email",
     "recipient_email",
@@ -247,7 +249,7 @@ def _route_user_msg(
 
 
 def _apply_template(text: str, prospect: dict[str, Any]) -> str:
-    """Substitute {first_name}, {name}, {title}, {company}, {email}."""
+    """Substitute {first_name}, {name}, {title}/{designation}, {company}, {email}."""
     if not text:
         return text or ""
     name = str(prospect.get("name") or prospect.get("recipient_name") or "").strip()
@@ -255,10 +257,23 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
     first = str(prospect.get("first_name") or "").strip() or (
         name_parts[0] if name_parts else ""
     )
+    title = (
+        str(prospect.get("title") or "").strip()
+        or str(prospect.get("designation") or "").strip()
+        or str(prospect.get("recipient_title") or "").strip()
+    )
+    if first and title:
+        name_with_title = f"{first} ({title})"
+    elif first:
+        name_with_title = first
+    else:
+        name_with_title = title or name
     mapping = {
         "first_name": first,
         "name": name,
-        "title": str(prospect.get("title") or ""),
+        "title": title,
+        "designation": title,
+        "name_with_title": name_with_title,
         "company": str(prospect.get("company") or ""),
         "email": str(
             prospect.get("email") or prospect.get("recipient_email") or ""
@@ -278,7 +293,38 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
     out = text
     for key in _TEMPLATE_KEYS:
         out = out.replace("{" + key + "}", mapping.get(key) or "")
+        out = out.replace("{{" + key + "}}", mapping.get(key) or "")
     return out
+
+
+def _ensure_designation_in_greeting(
+    html: str,
+    *,
+    first_name: str = "",
+    title: str = "",
+) -> str:
+    """Inject (designation) into the opening Dear/Hi/Hello line when missing."""
+    body = html or ""
+    title = (title or "").strip()
+    first = (first_name or "").strip()
+    if not body or not title:
+        return body
+    if title.lower() in body[:1200].lower():
+        return body
+    if first:
+        pat = (
+            rf"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)"
+            rf"({re.escape(first)})(\b)"
+        )
+        updated, n = re.subn(pat, rf"\1\2 ({title})\3", body, count=1, flags=re.I)
+        if n:
+            return updated
+    # Fallback: Dear Name, → Dear Name (Title),
+    pat2 = r"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)([^,<]{1,60}?)(\s*,)"
+    updated, n = re.subn(
+        pat2, rf"\1\2 ({title})\3", body, count=1, flags=re.I
+    )
+    return updated if n else body
 
 
 def _prospects_with_email(prospects: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -871,15 +917,27 @@ def _deliver_job(
 ) -> tuple[dict[str, Any], bool]:
     """Create a new draft (default) or send. Returns (result, did_send)."""
     do_send = want_send and not _prefer_draft_over_send(user_msg, True)
+    title = (
+        job.get("title")
+        or job.get("designation")
+        or job.get("recipient_title")
+        or ""
+    )
+    first = str(job.get("first_name") or "").strip()
+    if not first:
+        name = str(job.get("recipient_name") or job.get("name") or "").strip()
+        first = name.split(None, 1)[0] if name else ""
+    html_body = _ensure_designation_in_greeting(
+        job.get("html_body") or "",
+        first_name=first,
+        title=str(title),
+    )
     kwargs = {
         "to": job["recipient_email"],
         "subject": job.get("subject") or "(no subject)",
-        "html_body": job.get("html_body") or "",
+        "html_body": html_body,
         "recipient_name": job.get("recipient_name") or "",
-        "recipient_title": job.get("title")
-        or job.get("designation")
-        or job.get("recipient_title")
-        or "",
+        "recipient_title": str(title),
         "company": job.get("company") or "",
         "attachments": job.get("attachments"),
         "campaign": job.get("campaign"),
@@ -1148,6 +1206,10 @@ def _personalize_like_sent_job(
     if not first:
         name = str(pctx.get("name") or "").strip()
         first = name.split(None, 1)[0] if name else ""
+    title = (
+        str(pctx.get("title") or "").strip()
+        or str(pctx.get("designation") or "").strip()
+    )
     greet_to = first or company
     body = re.sub(
         rf"(Dear|Hi|Hello)\s+{re.escape(company)}\s+Team\b",
@@ -1155,6 +1217,7 @@ def _personalize_like_sent_job(
         body,
         flags=re.I,
     )
+    body = _ensure_designation_in_greeting(body, first_name=first, title=title)
     return {"subject": subj, "html_body": body}
 
 def _prospects_for_company(
@@ -2295,9 +2358,9 @@ def answer(
 User request:
 {user_msg}
 
-Use placeholders exactly: {{first_name}}, {{company}}, {{title}}, {{org_focus}}
+Use placeholders exactly: {{first_name}}, {{name_with_title}}, {{company}}, {{title}}, {{org_focus}}
 Return JSON:
-{{"subject":"...","html_body":"<p>Hi {{first_name}},</p>..."}}
+{{"subject":"...","html_body":"<p>Hi {{name_with_title}},</p>..."}}
 
 Keep it warm, specific to girls/skilling NGO partnership if relevant.
 If user mentions karunamedia.org or a brand, reference collaboration politely.
@@ -2315,7 +2378,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     or "Partnership idea for {company}'s girls skilling work"
                 )
                 html_body = tmpl.get("html_body") or (
-                    "<p>Hi {first_name},</p>"
+                    "<p>Hi {name_with_title},</p>"
                     "<p>I came across <strong>{company}</strong> and your work "
                     "on {org_focus}.</p>"
                     "<p>I'd love to explore a collaboration that supports "
@@ -3867,7 +3930,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         or "{first_name}" not in body
                     ):
                         payload["html_body"] = (
-                            "<p>Hi {first_name},</p>"
+                            "<p>Hi {name_with_title},</p>"
                             "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
                             "<p>{prior_summary}</p>"
                             "<p>Would you have time this week for a quick chat?</p>"

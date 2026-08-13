@@ -18,7 +18,12 @@ logout_button()
 
 from core import drive_db
 from core.tracking import extract_tracking_id, inject_tracking
-from gmail_client.drafts import get_gmail_draft, list_gmail_drafts, send_gmail_draft
+from gmail_client.drafts import (
+    delete_gmail_draft,
+    get_gmail_draft,
+    list_gmail_drafts,
+    send_gmail_draft,
+)
 from gmail_client.send import send_email
 
 
@@ -129,12 +134,12 @@ def _recipient_company(row: dict) -> str:
 st.title("📝 Drafts")
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
-    "send with open-tracking pixel."
+    "select with checkboxes to send or remove · designation shown per recipient."
 )
 st.markdown(
     """
 <style>
-div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) button {
+div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) button {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -145,7 +150,7 @@ div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) butt
   font-weight: 600 !important;
   text-decoration: underline;
 }
-div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) button:hover {
+div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) button:hover {
   color: #0b57d0 !important;
 }
 </style>
@@ -188,10 +193,20 @@ for r in gmail_rows:
         by_id[did] = {**r, "origin": "gmail"}
 
 rows = list(by_id.values())
+# Backfill designation/company from Saved prospects when Gmail metadata lacks them
+for r in rows:
+    if not _recipient_designation(r) or not _recipient_company(r):
+        des = _recipient_designation(r)
+        co = _recipient_company(r)
+        if des and not (r.get("title") or r.get("designation")):
+            r["title"] = des
+            r["designation"] = des
+        if co and not r.get("company"):
+            r["company"] = co
 rows.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
 
-q = st.text_input("Search subject/recipient")
-status_f = st.selectbox("Status", ["all", "draft", "ready", "sent", "deleted"])
+q = st.text_input("Search subject/recipient/designation")
+status_f = st.selectbox("Status", ["active", "all", "draft", "ready", "sent", "deleted"])
 source_f = st.selectbox("Source", ["all", "gmail", "drive", "bulk"])
 page = st.number_input("Page", min_value=1, value=1, step=1)
 page_size = 10
@@ -209,7 +224,13 @@ if q:
         or ql in _recipient_designation(r).lower()
         or ql in _recipient_company(r).lower()
     ]
-if status_f != "all":
+if status_f == "active":
+    rows = [
+        r
+        for r in rows
+        if (r.get("status") or "draft") not in ("deleted", "sent")
+    ]
+elif status_f != "all":
     rows = [r for r in rows if (r.get("status") or "draft") == status_f]
 if source_f == "gmail":
     rows = [r for r in rows if "gmail" in str(r.get("origin") or "")]
@@ -225,44 +246,67 @@ st.caption(
     f"{total} drafts · showing {start + 1}–{min(start + page_size, total) if total else 0}"
 )
 
-h = st.columns([0.4, 2.6, 3.0, 1.3, 1, 1.2, 1.2])
-h[0].markdown("**☐**")
-h[1].markdown("**Recipient**")
-h[2].markdown("**Subject**")
-h[3].markdown("**Updated**")
-h[4].markdown("**Status**")
-h[5].markdown("**Tracking**")
-h[6].markdown("**Source**")
-
-selected: list[str] = []
+if "draft_selected_ids" not in st.session_state:
+    st.session_state.draft_selected_ids = set()
 if "opened_draft_id" not in st.session_state:
     st.session_state.opened_draft_id = ""
 
+sel_c1, sel_c2, sel_c3 = st.columns([1, 1, 4])
+page_ids = [str(r.get("draft_id") or "") for r in page_rows if r.get("draft_id")]
+if sel_c1.button("☑ Select page"):
+    st.session_state.draft_selected_ids |= set(page_ids)
+    st.rerun()
+if sel_c2.button("☐ Clear selection"):
+    st.session_state.draft_selected_ids = set()
+    st.rerun()
+sel_c3.caption(f"{len(st.session_state.draft_selected_ids)} selected")
+
+h = st.columns([0.45, 2.2, 1.8, 2.6, 1.2, 0.9, 1.0])
+h[0].markdown("**☐**")
+h[1].markdown("**Recipient**")
+h[2].markdown("**Designation**")
+h[3].markdown("**Subject**")
+h[4].markdown("**Updated**")
+h[5].markdown("**Status**")
+h[6].markdown("**Source**")
+
+selected: list[str] = []
 for r in page_rows:
-    did = r.get("draft_id") or ""
-    cols = st.columns([0.4, 2.6, 3.0, 1.3, 1, 1.2, 1.2])
+    did = str(r.get("draft_id") or "")
+    cols = st.columns([0.45, 2.2, 1.8, 2.6, 1.2, 0.9, 1.0])
     with cols[0]:
-        if st.checkbox("", key=f"dsel_{did}", label_visibility="collapsed"):
+        checked = st.checkbox(
+            "select",
+            value=did in st.session_state.draft_selected_ids,
+            key=f"dsel_{did}",
+            label_visibility="collapsed",
+        )
+        if checked:
+            st.session_state.draft_selected_ids.add(did)
             selected.append(did)
+        else:
+            st.session_state.draft_selected_ids.discard(did)
     with cols[1]:
         email = r.get("recipient") or r.get("to") or "—"
         name = (r.get("recipient_name") or "").strip()
-        designation = _recipient_designation(r)
         company = _recipient_company(r)
         st.write(email)
         if name and name.lower() not in str(email).lower():
             st.caption(name)
-        if designation:
-            line = designation
-            if company:
-                line = f"{designation} · {company}"
-            st.caption(line)
         elif company:
             st.caption(company)
     with cols[2]:
+        designation = _recipient_designation(r)
+        company = _recipient_company(r)
+        if designation:
+            st.write(designation)
+            if company:
+                st.caption(company)
+        else:
+            st.caption(company or "—")
+    with cols[3]:
         subject_label = (r.get("subject") or "(no subject)").strip() or "(no subject)"
-        # Truncate long subjects for the button label
-        btn_label = subject_label if len(subject_label) <= 60 else subject_label[:57] + "…"
+        btn_label = subject_label if len(subject_label) <= 52 else subject_label[:49] + "…"
         if st.button(
             btn_label,
             key=f"open_subj_{did}",
@@ -271,21 +315,56 @@ for r in page_rows:
         ):
             st.session_state.opened_draft_id = did
             st.rerun()
-    cols[3].write((r.get("updated_at") or "")[:16] or "—")
-    cols[4].write(r.get("status") or "draft")
-    tracked = bool(r.get("tracking_id") or r.get("has_open_pixel"))
-    cols[5].write("🔒 yes" if tracked else "⚠️ no")
+    cols[4].write((r.get("updated_at") or "")[:16] or "—")
+    cols[5].write(r.get("status") or "draft")
     cols[6].write(r.get("origin") or r.get("source") or "—")
 
-c1, c2, c3, c4 = st.columns(4)
-if c1.button("📨 Send selected", type="primary") and selected:
+# Prefer explicit checkboxes on this page; fall back to session selection
+selected = selected or [
+    did for did in st.session_state.draft_selected_ids if did in set(page_ids)
+]
+# If user selected across pages, use full session set for actions
+action_ids = list(st.session_state.draft_selected_ids) or selected
+
+
+def _remove_drafts(ids: list[str]) -> list[dict]:
     results = []
-    for did in selected:
+    for did in ids:
+        row = by_id.get(did) or {}
+        gmail_id = row.get("gmail_draft_id") or ""
+        if not gmail_id and str(did).startswith("gmail:"):
+            gmail_id = str(did).removeprefix("gmail:")
+        gmail_res: dict = {}
+        if gmail_id:
+            gmail_res = delete_gmail_draft(gmail_id)
+        try:
+            drive_db.delete_draft(did, purge=True)
+            drive_ok = True
+        except Exception as e:
+            drive_ok = False
+            gmail_res = {**gmail_res, "drive_error": str(e)}
+        st.session_state.draft_selected_ids.discard(did)
+        if st.session_state.get("opened_draft_id") == did:
+            st.session_state.opened_draft_id = ""
+        results.append(
+            {
+                "draft_id": did,
+                "gmail": gmail_res,
+                "drive_removed": drive_ok,
+            }
+        )
+    return results
+
+
+c1, c2, c3, c4 = st.columns(4)
+if c1.button("📨 Send selected", type="primary") and action_ids:
+    results = []
+    for did in action_ids:
         draft = _load_full_draft(did, by_id.get(did) or {})
         results.append(_send_one(draft))
     st.json(results)
-if c2.button("🔒 Ensure tracking on selected") and selected:
-    for did in selected:
+if c2.button("🔒 Ensure tracking on selected") and action_ids:
+    for did in action_ids:
         draft = _load_full_draft(did, by_id.get(did) or {})
         html, tid = inject_tracking(
             draft.get("body_html") or "",
@@ -301,14 +380,13 @@ if c2.button("🔒 Ensure tracking on selected") and selected:
             drive_db.save_draft(did, draft)
         except Exception:
             pass
-    st.success(f"Tracking injected on {len(selected)} draft(s)")
+    st.success(f"Tracking injected on {len(action_ids)} draft(s)")
     st.rerun()
-if c3.button("Delete selected") and selected:
-    for did in selected:
-        try:
-            drive_db.delete_draft(did)
-        except Exception:
-            pass
+if c3.button("🗑 Remove selected") and action_ids:
+    results = _remove_drafts(action_ids)
+    ok_n = sum(1 for r in results if r.get("drive_removed"))
+    st.success(f"Removed {ok_n}/{len(results)} draft(s) from Drive"
+               + (" and Gmail" if any((r.get("gmail") or {}).get("ok") for r in results) else ""))
     st.rerun()
 if c4.button("Export CSV"):
     buf = io.StringIO()
@@ -349,6 +427,11 @@ labels = {
     r.get("draft_id"): (
         f"{r.get('subject') or '(no subject)'} → "
         f"{r.get('recipient') or r.get('to') or '—'}"
+        + (
+            f" · {_recipient_designation(r)}"
+            if _recipient_designation(r)
+            else ""
+        )
     )
     for r in page_rows
 }

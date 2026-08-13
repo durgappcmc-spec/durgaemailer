@@ -360,17 +360,28 @@ def list_drafts(limit: int = 50, offset: int = 0) -> list[dict]:
     return idx[offset : offset + limit]
 
 
-def delete_draft(draft_id: str) -> None:
+def delete_draft(draft_id: str, *, purge: bool = True) -> None:
+    """Remove a draft from the index; optionally delete the Drive blob.
+
+    Soft-deletes (purge=False) set status=deleted so filters can hide them.
+    """
     idx = _get(_path("drafts_index.json"), default=[]) or []
     if isinstance(idx, list):
         idx = [e for e in idx if e.get("draft_id") != draft_id]
         _put(_path("drafts_index.json"), idx)
-    # leave blob; mark deleted if present
     try:
         d = load_draft(draft_id)
-        d["status"] = "deleted"
-        d["updated_at"] = _now()
-        _put(_path("drafts", f"{draft_id}.json"), d)
+        if purge:
+            # Best-effort: overwrite with a tombstone so reloads don't resurrect
+            d["status"] = "deleted"
+            d["purged"] = True
+            d["updated_at"] = _now()
+            d["body_html"] = ""
+            _put(_path("drafts", f"{draft_id}.json"), d)
+        else:
+            d["status"] = "deleted"
+            d["updated_at"] = _now()
+            _put(_path("drafts", f"{draft_id}.json"), d)
     except KeyError:
         pass
 

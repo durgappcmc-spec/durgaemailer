@@ -185,6 +185,20 @@ def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         return {"error": str(e), "gmail_draft_id": did, "tracking_id": tid}
 
 
+def delete_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
+    """Permanently delete a Gmail draft (users.drafts.delete)."""
+    did = (gmail_draft_id or "").removeprefix("gmail:")
+    if not did:
+        return {"error": "missing gmail draft id"}
+    try:
+        svc = gmail_service()
+        svc.users().drafts().delete(userId="me", id=did).execute()
+        return {"ok": True, "gmail_draft_id": did}
+    except Exception as e:
+        print(f"[gmail] delete draft failed: {e}", file=sys.stderr)
+        return {"error": str(e), "gmail_draft_id": did}
+
+
 def _draft_headers(
     gmail_draft_id: str, *, format_: str = "metadata"
 ) -> dict[str, Any]:

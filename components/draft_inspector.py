@@ -86,7 +86,7 @@ def render_draft_inspector(
             else:
                 st.error("No open-tracking pixel detected.")
 
-        s1, s2 = st.columns(2)
+        s1, s2, s3 = st.columns(3)
         with s1:
             if st.button("📨 Send now", type="primary", key=f"{key_prefix}_send"):
                 result = _send_draft_now(draft)
@@ -115,6 +115,36 @@ def render_draft_inspector(
                 draft.update(updated)
                 st.success(f"Tracking id: {draft.get('tracking_id')}")
                 st.rerun()
+        with s3:
+            if st.button("🗑 Remove draft", key=f"{key_prefix}_remove"):
+                did = str(draft.get("draft_id") or "")
+                gmail_id = draft.get("gmail_draft_id") or (
+                    did.removeprefix("gmail:") if did.startswith("gmail:") else ""
+                )
+                errors = []
+                if gmail_id:
+                    try:
+                        from gmail_client.drafts import delete_gmail_draft
+
+                        res = delete_gmail_draft(gmail_id)
+                        if res.get("error"):
+                            errors.append(res["error"])
+                    except Exception as e:
+                        errors.append(str(e))
+                if did:
+                    try:
+                        from core import drive_db
+
+                        drive_db.delete_draft(did, purge=True)
+                    except Exception as e:
+                        errors.append(str(e))
+                if errors:
+                    st.error("; ".join(errors))
+                else:
+                    st.success("Draft removed")
+                    if st.session_state.get("opened_draft_id") == did:
+                        st.session_state.opened_draft_id = ""
+                    st.rerun()
 
     with tab_intel:
         brief = org_brief or draft.get("org_brief") or {}
