@@ -12,35 +12,31 @@ from core.prospect_list import (
     all_prospects,
     reload_from_drive,
     repair_saved_prospects,
+    save_prospects,
     search_saved,
+    visible_prospects,
 )
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
 if not require_login():
     st.stop()
 logout_button()
-ensure_session_sync(st.session_state)
 
-# Chat ZoomInfo hits live in session — merge into Saved before any Drive reload
-# can show a stale empty list.
-if st.session_state.get("last_prospects") and not st.session_state.get(
-    "_session_prospects_merged"
-):
-    st.session_state._session_prospects_merged = True
+# Persist Chat ZoomInfo hits into Saved on every visit (idempotent merge).
+_session_hits = [
+    p
+    for p in (st.session_state.get("last_prospects") or [])
+    if p and not p.get("error") and not p.get("research_only")
+]
+if _session_hits:
     try:
-        from core.prospect_list import save_prospects
+        n_merged = save_prospects(_session_hits)
+        if n_merged:
+            st.toast(f"Saved **{n_merged}** contacts from Chat/Search into the list")
+    except Exception as e:
+        st.warning(f"Could not merge session contacts into Saved: {e}")
 
-        clean = [
-            p
-            for p in (st.session_state.last_prospects or [])
-            if p and not p.get("error") and not p.get("research_only")
-        ]
-        if clean:
-            n = save_prospects(clean)
-            if n:
-                st.toast(f"Merged **{n}** session contacts into Saved list")
-    except Exception:
-        pass
+ensure_session_sync(st.session_state)
 
 # After each deploy Render disk is empty — pull Drive before any save can clobber it
 if not st.session_state.get("_prospects_drive_hydrated"):
@@ -51,6 +47,12 @@ if not st.session_state.get("_prospects_drive_hydrated"):
             st.toast(f"Restored **{n_cloud}** contacts from Google Drive")
     except Exception:
         pass
+    # Re-apply session hits after Drive reload (stale cloud must not win)
+    if _session_hits:
+        try:
+            save_prospects(_session_hits)
+        except Exception:
+            pass
 
 # One-time repair of name/email mix-ups on the durable list
 if not st.session_state.get("_prospects_repaired"):
@@ -97,9 +99,14 @@ except Exception:
 
 n_saved = 0
 try:
-    n_saved = len(all_prospects())
+    n_saved = len(
+        visible_prospects(session_prospects=st.session_state.get("last_prospects"))
+    )
 except Exception:
-    n_saved = 0
+    try:
+        n_saved = len(all_prospects())
+    except Exception:
+        n_saved = 0
 if n_saved:
     st.caption(f"Saved on your list: **{n_saved}** contacts")
 elif st.session_state.get("_prospects_restored_n") == 0:
@@ -113,9 +120,16 @@ with tab_saved:
     q_name = c1.text_input("Search by name / email / title", key="saved_name")
     q_org = c2.text_input("Search by organisation", key="saved_org")
     if c3.button("Refresh list", use_container_width=True, key="saved_refresh"):
-        # Force reload from Drive
+        # Force reload from Drive, then re-merge session Chat hits
         try:
             n = reload_from_drive()
+            hits = [
+                p
+                for p in (st.session_state.get("last_prospects") or [])
+                if p and not p.get("error")
+            ]
+            if hits:
+                save_prospects(hits)
             st.toast(f"Loaded {n} contacts from Drive")
         except Exception as e:
             st.warning(f"Drive reload failed: {e}")
@@ -123,9 +137,32 @@ with tab_saved:
 
     try:
         if (q_name or "").strip() or (q_org or "").strip():
-            saved_rows = search_saved(name=q_name, organisation=q_org, limit=1000)
+            # Filter the union of durable + session so Chat hits aren't hidden
+            saved_rows = visible_prospects(
+                session_prospects=st.session_state.get("last_prospects")
+            )
+            name_n = (q_name or "").strip().lower()
+            org_n = (q_org or "").strip().lower()
+            filtered = []
+            for p in saved_rows:
+                blob = " ".join(
+                    str(p.get(k) or "")
+                    for k in ("name", "first_name", "last_name", "email", "title")
+                ).lower()
+                org_blob = " ".join(
+                    str(p.get(k) or "")
+                    for k in ("company", "organization", "org", "org_website", "website")
+                ).lower()
+                if name_n and name_n not in blob:
+                    continue
+                if org_n and org_n not in org_blob and org_blob not in org_n:
+                    continue
+                filtered.append(p)
+            saved_rows = filtered
         else:
-            saved_rows = all_prospects()
+            saved_rows = visible_prospects(
+                session_prospects=st.session_state.get("last_prospects")
+            )
     except Exception as e:
         saved_rows = []
         st.warning(f"Could not load saved contacts: {e}")

@@ -63,14 +63,16 @@ def _load() -> list[dict[str, Any]]:
 def _persist(rows: list[dict[str, Any]]) -> bool:
     """Write prospect list to Drive (+ Sheets). Returns True if Drive sync ok."""
     global _CACHE, _LOADED
-    _CACHE = rows
+    slimmed = [slim_prospect(r) for r in rows if isinstance(r, dict)]
+    slimmed = _scrub_mailbox_noise(slimmed)
+    _CACHE = slimmed
     _LOADED = True
     try:
         from core.durable_store import save_json_blob
 
-        ok = bool(save_json_blob("prospect_list", rows[-1000:]))
+        ok = bool(save_json_blob("prospect_list", slimmed[-1000:]))
         print(
-            f"[prospect_list] persist n={len(rows)} drive_ok={ok}",
+            f"[prospect_list] persist n={len(slimmed)} drive_ok={ok}",
             file=sys.stderr,
         )
         if not ok:
@@ -93,6 +95,79 @@ def _is_mailbox_noise(p: dict[str, Any]) -> bool:
 
 def _scrub_mailbox_noise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict) and not _is_mailbox_noise(r)]
+
+
+_KEEP_FIELDS = (
+    "name",
+    "first_name",
+    "last_name",
+    "email",
+    "phone",
+    "mobile",
+    "title",
+    "company",
+    "organization",
+    "org",
+    "org_website",
+    "website",
+    "linkedin_url",
+    "location",
+    "seniority",
+    "department",
+    "source",
+    "source_id",
+    "saved_at",
+)
+
+
+def slim_prospect(p: dict[str, Any]) -> dict[str, Any]:
+    """Drop ZoomInfo `raw` blobs so Sheets/Drive saves stay small and reliable."""
+    from connectors import sanitize_prospect
+
+    clean = sanitize_prospect(p)
+    out: dict[str, Any] = {}
+    for k in _KEEP_FIELDS:
+        v = clean.get(k, p.get(k))
+        if v in (None, "", [], {}):
+            continue
+        out[k] = v
+    # Keep explicit source tag
+    if not (out.get("source") or "").strip():
+        src = str(p.get("source") or "").strip() or "zoominfo"
+        if src.lower() in ("zi", "zoom", "zoom info"):
+            src = "zoominfo"
+        out["source"] = src
+    return out
+
+
+def visible_prospects(*, session_prospects: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """Saved list ∪ current Chat/Search session hits (session wins on email/key)."""
+    from connectors import sanitize_prospect
+
+    with _LOCK:
+        base = [sanitize_prospect(p) for p in _scrub_mailbox_noise(list(_load()))]
+    by_key: dict[str, dict[str, Any]] = {_prospect_key(p): p for p in base}
+    for p in session_prospects or []:
+        if not p or p.get("error") or p.get("research_only"):
+            continue
+        if _is_mailbox_noise(p):
+            continue
+        sp = slim_prospect(p)
+        if not (
+            (sp.get("email") or "").strip()
+            or (sp.get("name") or "").strip()
+            or (sp.get("company") or "").strip()
+        ):
+            continue
+        by_key[_prospect_key(sp)] = {**by_key.get(_prospect_key(sp), {}), **sp}
+    rows = list(by_key.values())
+    rows.sort(
+        key=lambda p: (
+            _norm(str(p.get("company") or "")),
+            _norm(str(p.get("name") or "")),
+        )
+    )
+    return rows
 
 
 def reload_from_drive() -> int:
@@ -161,7 +236,6 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
     """
     if not prospects:
         return 0
-    from connectors import sanitize_prospect
 
     with _LOCK:
         global _CACHE, _LOADED
@@ -176,7 +250,7 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
         for p in prospects:
             if not p or p.get("error") or p.get("research_only"):
                 continue
-            p = sanitize_prospect(p)
+            p = slim_prospect(p)
             if _is_mailbox_noise(p):
                 continue
             # Need at least a name or email or company signal
@@ -196,7 +270,7 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
             }
             if key in by_key:
                 idx = by_key[key]
-                old = sanitize_prospect(rows[idx])
+                old = slim_prospect(rows[idx])
                 merged = {**old, **row}
                 for field in ("email", "phone", "mobile", "linkedin_url", "title", "name"):
                     if not (merged.get(field) or "").strip() and (old.get(field) or "").strip():
@@ -206,12 +280,14 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
                     str(row.get("source") or "").startswith("zoom")
                 ):
                     merged["source"] = row.get("source") or "zoominfo"
-                rows[idx] = sanitize_prospect(merged)
+                rows[idx] = slim_prospect(merged)
             else:
                 by_key[key] = len(rows)
                 rows.append(row)
             changed += 1
         if changed:
+            # Always drop raw blobs from the full list before persist
+            rows = [slim_prospect(r) for r in rows if isinstance(r, dict)]
             drive_ok = _persist(rows)
             if not drive_ok:
                 # One retry after clearing Drive file-id cache

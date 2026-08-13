@@ -677,6 +677,9 @@ def pull_sheets_into_local_async() -> None:
         try:
             for key in ("chat_messages", "session_extras", "memory_rows", "prospect_list"):
                 local = _load_local(key)
+                # Never clobber a non-empty prospect list with a background pull
+                if key == "prospect_list" and isinstance(local, list) and len(local) > 0:
+                    continue
                 if local is not None and not _local_is_miss(local):
                     continue
                 load_json_blob(key, allow_sheets=True)
