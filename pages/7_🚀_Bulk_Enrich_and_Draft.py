@@ -106,8 +106,11 @@ if not persona_presets:
                 "CSR Head",
                 "Head of CSR",
                 "CSR Manager",
+                "Head of Corporate Social Responsibility",
+                "Head of Sustainability",
                 "Head of Partnerships",
                 "Director of Partnerships",
+                "Head of Corporate Partnerships",
             ],
             "seniority": ["Director", "VP", "C-Level", "Manager"],
         }

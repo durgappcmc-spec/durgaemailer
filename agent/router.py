@@ -2577,7 +2577,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         "Saved list incomplete — checking ZoomInfo for contact "
                         "details (email/mobile)…\n"
                     )
-                yield f"Searching **{', '.join(providers)}** (limit **{limit}**)…\n"
+                yield (
+                    f"Searching **{', '.join(providers)}** "
+                    f"(CSR / persona titles first, then broader contacts; "
+                    f"limit **{limit}**)…\n"
+                )
                 results = search_all(
                     q, providers=tuple(providers), limit_per_provider=limit
                 )

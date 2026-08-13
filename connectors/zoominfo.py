@@ -192,12 +192,22 @@ class ZoomInfoConnector(ProspectConnector):
             company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
             company_hits = _rank_companies_for_query(company_hits, rank_needle)
             if company_hits:
+                # Same cascade as Phase 1 / Bulk Enrich: try CSR (or NGO) titles
+                # in priority order, then expand to other contacts at the firm.
+                cascade_titles, expand = _title_cascade_for_query(query)
                 results.extend(
-                    self._contacts_for_companies(company_hits[:5], limit=limit)
+                    self._contacts_for_companies(
+                        company_hits[:5],
+                        limit=limit,
+                        titles=cascade_titles,
+                        expand=expand,
+                    )
                 )
                 print(
                     f"[zoominfo] company-first: {len(company_hits)} firms → "
-                    f"{len(results)} contacts (q={rank_needle!r})",
+                    f"{len(results)} contacts (q={rank_needle!r}, "
+                    f"titles={cascade_titles[:3]!r}{'…' if len(cascade_titles) > 3 else ''}, "
+                    f"expand={expand})",
                     file=sys.stderr,
                 )
 
@@ -407,26 +417,43 @@ class ZoomInfoConnector(ProspectConnector):
         return list(by_id.values())
 
     def _contacts_for_companies(
-        self, companies: list[dict[str, Any]], limit: int = 10
+        self,
+        companies: list[dict[str, Any]],
+        limit: int = 10,
+        titles: Optional[list[str]] = None,
+        expand: bool = True,
     ) -> list[dict[str, Any]]:
-        """Pull contacts for company IDs, then enrich emails."""
+        """Pull contacts for company IDs — title priority first, then broaden.
+
+        Mirrors Phase 1 `zoominfo_search_contact`: try each title in order
+        (e.g. CSR Head → Head of CSR → …). If still short and expand=True,
+        pull remaining contacts at the firm without a title filter.
+        """
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for co in companies:
+        title_list = [str(t).strip() for t in (titles or []) if str(t).strip()]
+
+        def _append_from_company(
+            co: dict[str, Any], *, job_title: Optional[str] = None
+        ) -> None:
+            nonlocal out
             if len(out) >= limit:
-                break
+                return
             cid = co.get("id") or co.get("companyId")
             if not cid:
-                continue
+                return
+            body: dict[str, Any] = {
+                "companyId": str(cid),
+                "rpp": min(25, max(5, limit - len(out))),
+                "page": 1,
+            }
+            if job_title:
+                body["jobTitle"] = job_title
             try:
                 resp = requests.post(
                     f"{self.BASE}/search/contact",
                     headers=self._headers(),
-                    json={
-                        "companyId": str(cid),
-                        "rpp": min(25, max(5, limit - len(out))),
-                        "page": 1,
-                    },
+                    json=body,
                     timeout=45,
                 )
                 resp.raise_for_status()
@@ -439,17 +466,25 @@ class ZoomInfoConnector(ProspectConnector):
                     ),
                 )
             except Exception as e:
-                print(f"[zoominfo] contacts-for-company error: {e}", file=sys.stderr)
-                continue
+                label = job_title or "(any)"
+                print(
+                    f"[zoominfo] contacts-for-company error ({label}): {e}",
+                    file=sys.stderr,
+                )
+                return
             batch = self._enrich_contact_rows(rows, limit=limit - len(out))
             for p in batch:
-                key = (p.get("email") or p.get("source_id") or p.get("name") or "").lower()
+                key = (
+                    p.get("email") or p.get("source_id") or p.get("name") or ""
+                ).lower()
                 if key and key in seen:
                     continue
                 if key:
                     seen.add(key)
                 if not p.get("company"):
                     p["company"] = co.get("name") or ""
+                if job_title and not p.get("matched_on"):
+                    p["matched_on"] = f"{job_title} (ZI title priority)"
                 if co.get("city") and not p.get("location"):
                     p["location"] = ", ".join(
                         filter(
@@ -458,6 +493,39 @@ class ZoomInfoConnector(ProspectConnector):
                         )
                     )
                 out.append(p)
+                if len(out) >= limit:
+                    return
+
+        # Phase A — persona titles in order (CSR Head, …)
+        # Cap fan-out: top firms × priority titles until we have a solid CSR set.
+        title_target = min(limit, max(3, (limit + 1) // 2))
+        for title in title_list[:8]:
+            if len(out) >= title_target:
+                break
+            for co in companies[:2]:
+                if len(out) >= title_target:
+                    break
+                before = len(out)
+                _append_from_company(co, job_title=title)
+                if len(out) > before:
+                    print(
+                        f"[zoominfo] title hit {title!r} → +{len(out) - before} "
+                        f"at {co.get('name') or co.get('id')}",
+                        file=sys.stderr,
+                    )
+
+        # Phase B — broaden to other contacts at the same firms
+        if expand and len(out) < limit:
+            print(
+                f"[zoominfo] expanding beyond titles "
+                f"({len(out)}/{limit} so far)",
+                file=sys.stderr,
+            )
+            for co in companies:
+                if len(out) >= limit:
+                    break
+                _append_from_company(co, job_title=None)
+
         return out[:limit]
 
     def _enrich_contact_rows(
@@ -1001,6 +1069,93 @@ def _is_nonprofit_query(query: dict[str, Any]) -> bool:
             re.I,
         )
     )
+
+
+# Same persona ladder as Bulk Enrich / Phase 1 ContactAgent (CSR Head first).
+CSR_TITLE_PRIORITY: list[str] = [
+    "CSR Head",
+    "Head of CSR",
+    "CSR Manager",
+    "Head of Corporate Social Responsibility",
+    "Corporate Social Responsibility",
+    "Head of Sustainability",
+    "Sustainability Head",
+    "Head of Partnerships",
+    "Director of Partnerships",
+    "Head of Corporate Partnerships",
+    "CSR",
+]
+
+NGO_TITLE_PRIORITY: list[str] = [
+    "Founder",
+    "Co-Founder",
+    "Director",
+    "Managing Director",
+    "CEO",
+    "President",
+    "Secretary",
+    "Trustee",
+    "Program Manager",
+    "Program Director",
+    "Head",
+    "Coordinator",
+]
+
+
+def _titles_from_query(query: dict[str, Any]) -> list[str]:
+    raw = query.get("titles") or query.get("title") or []
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+        return parts
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw if str(t).strip()]
+    return []
+
+
+def _default_csr_titles() -> list[str]:
+    """Prefer Drive persona_targets CSR preset when present; else hardcoded ladder."""
+    try:
+        from core import drive_db
+
+        for p in drive_db.load_persona_targets() or []:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "").lower()
+            label = str(p.get("label") or "").lower()
+            titles = [str(t).strip() for t in (p.get("titles") or []) if str(t).strip()]
+            if titles and ("csr" in pid or "csr" in label):
+                return titles
+    except Exception:
+        pass
+    return list(CSR_TITLE_PRIORITY)
+
+
+def _title_cascade_for_query(query: dict[str, Any]) -> tuple[list[str], bool]:
+    """Return (titles_in_priority_order, expand_to_other_contacts).
+
+    - Explicit titles in the query → try those first; expand only if title_expand.
+    - Corporate company search with no titles → CSR Head ladder, then expand.
+    - Nonprofit search with no titles → NGO leadership ladder, then expand.
+    """
+    explicit = _titles_from_query(query)
+    if explicit:
+        # Still broaden when title hits are thin (same as CSR ladder behavior).
+        expand = bool(query.get("title_expand", True))
+        return explicit, expand
+    if _is_nonprofit_query(query):
+        return list(NGO_TITLE_PRIORITY), True
+    # Named company contact search (Sterlite Tech, etc.)
+    has_company = bool(
+        query.get("company_names")
+        or query.get("companies")
+        or query.get("company")
+        or query.get("company_domains")
+        or query.get("company_id")
+        or query.get("companyId")
+    )
+    if has_company:
+        return _default_csr_titles(), True
+    return [], True
 
 
 # Short user phrases → ZoomInfo-friendly legal / brand names
