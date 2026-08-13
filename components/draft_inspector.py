@@ -34,7 +34,33 @@ def render_draft_inspector(
     cols = st.columns([3, 1])
     with cols[0]:
         st.subheader(draft.get("subject") or "(no subject)")
-        st.caption(f"To: {draft.get('recipient') or draft.get('to') or '—'}")
+        to_line = draft.get("recipient") or draft.get("to") or "—"
+        name = (draft.get("recipient_name") or "").strip()
+        title = (
+            str(draft.get("title") or "").strip()
+            or str(draft.get("designation") or "").strip()
+            or str(draft.get("recipient_title") or "").strip()
+        )
+        company = str(draft.get("company") or "").strip()
+        if not title or not company:
+            try:
+                from core.prospect_list import all_prospects
+
+                email = str(to_line).strip().lower()
+                for p in all_prospects():
+                    if str(p.get("email") or "").strip().lower() == email:
+                        title = title or str(p.get("title") or "").strip()
+                        company = company or str(p.get("company") or "").strip()
+                        name = name or str(p.get("name") or "").strip()
+                        break
+            except Exception:
+                pass
+        st.caption(f"To: {to_line}")
+        if name:
+            st.caption(f"Name: {name}")
+        if title or company:
+            bits = [b for b in (title, company) if b]
+            st.caption(" · ".join(bits))
         if draft.get("gmail_draft_id") or str(draft.get("draft_id") or "").startswith("gmail:"):
             st.caption(f"Gmail draft · `{draft.get('gmail_draft_id') or draft.get('draft_id')}`")
     with cols[1]:

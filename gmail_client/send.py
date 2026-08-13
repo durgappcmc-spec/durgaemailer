@@ -190,6 +190,8 @@ def create_draft(
     from_email: Optional[str] = None,
     cc: Optional[str | list[str]] = None,
     include_signature: bool = True,
+    recipient_title: Optional[str] = None,
+    company: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new Gmail draft for review.
 
@@ -250,8 +252,16 @@ def create_draft(
             "cc": _normalize_cc(cc),
             "subject": subject,
             "body_html": instrumented_html,
+            "title": (recipient_title or "").strip(),
+            "company": (company or "").strip(),
         }
-        _mirror_draft_to_drive(result, recipient_name=recipient_name, source=src)
+        _mirror_draft_to_drive(
+            result,
+            recipient_name=recipient_name,
+            recipient_title=recipient_title,
+            company=company,
+            source=src,
+        )
         return result
     except Exception as e:
         print(f"[gmail] create_draft error: {e}", file=sys.stderr)
@@ -270,6 +280,8 @@ def _mirror_draft_to_drive(
     result: dict[str, Any],
     *,
     recipient_name: Optional[str] = None,
+    recipient_title: Optional[str] = None,
+    company: Optional[str] = None,
     source: str = "",
 ) -> None:
     """Persist Chat/Schedule drafts so the Drafts page can list/send them."""
@@ -280,6 +292,11 @@ def _mirror_draft_to_drive(
         from core import drive_db
 
         drive_id = f"gmail:{gmail_id}"
+        title = (
+            (recipient_title or "").strip()
+            or str(result.get("title") or result.get("designation") or "").strip()
+        )
+        co = (company or "").strip() or str(result.get("company") or "").strip()
         drive_db.save_draft(
             drive_id,
             {
@@ -289,6 +306,9 @@ def _mirror_draft_to_drive(
                 "to": result.get("to") or "",
                 "recipient": result.get("to") or "",
                 "recipient_name": recipient_name or "",
+                "title": title,
+                "designation": title,
+                "company": co,
                 "cc": result.get("cc") or "",
                 "subject": result.get("subject") or "",
                 "body_html": result.get("body_html") or "",
@@ -404,6 +424,11 @@ def create_drafts(
                 subject=job.get("subject") or "(no subject)",
                 html_body=job.get("html_body") or job.get("body") or "<p></p>",
                 recipient_name=job.get("recipient_name") or job.get("name"),
+                recipient_title=job.get("title")
+                or job.get("designation")
+                or job.get("recipient_title")
+                or "",
+                company=job.get("company") or "",
                 attachments=job.get("attachments"),
                 track=job.get("track", track),
                 campaign=job.get("campaign"),

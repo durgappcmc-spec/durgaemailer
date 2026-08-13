@@ -535,6 +535,8 @@ def _build_draft_jobs(
             job = {
                 "recipient_email": email,
                 "recipient_name": p.get("name") or "",
+                "title": p.get("title") or p.get("designation") or "",
+                "company": p.get("company") or "",
                 "subject": _apply_template(subject_tmpl, p),
                 "html_body": _apply_template(body_tmpl, p),
                 "campaign": campaign,
@@ -559,6 +561,8 @@ def _build_draft_jobs(
             job = {
                 "recipient_email": email,
                 "recipient_name": p.get("name") or "",
+                "title": p.get("title") or p.get("designation") or "",
+                "company": p.get("company") or "",
                 "subject": _apply_template(subject_tmpl, p),
                 "html_body": _apply_template(body_tmpl, p),
                 "campaign": campaign,
@@ -618,6 +622,11 @@ def _build_draft_jobs(
         job = {
             "recipient_email": email,
             "recipient_name": p.get("name") or payload.get("recipient_name") or "",
+            "title": p.get("title")
+            or p.get("designation")
+            or payload.get("title")
+            or "",
+            "company": p.get("company") or payload.get("company") or "",
             "subject": _apply_template(subject_tmpl, p),
             "html_body": _apply_template(body_tmpl, p),
             "campaign": campaign,
@@ -863,6 +872,11 @@ def _deliver_job(
         "subject": job.get("subject") or "(no subject)",
         "html_body": job.get("html_body") or "",
         "recipient_name": job.get("recipient_name") or "",
+        "recipient_title": job.get("title")
+        or job.get("designation")
+        or job.get("recipient_title")
+        or "",
+        "company": job.get("company") or "",
         "attachments": job.get("attachments"),
         "campaign": job.get("campaign"),
         "source": job.get("source"),

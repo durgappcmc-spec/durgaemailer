@@ -319,6 +319,16 @@ def save_draft(draft_id: str, draft: dict) -> None:
     entry = {
         "draft_id": draft_id,
         "recipient": draft.get("recipient") or draft.get("to"),
+        "recipient_name": draft.get("recipient_name") or "",
+        "title": draft.get("title")
+        or draft.get("designation")
+        or draft.get("recipient_title")
+        or "",
+        "designation": draft.get("designation")
+        or draft.get("title")
+        or draft.get("recipient_title")
+        or "",
+        "company": draft.get("company") or "",
         "subject": draft.get("subject"),
         "status": draft.get("status", "draft"),
         "updated_at": draft["updated_at"],

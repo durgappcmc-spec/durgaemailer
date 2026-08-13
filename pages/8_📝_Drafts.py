@@ -85,6 +85,47 @@ def _send_one(draft: dict) -> dict:
     return result
 
 
+def _recipient_designation(row: dict) -> str:
+    """Job title / designation for the draft list (draft fields or prospect lookup)."""
+    title = (
+        str(row.get("title") or "").strip()
+        or str(row.get("designation") or "").strip()
+        or str(row.get("recipient_title") or "").strip()
+    )
+    if title:
+        return title
+    email = str(row.get("recipient") or row.get("to") or "").strip().lower()
+    if not email or "@" not in email:
+        return ""
+    try:
+        from core.prospect_list import all_prospects
+
+        for p in all_prospects():
+            if str(p.get("email") or "").strip().lower() == email:
+                return str(p.get("title") or p.get("designation") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _recipient_company(row: dict) -> str:
+    company = str(row.get("company") or "").strip()
+    if company:
+        return company
+    email = str(row.get("recipient") or row.get("to") or "").strip().lower()
+    if not email or "@" not in email:
+        return ""
+    try:
+        from core.prospect_list import all_prospects
+
+        for p in all_prospects():
+            if str(p.get("email") or "").strip().lower() == email:
+                return str(p.get("company") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 st.title("📝 Drafts")
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
@@ -160,6 +201,11 @@ if q:
         for r in rows
         if ql in str(r.get("subject") or "").lower()
         or ql in str(r.get("recipient") or r.get("to") or "").lower()
+        or ql in str(r.get("recipient_name") or "").lower()
+        or ql in str(r.get("title") or r.get("designation") or "").lower()
+        or ql in str(r.get("company") or "").lower()
+        or ql in _recipient_designation(r).lower()
+        or ql in _recipient_company(r).lower()
     ]
 if status_f != "all":
     rows = [r for r in rows if (r.get("status") or "draft") == status_f]
@@ -177,7 +223,7 @@ st.caption(
     f"{total} drafts · showing {start + 1}–{min(start + page_size, total) if total else 0}"
 )
 
-h = st.columns([0.4, 2.2, 3.2, 1.3, 1, 1.2, 1.2])
+h = st.columns([0.4, 2.6, 3.0, 1.3, 1, 1.2, 1.2])
 h[0].markdown("**☐**")
 h[1].markdown("**Recipient**")
 h[2].markdown("**Subject**")
@@ -192,11 +238,25 @@ if "opened_draft_id" not in st.session_state:
 
 for r in page_rows:
     did = r.get("draft_id") or ""
-    cols = st.columns([0.4, 2.2, 3.2, 1.3, 1, 1.2, 1.2])
+    cols = st.columns([0.4, 2.6, 3.0, 1.3, 1, 1.2, 1.2])
     with cols[0]:
         if st.checkbox("", key=f"dsel_{did}", label_visibility="collapsed"):
             selected.append(did)
-    cols[1].write(r.get("recipient") or r.get("to") or "—")
+    with cols[1]:
+        email = r.get("recipient") or r.get("to") or "—"
+        name = (r.get("recipient_name") or "").strip()
+        designation = _recipient_designation(r)
+        company = _recipient_company(r)
+        st.write(email)
+        if name and name.lower() not in str(email).lower():
+            st.caption(name)
+        if designation:
+            line = designation
+            if company:
+                line = f"{designation} · {company}"
+            st.caption(line)
+        elif company:
+            st.caption(company)
     with cols[2]:
         subject_label = (r.get("subject") or "(no subject)").strip() or "(no subject)"
         # Truncate long subjects for the button label
@@ -255,6 +315,10 @@ if c4.button("Export CSV"):
         fieldnames=[
             "draft_id",
             "recipient",
+            "recipient_name",
+            "title",
+            "designation",
+            "company",
             "subject",
             "status",
             "updated_at",
@@ -264,7 +328,13 @@ if c4.button("Export CSV"):
     )
     w.writeheader()
     for r in rows:
-        w.writerow({k: r.get(k) for k in w.fieldnames})
+        row = {k: r.get(k) for k in w.fieldnames}
+        if not row.get("title") and not row.get("designation"):
+            row["title"] = _recipient_designation(r)
+            row["designation"] = row["title"]
+        if not row.get("company"):
+            row["company"] = _recipient_company(r)
+        w.writerow(row)
     st.download_button("Download", buf.getvalue(), file_name="drafts.csv")
 
 st.divider()
