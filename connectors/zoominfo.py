@@ -177,10 +177,6 @@ class ZoomInfoConnector(ProspectConnector):
         # company + contact search hit the right firm.
         query = _with_company_name_aliases(query)
 
-        # Company-first: resolve firm via /search/company, then contacts by
-        # companyId. Free-text companyName on /search/contact is unreliable for
-        # short names like "sterlite tech" (often 0 hits after we stopped
-        # merging polluted Saved-list rows).
         cn_list = query.get("company_names") or []
         if isinstance(cn_list, list) and cn_list:
             rank_needle = str(cn_list[0])
@@ -188,6 +184,42 @@ class ZoomInfoConnector(ProspectConnector):
         else:
             names = _join(cn_list)
             rank_needle = names
+
+        # Google → LinkedIn → ZoomInfo enrich FIRST for corporate CSR searches.
+        # Public titles are often more accurate than ZoomInfo's jobTitle field.
+        if (
+            names
+            and not _is_nonprofit_query(query)
+            and not query.get("skip_web_csr")
+            and not (query.get("linkedin_url") or query.get("linkedin"))
+        ):
+            try:
+                from agent.csr_web_discovery import discover_csr_via_web_then_zoominfo
+
+                domains = query.get("company_domains") or query.get("domains") or []
+                if isinstance(domains, str):
+                    domains = [domains] if domains.strip() else []
+                web_n = min(max(limit // 2, 3), limit)
+                web_hits = discover_csr_via_web_then_zoominfo(
+                    company=rank_needle or names.split(",")[0],
+                    domains=[str(d) for d in domains if d],
+                    limit=web_n,
+                    zi=self,
+                )
+                if web_hits:
+                    results.extend(web_hits)
+                    print(
+                        f"[zoominfo] web→LI→ZI CSR: {len(web_hits)} contacts "
+                        f"for {rank_needle!r}",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                print(f"[zoominfo] web CSR discovery skipped: {e}", file=sys.stderr)
+
+        # Company-first: resolve firm via /search/company, then contacts by
+        # companyId. Free-text companyName on /search/contact is unreliable for
+        # short names like "sterlite tech" (often 0 hits after we stopped
+        # merging polluted Saved-list rows).
         if names or _is_nonprofit_query(query):
             company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
             company_hits = _rank_companies_for_query(company_hits, rank_needle)
@@ -196,11 +228,12 @@ class ZoomInfoConnector(ProspectConnector):
             if isinstance(domains, str):
                 domains = [domains] if domains.strip() else []
             domain_list = [str(d) for d in domains if d]
-            if company_hits or domain_list:
+            remaining = max(limit - len(results), 0)
+            if remaining and (company_hits or domain_list):
                 results.extend(
                     self._contacts_for_companies(
                         company_hits[:5] if company_hits else [],
-                        limit=limit,
+                        limit=remaining,
                         titles=cascade_titles,
                         expand=expand,
                         domains=domain_list,
@@ -208,7 +241,7 @@ class ZoomInfoConnector(ProspectConnector):
                 )
                 print(
                     f"[zoominfo] company-first: {len(company_hits)} firms → "
-                    f"{len(results)} contacts (q={rank_needle!r}, "
+                    f"{len(results)} contacts total (q={rank_needle!r}, "
                     f"titles={cascade_titles[:3]!r}{'…' if len(cascade_titles) > 3 else ''}, "
                     f"domains={domain_list!r}, expand={expand})",
                     file=sys.stderr,
