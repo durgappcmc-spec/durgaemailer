@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import time
 from typing import Any, Optional
 
 from core.google_sheets import sheets_credentials
@@ -13,8 +14,15 @@ from core.google_sheets import sheets_credentials
 FOLDER_NAME = "Relay Memory"
 _FILE_IDS: dict[str, str] = {}
 _FOLDER_ID: Optional[str] = None
-_LOCK = threading.Lock()
+# RLock: upload/download hold the lock across execute(); nested clear/reset is safe.
+_LOCK = threading.RLock()
 _DRIVE = None
+# OpenSSL on Render segfaults when Drive SSL is hammered after record-layer failures.
+# Trip a breaker and use Sheets AppState until it cools down.
+_SSL_FAILS = 0
+_SSL_BREAKER_UNTIL = 0.0
+_SSL_BREAKER_SEC = float(os.getenv("RELAY_DRIVE_SSL_COOLDOWN_SEC", "600") or 600)
+_SSL_FAIL_TRIP = int(os.getenv("RELAY_DRIVE_SSL_FAIL_TRIP", "2") or 2)
 
 
 def clear_file_cache() -> None:
@@ -24,8 +32,35 @@ def clear_file_cache() -> None:
         _FILE_IDS = {}
 
 
+def is_drive_degraded() -> bool:
+    """True while Drive HTTPS is circuit-broken (use Sheets only)."""
+    return time.time() < _SSL_BREAKER_UNTIL
+
+
+def _trip_ssl_breaker(exc: BaseException) -> None:
+    global _SSL_FAILS, _SSL_BREAKER_UNTIL
+    if not _is_ssl_error(exc):
+        return
+    _SSL_FAILS += 1
+    if _SSL_FAILS < max(1, _SSL_FAIL_TRIP):
+        return
+    _SSL_BREAKER_UNTIL = time.time() + max(60.0, _SSL_BREAKER_SEC)
+    print(
+        f"[drive] SSL circuit open for {int(_SSL_BREAKER_SEC)}s after "
+        f"{_SSL_FAILS} failures — using Sheets AppState only ({exc})",
+        file=sys.stderr,
+    )
+
+
+def _note_drive_success() -> None:
+    global _SSL_FAILS
+    _SSL_FAILS = 0
+
+
 def _drive(*, force_new: bool = False):
     global _DRIVE
+    if is_drive_degraded():
+        return None
     if _DRIVE is not None and not force_new:
         return _DRIVE
     creds = sheets_credentials()
@@ -39,10 +74,30 @@ def _drive(*, force_new: bool = False):
     try:
         from googleapiclient.discovery import build
 
-        _DRIVE = build("drive", "v3", credentials=creds, cache_discovery=False)
+        # Fresh HTTP stack each rebuild — reused httplib2 connections corrupt
+        # after SSL record-layer failures and can native-crash on Render.
+        http = None
+        try:
+            import google_auth_httplib2
+            import httplib2
+
+            http = google_auth_httplib2.AuthorizedHttp(
+                creds, http=httplib2.Http(timeout=45)
+            )
+        except Exception:
+            http = None
+        if http is not None:
+            _DRIVE = build(
+                "drive", "v3", http=http, cache_discovery=False
+            )
+        else:
+            _DRIVE = build(
+                "drive", "v3", credentials=creds, cache_discovery=False
+            )
         return _DRIVE
     except Exception as e:
         print(f"[drive] build failed: {e}", file=sys.stderr)
+        _trip_ssl_breaker(e)
         return None
 
 
@@ -51,6 +106,14 @@ def _reset_drive() -> None:
     global _DRIVE
     with _LOCK:
         _DRIVE = None
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        n in msg
+        for n in ("ssl", "record layer", "wrong version number", "bad record mac")
+    )
 
 
 def _is_transient_drive_error(exc: BaseException) -> bool:
@@ -71,14 +134,19 @@ def _is_transient_drive_error(exc: BaseException) -> bool:
     return any(n in msg for n in needles)
 
 
-def _with_drive_retry(op_name: str, fn, *, attempts: int = 3):
-    """Retry Drive calls; rebuild the client after SSL/transport failures."""
-    import time
+def _with_drive_retry(op_name: str, fn, *, attempts: int = 2):
+    """Retry Drive calls once; trip SSL breaker instead of thrashing OpenSSL."""
+    if is_drive_degraded():
+        raise RuntimeError("drive ssl circuit open")
 
     last: Optional[BaseException] = None
     for i in range(max(1, attempts)):
+        if is_drive_degraded():
+            break
         try:
-            return fn()
+            result = fn()
+            _note_drive_success()
+            return result
         except Exception as e:
             last = e
             transient = _is_transient_drive_error(e)
@@ -87,10 +155,11 @@ def _with_drive_retry(op_name: str, fn, *, attempts: int = 3):
                 f"{' (retry)' if transient and i + 1 < attempts else ''}: {e}",
                 file=sys.stderr,
             )
-            if not transient or i + 1 >= attempts:
+            _trip_ssl_breaker(e)
+            if not transient or i + 1 >= attempts or is_drive_degraded():
                 break
             _reset_drive()
-            time.sleep(0.4 * (i + 1))
+            time.sleep(0.35 * (i + 1))
     if last is not None:
         raise last
     return None
@@ -107,13 +176,13 @@ def _pinned_folder_id() -> str:
 
 def _probe_file_id(name: str, folder_id: str) -> Optional[str]:
     """Look up a file id in a folder without touching the process cache."""
-    if not folder_id:
+    if not folder_id or is_drive_degraded():
         return None
 
     def _op():
         svc = _drive()
         if not svc:
-            return None
+            raise RuntimeError("drive client unavailable")
         q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
         res = (
             svc.files()
@@ -126,20 +195,21 @@ def _probe_file_id(name: str, folder_id: str) -> Optional[str]:
         return None
 
     try:
-        return _with_drive_retry(f"probe {name}", _op)
+        with _LOCK:
+            return _with_drive_retry(f"probe {name}", _op)
     except Exception as e:
         print(f"[drive] probe {name} failed: {e}", file=sys.stderr)
         return None
 
 
 def _probe_file_size(name: str, folder_id: str) -> int:
-    if not folder_id:
+    if not folder_id or is_drive_degraded():
         return 0
 
     def _op():
         svc = _drive()
         if not svc:
-            return 0
+            raise RuntimeError("drive client unavailable")
         q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
         res = (
             svc.files()
@@ -152,7 +222,8 @@ def _probe_file_size(name: str, folder_id: str) -> int:
         return int(files[0].get("size") or 0)
 
     try:
-        return int(_with_drive_retry(f"size {name}", _op) or 0)
+        with _LOCK:
+            return int(_with_drive_retry(f"size {name}", _op) or 0)
     except Exception:
         return 0
 
@@ -302,6 +373,9 @@ def upload_json(name: str, payload: Any) -> bool:
     """Create or update a JSON file in the Relay Memory Drive folder."""
     from googleapiclient.http import MediaIoBaseUpload
 
+    if is_drive_degraded():
+        print(f"[drive] skip upload {name} (ssl circuit open)", file=sys.stderr)
+        return False
     folder = _ensure_folder()
     if not folder:
         return False
@@ -323,31 +397,34 @@ def upload_json(name: str, payload: Any) -> bool:
             media = MediaIoBaseUpload(
                 io.BytesIO(raw), mimetype="application/json", resumable=False
             )
-            with _LOCK:
-                file_id = _find_file(name, folder)
-                if file_id:
-                    svc.files().update(fileId=file_id, media_body=media).execute()
-                else:
-                    meta = (
-                        svc.files()
-                        .create(
-                            body={"name": name, "parents": [folder]},
-                            media_body=media,
-                            fields="id",
-                        )
-                        .execute()
+            file_id = _find_file(name, folder)
+            if file_id:
+                svc.files().update(fileId=file_id, media_body=media).execute()
+            else:
+                meta = (
+                    svc.files()
+                    .create(
+                        body={"name": name, "parents": [folder]},
+                        media_body=media,
+                        fields="id",
                     )
-                    _FILE_IDS[name] = meta["id"]
+                    .execute()
+                )
+                _FILE_IDS[name] = meta["id"]
             return True
 
-        return bool(_with_drive_retry(f"upload {name}", _op))
+        with _LOCK:
+            return bool(_with_drive_retry(f"upload {name}", _op))
     except Exception as e:
         print(f"[drive] upload {name} failed: {e}", file=sys.stderr)
+        _trip_ssl_breaker(e)
         _reset_drive()
         return False
 
 
 def download_json(name: str) -> Optional[Any]:
+    if is_drive_degraded():
+        return None
     folder = _ensure_folder()
     if not folder:
         return None
@@ -367,9 +444,11 @@ def download_json(name: str) -> Optional[Any]:
         return json.loads(text)
 
     try:
-        return _with_drive_retry(f"download {name}", _op)
+        with _LOCK:
+            return _with_drive_retry(f"download {name}", _op)
     except Exception as e:
         print(f"[drive] download {name} failed: {e}", file=sys.stderr)
+        _trip_ssl_breaker(e)
         _reset_drive()
         return None
 

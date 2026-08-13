@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from typing import Any, Optional
@@ -217,9 +218,26 @@ def ensure_session_sync(session_state: Any, *, light: bool = False) -> dict[str,
         except Exception as e:
             print(f"[auto_sync] prospect hydrate: {e}", file=sys.stderr)
 
-    if light:
+    # Free Render: skip boot Gmail sync — it piles SSL/API work on top of Drive
+    # restore and has been correlated with native segfaults after SSL failures.
+    on_render = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+    skip_boot_gmail = _env_bool("RELAY_SKIP_BOOT_GMAIL", on_render)
+    try:
+        from core.drive_store import is_drive_degraded
+
+        if is_drive_degraded():
+            skip_boot_gmail = True
+    except Exception:
+        pass
+
+    if light or skip_boot_gmail:
+        if skip_boot_gmail and not light:
+            print("[auto_sync] skip boot Gmail sync (Render/SSL-safe)", file=sys.stderr)
         # Chat page: never block on Gmail
-        return session_state.get("_auto_sync_result") or {"skipped": True, "reason": "light"}
+        return session_state.get("_auto_sync_result") or {
+            "skipped": True,
+            "reason": "light" if light else "boot_gmail_skipped",
+        }
 
     if session_state.get("_auto_sync_done"):
         return session_state.get("_auto_sync_result") or {"skipped": True}

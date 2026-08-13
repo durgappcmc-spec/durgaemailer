@@ -101,7 +101,7 @@ def _restore_memory_from_cloud() -> None:
         existing = {str(r.get("id")): r for r in rows if isinstance(r, dict) and r.get("id")}
         _write_fallback_map(existing)
         print(
-            f"[memory] restored {len(existing)} rows from Google Drive",
+            f"[memory] restored {len(existing)} rows from cloud",
             file=sys.stderr,
         )
     except Exception as e:

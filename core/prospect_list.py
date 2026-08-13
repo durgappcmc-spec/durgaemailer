@@ -104,12 +104,30 @@ def reload_from_drive() -> int:
         rows = _load()
         cleaned = _scrub_mailbox_noise(rows)
         if len(cleaned) != len(rows):
+            removed = len(rows) - len(cleaned)
             print(
-                f"[prospect_list] scrubbed {len(rows) - len(cleaned)} "
+                f"[prospect_list] scrubbed {removed} "
                 f"gmail mailbox rows from Saved list",
                 file=sys.stderr,
             )
-            _persist(cleaned)
+            _CACHE = cleaned
+            _LOADED = True
+            # Avoid Drive HTTPS during OpenSSL storms — Sheets mirror is enough.
+            try:
+                from core.drive_store import is_drive_degraded
+
+                degraded = is_drive_degraded()
+            except Exception:
+                degraded = False
+            if degraded:
+                try:
+                    from core.durable_store import save_json_blob
+
+                    save_json_blob("prospect_list", cleaned[-1000:], sync_sheets=True)
+                except Exception as e:
+                    print(f"[prospect_list] sheets-only scrub save failed: {e}", file=sys.stderr)
+            else:
+                _persist(cleaned)
             rows = cleaned
         return len(rows)
 

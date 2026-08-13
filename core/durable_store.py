@@ -222,8 +222,10 @@ def _protect_drive_upload(key: str, payload: Any, *, allow_empty: bool) -> Any:
     if not isinstance(payload, (list, dict)):
         return payload
     try:
-        from core.drive_store import download_json
+        from core.drive_store import download_json, is_drive_degraded
 
+        if is_drive_degraded():
+            return payload
         existing = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
     except Exception as e:
         print(f"[durable] drive pre-check {key} failed: {e}", file=sys.stderr)
@@ -323,15 +325,22 @@ def save_json_blob(
         drive_ok = False
         to_upload: Any = payload
         try:
-            from core.drive_store import upload_json
+            from core.drive_store import is_drive_degraded, upload_json
 
-            to_upload = _protect_drive_upload(key, payload, allow_empty=allow_empty)
-            if to_upload is None:
-                drive_ok = True  # intentionally skipped (protect cloud)
-            else:
-                drive_ok = bool(
-                    upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
+            if is_drive_degraded():
+                print(
+                    f"[durable] skip Drive save {key} (ssl circuit open)",
+                    file=sys.stderr,
                 )
+                to_upload = payload
+            else:
+                to_upload = _protect_drive_upload(key, payload, allow_empty=allow_empty)
+                if to_upload is None:
+                    drive_ok = True  # intentionally skipped (protect cloud)
+                else:
+                    drive_ok = bool(
+                        upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
+                    )
         except Exception as e:
             print(f"[durable] drive save {key} failed: {e}", file=sys.stderr)
             drive_ok = False
@@ -350,6 +359,15 @@ def save_json_blob(
                         )
             except Exception as e:
                 print(f"[durable] sheets mirror {key} failed: {e}", file=sys.stderr)
+        # Sheets mirror counts as durable when Drive SSL is circuit-broken
+        if not drive_ok:
+            try:
+                from core.drive_store import is_drive_degraded
+
+                if is_drive_degraded():
+                    return True
+            except Exception:
+                pass
         return drive_ok
     try:
         text = json.dumps(payload, ensure_ascii=False, default=str)
@@ -380,13 +398,22 @@ def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
     if not allow_sheets:
         return local
     cloud: Any = None
+    drive_ok = True
     if key in _DRIVE_KEYS:
         try:
-            from core.drive_store import download_json
+            from core.drive_store import download_json, is_drive_degraded
 
-            cloud = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
+            if is_drive_degraded():
+                drive_ok = False
+                print(
+                    f"[durable] skip Drive load {key} (ssl circuit open)",
+                    file=sys.stderr,
+                )
+            else:
+                cloud = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
         except Exception as e:
             print(f"[durable] drive load {key} failed: {e}", file=sys.stderr)
+            drive_ok = False
     if cloud is not None and not _is_empty_payload(cloud):
         # Prefer Drive when local is missing, empty, or much smaller (post-deploy wipe)
         if _local_is_miss(local):
