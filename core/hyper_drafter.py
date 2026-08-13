@@ -16,7 +16,7 @@ Follow this grounding contract:
 8. Include a single clear CTA.
 9. Output strict JSON: {subject, body_html, personalization_ledger, confidence}.
 10. personalization_ledger is a list of {claim, evidence_ref, source_tool} — evidence_ref must point into org_brief or source_email.
-11. Greet the approved contact by their first name (and title if present). Never greet a name from source_email.
+11. Greet the approved contact by first name only (e.g. Hi Sushmita,). Never put job title in parentheses. Never greet a name from source_email.
 12. Never include tracking, Netlify, or click-redirect URLs in the body text or link labels.
 """
 

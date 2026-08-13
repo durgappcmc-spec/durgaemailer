@@ -27,31 +27,34 @@ def _is_tracking_url(url: str) -> bool:
     return bool(url) and bool(_TRACKING_URL_RE.search(url))
 
 
+_GREETING_TITLE_PAREN_RE = re.compile(
+    r"((?:<(?:p|div)[^>]*>\s*)?(?:Dear|Hi|Hello)\s+[^,<\n(]{1,60}?)\s*\([^)]+\)",
+    re.I,
+)
+
+
 def rewrite_opening_greeting(html: str, *, first_name: str = "") -> str:
-    """Point the first Dear/Hi/Hello line at this recipient, not a cloned name."""
+    """Point the first Dear/Hi/Hello line at this recipient's first name only.
+
+    Never keep a job title in parentheses (e.g. not 'Hi Sushmita (ESG Associate)').
+    """
     body = html or ""
     first = (first_name or "").strip()
-    if not body or not first:
+    if not body:
         return body
 
-    def _already_this_person(old: str) -> bool:
-        core = re.sub(r"\s*\([^)]*\)\s*", " ", old or "").strip()
-        if not core:
-            return False
-        token = core.split()[0].strip(".,;:")
-        return token.lower() == first.lower() or core.lower().startswith(first.lower())
+    if first:
+        def _repl(_m: re.Match) -> str:
+            return f"{_m.group(1)}{_m.group(2)}{_m.group(3)}{first}"
 
-    def _repl(m: re.Match) -> str:
-        old = m.group(4)
-        if _already_this_person(old):
-            return m.group(0)
-        return f"{m.group(1)}{m.group(2)}{m.group(3)}{first}"
+        updated, n = _HTML_GREETING_RE.subn(_repl, body, count=1)
+        if not n:
+            updated, n = _PLAIN_GREETING_RE.subn(_repl, body, count=1)
+        if n:
+            body = updated
 
-    updated, n = _HTML_GREETING_RE.subn(_repl, body, count=1)
-    if n:
-        return updated
-    updated, n = _PLAIN_GREETING_RE.subn(_repl, body, count=1)
-    return updated if n else body
+    stripped, n = _GREETING_TITLE_PAREN_RE.subn(r"\1", body, count=1)
+    return stripped if n else body
 
 
 def ensure_designation_in_greeting(
@@ -60,28 +63,8 @@ def ensure_designation_in_greeting(
     first_name: str = "",
     title: str = "",
 ) -> str:
-    """Rewrite the opening greeting to this recipient, then add (designation)."""
-    body = rewrite_opening_greeting(html or "", first_name=first_name)
-    title = (title or "").strip()
-    first = (first_name or "").strip()
-    if not body or not title:
-        return body
-    greet = body[:800]
-    if first and f"{first} ({title})" in greet:
-        return body
-    if first:
-        pat = (
-            rf"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)"
-            rf"({re.escape(first)})(\b)"
-        )
-        updated, n = re.subn(pat, rf"\1\2 ({title})\3", body, count=1, flags=re.I)
-        if n:
-            return updated
-    pat2 = r"(<(?:p|div)[^>]*>\s*(?:Dear|Hi|Hello)\s+)([^,<]{1,60}?)(\s*,)"
-    updated, n = re.subn(
-        pat2, rf"\1\2 ({title})\3", body, count=1, flags=re.I
-    )
-    return updated if n else body
+    """Rewrite the opening greeting to first name only (no title in brackets)."""
+    return rewrite_opening_greeting(html or "", first_name=first_name)
 
 
 def apply_inline_markdown(text: str, *, escape_html: bool = True) -> str:

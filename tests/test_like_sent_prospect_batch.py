@@ -115,8 +115,9 @@ def test_personalize_rewrites_khushid_greeting():
         },
         scrub_names=["IndiaMART", "indiamart"],
     )
-    assert "Hi Priya (CSR Head)" in out["html_body"]
+    assert "Hi Priya," in out["html_body"]
     assert "Khushid" not in out["html_body"]
+    assert "CSR Head" not in out["html_body"].split(",")[0]
 
 
 def test_like_sent_clone_drops_click_tracking_autolink():

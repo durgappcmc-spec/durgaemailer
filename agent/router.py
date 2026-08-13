@@ -262,12 +262,8 @@ def _apply_template(text: str, prospect: dict[str, Any]) -> str:
         or str(prospect.get("designation") or "").strip()
         or str(prospect.get("recipient_title") or "").strip()
     )
-    if first and title:
-        name_with_title = f"{first} ({title})"
-    elif first:
-        name_with_title = first
-    else:
-        name_with_title = title or name
+    # Greet by first name only — never "Sushmita (ESG Associate)"
+    name_with_title = first or name or title
     mapping = {
         "first_name": first,
         "name": name,
@@ -303,7 +299,7 @@ def _ensure_designation_in_greeting(
     first_name: str = "",
     title: str = "",
 ) -> str:
-    """Rewrite the opening greeting to this recipient, then add (designation)."""
+    """Rewrite the opening greeting to this recipient's first name only."""
     from gmail_client.html_format import ensure_designation_in_greeting
 
     return ensure_designation_in_greeting(
@@ -2351,8 +2347,9 @@ User request:
 {user_msg}
 
 Use placeholders exactly: {{first_name}}, {{name_with_title}}, {{company}}, {{title}}, {{org_focus}}
+Greet with first name only — never put title in parentheses (not "Hi {{first_name}} ({{title}})").
 Return JSON:
-{{"subject":"...","html_body":"<p>Hi {{name_with_title}},</p>..."}}
+{{"subject":"...","html_body":"<p>Hi {{first_name}},</p>..."}}
 
 Keep it warm, specific to girls/skilling NGO partnership if relevant.
 If user mentions karunamedia.org or a brand, reference collaboration politely.
@@ -2370,7 +2367,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     or "Partnership idea for {company}'s girls skilling work"
                 )
                 html_body = tmpl.get("html_body") or (
-                    "<p>Hi {name_with_title},</p>"
+                    "<p>Hi {first_name},</p>"
                     "<p>I came across <strong>{company}</strong> and your work "
                     "on {org_focus}.</p>"
                     "<p>I'd love to explore a collaboration that supports "
@@ -3931,7 +3928,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         or "{first_name}" not in body
                     ):
                         payload["html_body"] = (
-                            "<p>Hi {name_with_title},</p>"
+                            "<p>Hi {first_name},</p>"
                             "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
                             "<p>{prior_summary}</p>"
                             "<p>Would you have time this week for a quick chat?</p>"
