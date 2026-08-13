@@ -234,16 +234,19 @@ def _protect_drive_upload(key: str, payload: Any, *, allow_empty: bool) -> Any:
         return payload
     old_n = _payload_len(existing)
     new_n = _payload_len(payload)
-    # Accidental wipe: sparse local after rebuild uploading over a full Drive blob
-    if old_n > 0 and new_n < max(3, int(old_n * 0.5)):
-        if key == "prospect_list" and isinstance(existing, list) and isinstance(payload, list):
-            merged = _merge_prospect_lists(existing, payload)
+    # Always union prospect lists so ZoomInfo hits never get wiped by a
+    # concurrent Gmail-only save or a stale in-memory cache.
+    if key == "prospect_list" and isinstance(existing, list) and isinstance(payload, list):
+        merged = _merge_prospect_lists(existing, payload)
+        if len(merged) != new_n or len(merged) != old_n:
             print(
                 f"[durable] merge Drive {key}: cloud={old_n} local={new_n} → {len(merged)}",
                 file=sys.stderr,
             )
             _save_local(key, merged)
-            return merged
+        return merged
+    # Accidental wipe: sparse local after rebuild uploading over a full Drive blob
+    if old_n > 0 and new_n < max(3, int(old_n * 0.5)):
         if key == "memory_rows" and isinstance(existing, list) and isinstance(payload, list):
             merged = _merge_memory_rows(existing, payload)
             print(
@@ -268,7 +271,6 @@ def _protect_drive_upload(key: str, payload: Any, *, allow_empty: bool) -> Any:
         )
         return None
     return payload
-
 
 def _merge_prospect_lists(
     existing: list[Any], incoming: list[Any]
