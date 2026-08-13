@@ -17,6 +17,75 @@ _ORG_NOISE = re.compile(
     re.I,
 )
 
+# Like-sent templates / directories that must never be treated as employees of
+# a searched company (e.g. IndiaMART address tagged onto "Sterlite Tech").
+_REJECT_EMAIL_DOMAINS = frozenset(
+    {
+        "indiamart.com",
+        "justdial.com",
+        "tradeindia.com",
+        "linkedin.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "karunamedia.org",
+    }
+)
+
+
+def _email_domain(email: str) -> str:
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return ""
+    return e.rsplit("@", 1)[-1].strip()
+
+
+def email_blocked_for_company_search(email: str) -> bool:
+    """True for marketplace / template domains that are never company employees."""
+    return _email_domain(email) in _REJECT_EMAIL_DOMAINS
+
+
+def prospect_fits_company_query(
+    p: dict[str, Any],
+    companies: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """Drop polluted rows (e.g. @indiamart.com saved as company=Sterlite)."""
+    if not p or p.get("error"):
+        return False
+    email = str(p.get("email") or "").strip()
+    if email and email_blocked_for_company_search(email):
+        return False
+    companies = [str(c).strip() for c in (companies or []) if str(c).strip()]
+    if not companies:
+        return True
+    # Prefer ZoomInfo company field match; still allow if domain shares a token
+    company_blob = _norm(
+        " ".join(
+            str(p.get(k) or "")
+            for k in ("company", "organization", "org", "org_website", "website")
+        )
+    )
+    domain = _email_domain(email)
+    domain_compact = re.sub(r"[^a-z0-9]", "", domain)
+    for company in companies:
+        if _companies_match(company, company_blob, domain):
+            return True
+        for tok in _company_tokens(company):
+            if len(tok) >= 4 and tok in domain_compact:
+                return True
+    # No company/domain signal — keep only if ZoomInfo left a real company name
+    # that somehow failed token match (rare); otherwise drop polluted stubs.
+    if company_blob and any(_companies_match(c, company_blob) for c in companies):
+        return True
+    return False
+
+
+def filter_prospects_for_company_query(
+    rows: list[dict[str, Any]],
+    companies: list[str] | tuple[str, ...] | None,
+) -> list[dict[str, Any]]:
+    return [p for p in (rows or []) if prospect_fits_company_query(p, companies)]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -94,7 +163,15 @@ def _is_mailbox_noise(p: dict[str, Any]) -> bool:
 
 
 def _scrub_mailbox_noise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [r for r in rows if isinstance(r, dict) and not _is_mailbox_noise(r)]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict) or _is_mailbox_noise(r):
+            continue
+        # Drop marketplace templates wrongly tagged onto a company search
+        if email_blocked_for_company_search(str(r.get("email") or "")):
+            continue
+        out.append(r)
+    return out
 
 
 _KEEP_FIELDS = (
@@ -252,6 +329,8 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
                 continue
             p = slim_prospect(p)
             if _is_mailbox_noise(p):
+                continue
+            if email_blocked_for_company_search(str(p.get("email") or "")):
                 continue
             # Need at least a name or email or company signal
             if not (

@@ -43,6 +43,14 @@ def parse_prospects_from_agent_text(
         linkedin = (m.group("linkedin") or "").strip()
         if not email and not name:
             continue
+        if email and email.rsplit("@", 1)[-1].lower() in {
+            "indiamart.com",
+            "justdial.com",
+            "tradeindia.com",
+            "linkedin.com",
+            "karunamedia.org",
+        }:
+            continue
         key = (email or name).lower()
         if key in seen:
             continue
@@ -74,6 +82,15 @@ def parse_prospects_from_agent_text(
         if email in ("a@b.com", "test@test.com", "example@example.com"):
             continue
         if email.endswith("@karunamedia.org") or email.startswith("noreply"):
+            continue
+        # Never invent company employees from marketplace / like-sent templates
+        domain = email.rsplit("@", 1)[-1]
+        if domain in {
+            "indiamart.com",
+            "justdial.com",
+            "tradeindia.com",
+            "linkedin.com",
+        }:
             continue
         seen.add(email)
         local = email.split("@")[0]

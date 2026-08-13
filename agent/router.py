@@ -2476,7 +2476,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
 
             from core.prospect_list import (
                 count_with_email,
+                email_blocked_for_company_search,
                 enough_emailed_contacts,
+                filter_prospects_for_company_query,
                 lookup_for_query,
                 wants_force_refresh,
             )
@@ -2488,14 +2490,22 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 user_msg or ""
             )
 
+            companies_q: list[str] = []
+            for key in ("company_names", "companies", "company"):
+                val = q.get(key)
+                if isinstance(val, list):
+                    companies_q.extend(str(x) for x in val if x)
+                elif isinstance(val, str) and val.strip():
+                    companies_q.append(val.strip())
+
             cached: list[dict[str, Any]] = []
             if not wants_force_refresh(user_msg or ""):
                 cached = lookup_for_query(q, limit=limit)
+                # Drop IndiaMART/etc. rows polluted onto this company name
+                cached = filter_prospects_for_company_query(cached, companies_q)
 
             specific = bool(
-                q.get("company_names")
-                or q.get("companies")
-                or q.get("company")
+                companies_q
                 or q.get("company_domains")
                 or q.get("domains")
             )
@@ -2578,21 +2588,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         p["source"] = "zoominfo"
                     elif str(p.get("source") or "").lower() in ("zi", "zoom", "zoom info"):
                         p["source"] = "zoominfo"
-                if cached:
-                    seen = {
-                        (
-                            (p.get("email") or p.get("source_id") or p.get("name") or "")
-                            .lower()
-                        )
+                # Never merge Saved-list pollution into a live ZoomInfo search.
+                # (Earlier bug: IndiaMART like-sent email tagged company=Sterlite
+                # was appended here and shown as the only "ZoomInfo" hit.)
+                if companies_q:
+                    ok = [
+                        p
                         for p in ok
-                    }
-                    for p in cached:
-                        key = (
-                            p.get("email") or p.get("source_id") or p.get("name") or ""
-                        ).lower()
-                        if key and key not in seen:
-                            ok.append(p)
-                            seen.add(key)
+                        if not email_blocked_for_company_search(
+                            str(p.get("email") or "")
+                        )
+                    ]
                 errs = [p for p in results if p.get("error")]
                 prospect_out = ok
                 saved_ids = []
