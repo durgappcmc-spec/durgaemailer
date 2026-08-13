@@ -69,15 +69,21 @@ def compose_email(
         name.split(None, 1)[0] if name else ""
     )
     title = str(contact.get("title") or contact.get("designation") or "").strip()
-    if first and draft.get("body_html"):
+    if draft.get("body_html"):
         try:
-            from gmail_client.html_format import ensure_designation_in_greeting
+            from gmail_client.html_format import (
+                ensure_designation_in_greeting,
+                normalize_email_html,
+            )
             from core.tracking import strip_visible_tracking_urls
 
-            draft["body_html"] = strip_visible_tracking_urls(
-                ensure_designation_in_greeting(
-                    draft["body_html"], first_name=first, title=title
+            html = draft["body_html"]
+            if first:
+                html = ensure_designation_in_greeting(
+                    html, first_name=first, title=title
                 )
+            draft["body_html"] = normalize_email_html(
+                strip_visible_tracking_urls(html)
             )
         except Exception:
             pass

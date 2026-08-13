@@ -36,8 +36,37 @@ def test_normalize_renders_markdown_inside_html():
     raw = "<p>See our **AI-integrated** crafts.</p><p>*Next step*: call.</p>"
     out = normalize_email_html(raw)
     assert "<strong>AI-integrated</strong>" in out
-    assert "<em>Next step</em>" in out or "Next step" in out
+    assert "<em>Next step</em>" in out
     assert "**" not in out
+    assert "*Next step*" not in out
+
+
+def test_star_wrapped_text_becomes_italic():
+    """*text* markdown must not stay visible in drafts."""
+    out = apply_inline_markdown("Please review *text* today")
+    assert "<em>text</em>" in out
+    assert "*text*" not in out
+
+    html = normalize_email_html(
+        "<p>*The opportunity*</p><p>We can support *girls' skilling* at scale.</p>"
+    )
+    assert "<em>The opportunity</em>" in html
+    assert "<em>girls' skilling</em>" in html
+    assert "*The opportunity*" not in html
+    assert "*girls' skilling*" not in html
+
+
+def test_star_wrapped_heading_becomes_strong():
+    html = plain_or_markdown_to_html("*The opportunity*")
+    assert "<strong>The opportunity</strong>" in html
+    assert "*The opportunity*" not in html
+
+
+def test_star_list_markers_are_not_eaten_as_italic():
+    html = plain_or_markdown_to_html("* Point one\n* Point two")
+    assert "<li>" in html
+    assert "Point one" in html
+    assert "<em>Point one" not in html
 
 
 def test_body_looks_signed_requires_real_sig():

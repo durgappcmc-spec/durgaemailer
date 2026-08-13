@@ -6,8 +6,13 @@ from typing import Optional
 
 _MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
 _MD_BOLD_US = re.compile(r"__(.+?)__")
-_MD_ITALIC = re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])")
-_MD_ITALIC_US = re.compile(r"(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?![\w_])")
+# *text* / *several words* — not * list bullets (space after opening *)
+_MD_ITALIC = re.compile(
+    r"(?<![\w*])\*(?!\s)([^*\n]{1,240}?)(?<!\s)\*(?![\w*])"
+)
+_MD_ITALIC_US = re.compile(
+    r"(?<![\w_])_(?!\s)([^_\n]{1,240}?)(?<!\s)_(?![\w_])"
+)
 _URL_RE = re.compile(r"(https?://[^\s<]+)")
 _TRACKING_URL_RE = re.compile(
     r"(?:/\.netlify/functions/(?:click|open)|/t/[co]/|durgaemailer-tracking\.netlify\.app)",
@@ -97,6 +102,56 @@ def apply_inline_markdown(text: str, *, escape_html: bool = True) -> str:
     return s
 
 
+def _unwrap_emphasis_markers(line: str) -> str:
+    """Strip a single wrapping *...* / **...** / _..._ from a whole line."""
+    s = (line or "").strip()
+    for pat in (
+        r"^\*\*(.+?)\*\*:?$",
+        r"^__(.+?)__:?$",
+        r"^\*(.+?)\*:?$",
+        r"^_(.+?)_:?$",
+    ):
+        m = re.match(pat, s)
+        if m:
+            inner = m.group(1).strip()
+            return inner + (":" if s.endswith(":") and not inner.endswith(":") else "")
+    return s
+
+
+def _markdown_in_text(text: str) -> str:
+    """Convert **bold** / *italic* in a plain text run (no HTML tags)."""
+    return apply_inline_markdown(text or "", escape_html=False)
+
+
+def _replace_node_with_html(node, html_fragment: str) -> None:
+    """Swap a text node for parsed inline HTML without wrapping <html>/<body>."""
+    from bs4 import BeautifulSoup
+
+    frag = BeautifulSoup(f"<span>{html_fragment}</span>", "html.parser")
+    span = frag.span
+    if span is None or not span.contents:
+        node.replace_with(html_fragment)
+        return
+    children = list(span.contents)
+    for child in children:
+        node.insert_before(child)
+    node.extract()
+
+
+def _italicize_leftover_in_html(html: str) -> str:
+    """Convert leftover *text* markdown in HTML text runs (never inside tags)."""
+    if not html or "*" not in html:
+        return html
+    parts = re.split(r"(<[^>]+>)", html)
+    out: list[str] = []
+    for part in parts:
+        if not part or part.startswith("<"):
+            out.append(part)
+            continue
+        out.append(_markdown_in_text(part))
+    return "".join(out)
+
+
 def plain_or_markdown_to_html(text: str) -> str:
     """Convert a full plain/markdown email body into simple HTML paragraphs/lists."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -129,22 +184,25 @@ def plain_or_markdown_to_html(text: str) -> str:
             parts.append(f"<p>{inner}</p>")
         else:
             line = lines[0].strip()
+            heading_src = _unwrap_emphasis_markers(line)
             if (
-                len(line) < 120
-                and not line.endswith(".")
-                and not line.lower().startswith("http")
+                len(heading_src) < 120
+                and not heading_src.endswith(".")
+                and not heading_src.lower().startswith("http")
                 and (
-                    line.endswith(":")
-                    or "—" in line
+                    heading_src.endswith(":")
+                    or "—" in heading_src
                     or re.match(
                         r"^(The opportunity|Why |What your|See our|Success stories|"
                         r"AI-integrated|Craft &|Full channel|Next step|Thanks,?)",
-                        line,
+                        heading_src,
                         re.I,
                     )
                 )
             ):
-                parts.append(f"<p><strong>{apply_inline_markdown(line)}</strong></p>")
+                parts.append(
+                    f"<p><strong>{apply_inline_markdown(heading_src)}</strong></p>"
+                )
             else:
                 parts.append(f"<p>{apply_inline_markdown(line)}</p>")
     return "\n".join(parts)
@@ -154,10 +212,8 @@ def render_markdown_in_html(html: str) -> str:
     """Replace leftover **bold** / *italic* inside HTML text nodes."""
     if not html:
         return html or ""
-    if "**" not in html and not re.search(r"(?<!\w)\*(?!\*)", html):
-        # Still may have single * italics; cheap path when no markers
-        if "*" not in html and "_" not in html:
-            return html
+    if "*" not in html and "_" not in html:
+        return html
     try:
         from bs4 import BeautifulSoup
         from bs4 import NavigableString
@@ -167,31 +223,40 @@ def render_markdown_in_html(html: str) -> str:
             if not isinstance(node, NavigableString):
                 continue
             parent = node.parent
-            if parent is None or parent.name in ("script", "style", "code", "pre"):
+            if parent is None or parent.name in (
+                "script",
+                "style",
+                "code",
+                "pre",
+                "em",
+                "strong",
+                "i",
+                "b",
+            ):
                 continue
             raw = str(node)
             if "*" not in raw and "_" not in raw:
                 continue
-            converted = apply_inline_markdown(raw, escape_html=False)
+            converted = _markdown_in_text(raw)
             if converted == raw:
                 continue
-            # Parsed fragment may include <strong>/<em>/<a>
-            frag = BeautifulSoup(converted, "html.parser")
-            node.replace_with(frag)
-        return str(soup)
+            _replace_node_with_html(node, converted)
+        rendered = str(soup)
     except Exception:
-        # Fallback: crude global replace (safe enough after escape)
-        return apply_inline_markdown(html, escape_html=False)
+        rendered = apply_inline_markdown(html, escape_html=False)
+    # Catch *text* that survived the tree walk (e.g. odd MIME splits)
+    return _italicize_leftover_in_html(rendered)
 
 
 def normalize_email_html(body: str) -> str:
-    """Ensure draft/send body is real HTML with markdown rendered (no raw **)."""
+    """Ensure draft/send body is real HTML with markdown rendered (no raw * / **)."""
     body = (body or "").strip()
     if not body:
         return "<p></p>"
     if re.search(r"</?(?:p|div|br|ul|ol|li|table|strong|em|a|h\d)\b", body, re.I):
         return render_markdown_in_html(body)
-    return plain_or_markdown_to_html(body) or "<p></p>"
+    html = plain_or_markdown_to_html(body) or "<p></p>"
+    return render_markdown_in_html(html)
 
 
 def body_looks_signed(html: str, signature_html: str = "") -> bool:

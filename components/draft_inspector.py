@@ -119,7 +119,11 @@ def render_draft_inspector(
                     preview_body = html_for_preview(body)
                 except Exception:
                     preview_body = body
-            st.markdown(preview_body, unsafe_allow_html=True)
+            # Wrap so Streamlit does not re-parse leftover *text* as markdown
+            st.markdown(
+                f'<div class="email-preview">{preview_body}</div>',
+                unsafe_allow_html=True,
+            )
             if tid or has_pixel:
                 st.caption("🔒 Open tracking is embedded (hidden). Links shown as originals.")
             else:
