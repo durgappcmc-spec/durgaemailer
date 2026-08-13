@@ -87,8 +87,29 @@ def _send_one(draft: dict) -> dict:
 
 st.title("📝 Drafts")
 st.caption(
-    "Review drafts from Chat / Schedule / Bulk · preview body · "
+    "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
     "send with open-tracking pixel."
+)
+st.markdown(
+    """
+<style>
+div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) button {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #1a73e8 !important;
+  text-align: left !important;
+  justify-content: flex-start !important;
+  padding-left: 0 !important;
+  font-weight: 600 !important;
+  text-decoration: underline;
+}
+div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(3) button:hover {
+  color: #0b57d0 !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 with st.spinner("Loading Gmail drafts…"):
@@ -166,13 +187,28 @@ h[5].markdown("**Tracking**")
 h[6].markdown("**Source**")
 
 selected: list[str] = []
+if "opened_draft_id" not in st.session_state:
+    st.session_state.opened_draft_id = ""
+
 for r in page_rows:
+    did = r.get("draft_id") or ""
     cols = st.columns([0.4, 2.2, 3.2, 1.3, 1, 1.2, 1.2])
     with cols[0]:
-        if st.checkbox("", key=f"dsel_{r.get('draft_id')}", label_visibility="collapsed"):
-            selected.append(r["draft_id"])
+        if st.checkbox("", key=f"dsel_{did}", label_visibility="collapsed"):
+            selected.append(did)
     cols[1].write(r.get("recipient") or r.get("to") or "—")
-    cols[2].write(r.get("subject") or "—")
+    with cols[2]:
+        subject_label = (r.get("subject") or "(no subject)").strip() or "(no subject)"
+        # Truncate long subjects for the button label
+        btn_label = subject_label if len(subject_label) <= 60 else subject_label[:57] + "…"
+        if st.button(
+            btn_label,
+            key=f"open_subj_{did}",
+            help="Open this draft",
+            use_container_width=True,
+        ):
+            st.session_state.opened_draft_id = did
+            st.rerun()
     cols[3].write((r.get("updated_at") or "")[:16] or "—")
     cols[4].write(r.get("status") or "draft")
     tracked = bool(r.get("tracking_id") or r.get("has_open_pixel"))
@@ -233,6 +269,10 @@ if c4.button("Export CSV"):
 
 st.divider()
 st.subheader("Open a draft")
+st.caption("Click a **subject** in the list above to open it.")
+
+opened = st.session_state.get("opened_draft_id") or ""
+# Also allow picking from dropdown (synced with click)
 labels = {
     r.get("draft_id"): (
         f"{r.get('subject') or '(no subject)'} → "
@@ -240,11 +280,29 @@ labels = {
     )
     for r in page_rows
 }
+options = ["—"] + [r.get("draft_id") for r in page_rows if r.get("draft_id")]
+idx = options.index(opened) if opened in options else 0
 pick = st.selectbox(
-    "Select draft to preview / send",
-    ["—"] + list(labels.keys()),
+    "Or select here",
+    options,
+    index=idx,
     format_func=lambda x: "—" if x == "—" else labels.get(x, x),
 )
-if pick and pick != "—":
-    draft = _load_full_draft(pick, by_id.get(pick) or {})
+if pick != "—" and pick != opened:
+    st.session_state.opened_draft_id = pick
+    opened = pick
+elif pick == "—" and opened and opened not in (r.get("draft_id") for r in page_rows):
+    # keep opened if it's from another page of results
+    pass
+elif pick == "—" and opened in options:
+    # User cleared the selectbox
+    st.session_state.opened_draft_id = ""
+    opened = ""
+
+if opened:
+    c_close, _ = st.columns([1, 5])
+    if c_close.button("✕ Close", key="close_opened_draft"):
+        st.session_state.opened_draft_id = ""
+        st.rerun()
+    draft = _load_full_draft(opened, by_id.get(opened) or {})
     render_draft_inspector(draft, key_prefix="drafts_page")
