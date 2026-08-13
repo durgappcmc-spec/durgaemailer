@@ -81,13 +81,21 @@ if not st.session_state.messages:
 if not st.session_state._durable_pull_started:
     st.session_state._durable_pull_started = True
     durable_store.pull_sheets_into_local_async()
-# Restore RAG memory from Google Drive (non-blocking; Drive is source of truth)
+# Restore RAG memory + prospect list from Google Drive (Render disk is ephemeral)
 if not st.session_state.get("_memory_hydrated"):
     st.session_state._memory_hydrated = True
     try:
         from core import memory as _mem
 
         _mem.hydrate_from_cloud()
+    except Exception:
+        pass
+if not st.session_state.get("_prospects_drive_hydrated"):
+    st.session_state._prospects_drive_hydrated = True
+    try:
+        from core.prospect_list import reload_from_drive
+
+        st.session_state["_prospects_restored_n"] = reload_from_drive()
     except Exception:
         pass
 

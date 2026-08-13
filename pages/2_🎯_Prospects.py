@@ -48,6 +48,32 @@ st.caption(
     "Missing email triggers ZoomInfo automatically (say **refresh** to force a full re-search)."
 )
 
+try:
+    from core.drive_store import memory_status
+
+    ms = memory_status()
+    if not ms.get("drive_ok"):
+        st.error(
+            "Google Drive is not connected (token missing `drive.file` or "
+            "`BOOTSTRAP_TOKEN_JSON`). Prospects only live on ephemeral disk and "
+            "will vanish on the next deploy."
+        )
+    elif not ms.get("folder_pinned"):
+        st.warning(
+            "Set **RELAY_DRIVE_FOLDER_ID** on Render to your existing "
+            f"`Relay Memory` folder id (`{ms.get('folder_id') or 'unknown'}`). "
+            "Without it, a new deploy can attach to an empty Drive folder and "
+            "your contacts look gone."
+        )
+    elif ms.get("prospects_count", 0) == 0 and not ms.get("has_prospects_file"):
+        st.info(
+            "Drive folder is pinned but `relay_prospects.json` is missing there. "
+            "If you had contacts before, open Google Drive, find the older "
+            "`Relay Memory` folder that still has that file, and pin its id."
+        )
+except Exception:
+    pass
+
 n_saved = 0
 try:
     n_saved = len(all_prospects())
@@ -55,6 +81,8 @@ except Exception:
     n_saved = 0
 if n_saved:
     st.caption(f"Saved on your list: **{n_saved}** contacts")
+elif st.session_state.get("_prospects_restored_n") == 0:
+    st.caption("Saved list is empty after Drive restore — check the warning above.")
 
 tab_saved, tab_search, tab_enrich = st.tabs(["Saved", "Search", "Enrich"])
 

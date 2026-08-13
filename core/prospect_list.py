@@ -65,10 +65,10 @@ def _persist(rows: list[dict[str, Any]]) -> None:
     _CACHE = rows
     _LOADED = True
     try:
-        from core.durable_store import save_json_blob_async
+        from core.durable_store import save_json_blob
 
-        # Cap growth — keep newest/most complete first
-        save_json_blob_async("prospect_list", rows[-1000:])
+        # Sync to Drive — async-only saves were lost on Render restarts mid-upload
+        save_json_blob("prospect_list", rows[-1000:])
     except Exception as e:
         print(f"[prospect_list] save failed: {e}", file=sys.stderr)
 
@@ -162,6 +162,52 @@ def all_prospects() -> list[dict[str, Any]]:
         return [sanitize_prospect(p) for p in _load()]
 
 
+def _company_tokens(s: str) -> list[str]:
+    stop = {
+        "ltd",
+        "llc",
+        "inc",
+        "pvt",
+        "private",
+        "limited",
+        "the",
+        "and",
+        "of",
+        "co",
+        "corp",
+        "company",
+    }
+    return [t for t in _norm(s).split() if len(t) > 2 and t not in stop]
+
+
+def _companies_match(needle: str, company_blob: str, website: str = "") -> bool:
+    """Strict-ish org match — avoid 'tech' matching every '* tech' query."""
+    needle = _norm(needle)
+    company_blob = _norm(company_blob)
+    website = _norm(website)
+    if not needle or len(needle) < 2:
+        return False
+    if company_blob and (needle in company_blob or company_blob == needle):
+        return True
+    if website and (
+        needle in website
+        or (len(needle) >= 4 and needle.replace(" ", "") in website.replace(" ", ""))
+    ):
+        return True
+    # Allow blob⊂needle only when the saved company name is substantial
+    if company_blob and len(company_blob) >= 6 and company_blob in needle:
+        return True
+    n_toks = _company_tokens(needle)
+    if not n_toks or not company_blob:
+        return False
+    distinctive = [t for t in n_toks if len(t) >= 5]
+    if distinctive and not any(t in company_blob for t in distinctive):
+        return False
+    hits = sum(1 for t in n_toks if t in company_blob)
+    need = max(1, (len(n_toks) + 1) // 2)
+    return hits >= need
+
+
 def find_by_company(
     company: str,
     *,
@@ -182,9 +228,7 @@ def find_by_company(
                 )
             )
             website = _norm(str(p.get("org_website") or p.get("website") or ""))
-            if needle in company_blob or company_blob in needle:
-                hits.append(p)
-            elif needle in website or (len(needle) >= 4 and needle.replace(" ", "") in website.replace(" ", "")):
+            if _companies_match(needle, company_blob, website):
                 hits.append(p)
             if len(hits) >= max(limit * 3, limit):
                 break

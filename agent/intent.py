@@ -595,7 +595,7 @@ def org_label_from_email(email: str) -> str:
 
 _CONTACT_SEARCH_RE = re.compile(
     r"\b(?:"
-    r"(?:search|find|look\s*up|get|pull|fetch)\s+"
+    r"(?:search|find|look\s*up|get|pull|fetch|check)\s+"
     r"(?:(?:for|me)\s+)?"
     r"(?:a\s+|the\s+|any\s+)?"
     r"(?:contacts?|people|prospects?|persons?)\s+"
@@ -693,6 +693,18 @@ def parse_named_person_contact(user_msg: str) -> dict[str, str]:
     return out
 
 
+def wants_saved_list_only(user_msg: str) -> bool:
+    """True when user wants the local prospect list, not a live ZoomInfo search."""
+    return bool(
+        re.search(
+            r"\b(saved|local|my\s+list|prospect\s+list|already\s+saved|"
+            r"from\s+(?:memory|the\s+list|our\s+list)|in\s+memory)\b",
+            user_msg or "",
+            re.I,
+        )
+    )
+
+
 def wants_contact_search(user_msg: str) -> bool:
     """True when user wants ZoomInfo/prospect contact lookup, not an email draft."""
     msg = user_msg or ""
@@ -718,6 +730,13 @@ def wants_contact_search(user_msg: str) -> bool:
             re.I,
         )
     )
+
+
+def wants_live_zoominfo_search(user_msg: str) -> bool:
+    """Explicit company contact search → always hit ZoomInfo (not local-only)."""
+    if wants_saved_list_only(user_msg):
+        return False
+    return wants_contact_search(user_msg)
 
 
 def looks_like_mission_org_discovery(user_msg: str) -> bool:

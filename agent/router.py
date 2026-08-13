@@ -29,6 +29,7 @@ from agent.intent import (
     resolve_like_sent_from_history,
     resolve_to_emails_from_history,
     wants_contact_search,
+    wants_live_zoominfo_search,
     wants_previous_chat_recipient,
 )
 from agent.research_pipeline import (
@@ -2091,6 +2092,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 wants_force_refresh,
             )
 
+            # "search contact from Sterlite Tech" must hit ZoomInfo — local list
+            # is only a fallback when the user asks for saved/memory, or when a
+            # non-explicit query already has enough emailed contacts on file.
+            live_zoom = wants_live_zoominfo_search(user_msg or "") or wants_force_refresh(
+                user_msg or ""
+            )
+
             cached: list[dict[str, Any]] = []
             if not wants_force_refresh(user_msg or ""):
                 cached = lookup_for_query(q, limit=limit)
@@ -2103,8 +2111,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 or q.get("domains")
             )
             # Only skip ZoomInfo when we already have enough contacts *with email*
+            # AND the user did not ask for a live contact search.
             use_saved = bool(
-                cached
+                not live_zoom
+                and cached
                 and enough_emailed_contacts(cached, limit=limit, specific=specific)
             )
 

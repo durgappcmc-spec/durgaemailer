@@ -176,6 +176,18 @@ def ensure_session_sync(session_state: Any, *, light: bool = False) -> dict[str,
         except Exception as e:
             print(f"[auto_sync] memory hydrate: {e}", file=sys.stderr)
 
+    # Render wipes local disk each deploy — restore contacts before any save
+    if not session_state.get("_prospects_drive_hydrated"):
+        session_state["_prospects_drive_hydrated"] = True
+        try:
+            from core.prospect_list import reload_from_drive
+
+            n = reload_from_drive()
+            session_state["_prospects_restored_n"] = n
+            print(f"[auto_sync] restored {n} prospects from Drive", file=sys.stderr)
+        except Exception as e:
+            print(f"[auto_sync] prospect hydrate: {e}", file=sys.stderr)
+
     if light:
         # Chat page: never block on Gmail
         return session_state.get("_auto_sync_result") or {"skipped": True, "reason": "light"}

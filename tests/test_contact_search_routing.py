@@ -12,6 +12,8 @@ from agent.intent import (
     parse_contact_search_company,
     parse_named_person_contact,
     wants_contact_search,
+    wants_live_zoominfo_search,
+    wants_saved_list_only,
 )
 
 
@@ -29,6 +31,21 @@ def test_find_contacts_at_company():
     assert wants_contact_search(msg)
     assert "Magic Bus" in parse_contact_search_company(msg)
     assert _heuristic_plan(msg).action == "prospect_search"
+
+
+def test_sterlite_forces_live_zoominfo():
+    msg = "search contact from Sterlite Tech"
+    assert wants_contact_search(msg)
+    assert parse_contact_search_company(msg) == "Sterlite Tech"
+    assert wants_live_zoominfo_search(msg)
+    assert not wants_saved_list_only(msg)
+    assert _heuristic_plan(msg).action == "prospect_search"
+
+
+def test_saved_list_phrasing_skips_live_zoom():
+    msg = "show saved contacts from Sterlite Tech"
+    assert wants_saved_list_only(msg)
+    assert not wants_live_zoominfo_search(msg)
 
 
 def test_named_person_from_domain_goes_to_enrich():

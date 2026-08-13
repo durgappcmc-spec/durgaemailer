@@ -48,6 +48,93 @@ def _pinned_folder_id() -> str:
         return (os.getenv("RELAY_DRIVE_FOLDER_ID") or "").strip()
 
 
+def _probe_file_id(name: str, folder_id: str) -> Optional[str]:
+    """Look up a file id in a folder without touching the process cache."""
+    svc = _drive()
+    if not svc or not folder_id:
+        return None
+    try:
+        q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
+        res = (
+            svc.files()
+            .list(q=q, spaces="drive", fields="files(id,name,size)", pageSize=5)
+            .execute()
+        )
+        files = res.get("files") or []
+        if files:
+            return files[0]["id"]
+    except Exception as e:
+        print(f"[drive] probe {name} failed: {e}", file=sys.stderr)
+    return None
+
+
+def _probe_file_size(name: str, folder_id: str) -> int:
+    svc = _drive()
+    if not svc or not folder_id:
+        return 0
+    try:
+        q = f"name='{name}' and '{folder_id}' in parents and trashed=false"
+        res = (
+            svc.files()
+            .list(q=q, spaces="drive", fields="files(id,size)", pageSize=5)
+            .execute()
+        )
+        files = res.get("files") or []
+        if not files:
+            return 0
+        return int(files[0].get("size") or 0)
+    except Exception:
+        return 0
+
+
+def _pick_best_memory_folder(folders: list[dict[str, Any]]) -> Optional[str]:
+    """Prefer the Relay Memory folder that already holds prospect/chat blobs.
+
+    Without RELAY_DRIVE_FOLDER_ID, drive.file can leave multiple 'Relay Memory'
+    folders after redeploys. Picking files[0] often attaches to an empty one.
+    """
+    if not folders:
+        return None
+    if len(folders) == 1:
+        return folders[0]["id"]
+    scored: list[tuple[int, str]] = []
+    for f in folders:
+        fid = str(f.get("id") or "")
+        if not fid:
+            continue
+        # Weight durable blobs so we land on the folder with real history
+        score = 0
+        for blob, weight in (
+            ("relay_prospects.json", 1000),
+            ("relay_memory.json", 100),
+            ("relay_chat.json", 50),
+            ("relay_session.json", 10),
+            ("relay_aliases.json", 5),
+        ):
+            sz = _probe_file_size(blob, fid)
+            if sz > 0:
+                score += weight + min(sz, 500_000) // 1000
+        scored.append((score, fid))
+        print(f"[drive] candidate folder {fid} score={score}", file=sys.stderr)
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best_score, best_id = scored[0]
+    if best_score == 0:
+        # All empty — keep first for stability, but scream for a pin
+        print(
+            "[drive] multiple empty Relay Memory folders; "
+            "set RELAY_DRIVE_FOLDER_ID to the one with your data",
+            file=sys.stderr,
+        )
+        return folders[0]["id"]
+    if len(scored) > 1 and scored[1][0] > 0:
+        print(
+            f"[drive] chose folder {best_id} (score={best_score}) among "
+            f"{len(folders)} Relay Memory folders — pin RELAY_DRIVE_FOLDER_ID",
+            file=sys.stderr,
+        )
+    return best_id
+
+
 def _ensure_folder() -> Optional[str]:
     global _FOLDER_ID
     if _FOLDER_ID:
@@ -55,6 +142,7 @@ def _ensure_folder() -> Optional[str]:
     pinned = _pinned_folder_id()
     if pinned:
         _FOLDER_ID = pinned
+        print(f"[drive] using pinned folder id={pinned}", file=sys.stderr)
         return _FOLDER_ID
     svc = _drive()
     if not svc:
@@ -66,13 +154,20 @@ def _ensure_folder() -> Optional[str]:
         )
         res = (
             svc.files()
-            .list(q=q, spaces="drive", fields="files(id,name)", pageSize=5)
+            .list(q=q, spaces="drive", fields="files(id,name)", pageSize=20)
             .execute()
         )
         files = res.get("files") or []
         if files:
-            _FOLDER_ID = files[0]["id"]
-            return _FOLDER_ID
+            chosen = _pick_best_memory_folder(files)
+            if chosen:
+                _FOLDER_ID = chosen
+                print(
+                    f"[drive] using folder '{FOLDER_NAME}' id={_FOLDER_ID} "
+                    f"(set RELAY_DRIVE_FOLDER_ID on Render to pin across deploys)",
+                    file=sys.stderr,
+                )
+                return _FOLDER_ID
         meta = (
             svc.files()
             .create(
@@ -96,27 +191,40 @@ def _ensure_folder() -> Optional[str]:
         return None
 
 
+def memory_status() -> dict[str, Any]:
+    """Diagnostics for Prospects / Memory UI after redeploys."""
+    pinned = _pinned_folder_id()
+    folder = _ensure_folder()
+    prospects_n = 0
+    has_prospects_file = False
+    drive_ok = _drive() is not None
+    if folder and drive_ok:
+        try:
+            data = download_json("relay_prospects.json")
+            if isinstance(data, list):
+                has_prospects_file = True
+                prospects_n = len([r for r in data if isinstance(r, dict)])
+            elif data is not None:
+                has_prospects_file = True
+        except Exception as e:
+            print(f"[drive] memory_status: {e}", file=sys.stderr)
+    return {
+        "drive_ok": drive_ok,
+        "folder_id": folder or "",
+        "folder_pinned": bool(pinned),
+        "pinned_folder_id": pinned,
+        "has_prospects_file": has_prospects_file,
+        "prospects_count": prospects_n,
+    }
+
+
 def _find_file(name: str, folder_id: str) -> Optional[str]:
     if name in _FILE_IDS:
         return _FILE_IDS[name]
-    svc = _drive()
-    if not svc:
-        return None
-    try:
-        q = (
-            f"name='{name}' and '{folder_id}' in parents and trashed=false"
-        )
-        res = (
-            svc.files()
-            .list(q=q, spaces="drive", fields="files(id,name)", pageSize=5)
-            .execute()
-        )
-        files = res.get("files") or []
-        if files:
-            _FILE_IDS[name] = files[0]["id"]
-            return files[0]["id"]
-    except Exception as e:
-        print(f"[drive] find {name} failed: {e}", file=sys.stderr)
+    file_id = _probe_file_id(name, folder_id)
+    if file_id:
+        _FILE_IDS[name] = file_id
+        return file_id
     return None
 
 
