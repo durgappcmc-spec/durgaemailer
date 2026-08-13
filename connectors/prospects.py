@@ -41,7 +41,7 @@ def _dedupe_key(p: dict[str, Any]) -> str:
 
 def search_all(
     query: dict[str, Any],
-    providers: tuple[str, ...] | list[str] = ("apollo", "zoominfo", "rocketreach"),
+    providers: tuple[str, ...] | list[str] = ("zoominfo",),
     limit_per_provider: int = 50,
 ) -> list[dict[str, Any]]:
     """Fan out search across providers and dedupe results."""
@@ -73,12 +73,7 @@ def enrich_fallthrough(
 ) -> dict[str, Any]:
     """Try providers in order; return first result that has an email."""
     if order is None:
-        # LinkedIn URLs: ZoomInfo resolves via name search; Apollo/RR accept the URL.
-        if identifier.get("linkedin_url") or identifier.get("linkedin"):
-            order = ("zoominfo", "apollo", "rocketreach")
-        else:
-            order = ("zoominfo", "apollo", "rocketreach")
-    errors: list[dict[str, str]] = []
+        order = ("zoominfo",)    errors: list[dict[str, str]] = []
     last_without_email: Optional[dict[str, Any]] = None
     for name in order:
         try:

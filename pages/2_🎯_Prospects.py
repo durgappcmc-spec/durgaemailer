@@ -168,12 +168,8 @@ with tab_search:
         locations = c2.text_input("Locations", "")
         seniorities = c1.text_input("Seniorities", "vp, director, c_suite")
         keywords = c2.text_input("Keywords", "")
-        providers = st.multiselect(
-            "Providers",
-            ["zoominfo", "apollo", "rocketreach"],
-            default=["zoominfo"],
-        )
-        limit = st.slider("Limit per provider", 5, 100, 50)
+        st.caption("Provider: **ZoomInfo** only")
+        limit = st.slider("Limit", 5, 100, 50)
         submitted = st.form_submit_button("🔍 Search")
 
     if submitted:
@@ -185,9 +181,9 @@ with tab_search:
             "seniorities": seniorities,
             "keywords": keywords,
         }
-        with st.spinner("Searching providers…"):
+        with st.spinner("Searching ZoomInfo…"):
             results = search_all(
-                query, providers=providers or ["zoominfo"], limit_per_provider=limit
+                query, providers=["zoominfo"], limit_per_provider=limit
             )
         st.session_state.last_prospects = results
         clean = [p for p in results if not p.get("error")]
@@ -232,8 +228,8 @@ with tab_enrich:
         title = c2.text_input("Title")
         order = st.multiselect(
             "Fallthrough order",
-            ["zoominfo", "apollo", "rocketreach"],
-            default=["zoominfo", "apollo", "rocketreach"],
+            ["zoominfo"],
+            default=["zoominfo"],
         )
         go = st.form_submit_button("✨ Enrich")
 
@@ -248,7 +244,7 @@ with tab_enrich:
         }
         with st.spinner("Enriching…"):
             result = enrich_fallthrough(
-                ident, order=order or ["zoominfo", "apollo", "rocketreach"]
+                ident, order=order or ["zoominfo"]
             )
         st.session_state.last_enrich = result
         st.json(result)

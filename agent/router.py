@@ -2431,16 +2431,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
             q = _parse_json_tail(routing, "PROSPECT_SEARCH:")
             if not q:
                 q = {"keywords": user_msg}
-            # Provider selection: ZoomInfo-first by default; honor explicit providers
+            # Provider selection: ZoomInfo only (Apollo / RocketReach disabled)
             providers = q.pop("providers", None) or q.pop("provider", None)
             if isinstance(providers, str):
                 providers = [providers]
-            if not providers:
-                if re.search(r"\bzoom\s*info\b|\bzi\b", user_msg or "", re.I):
-                    providers = ("zoominfo",)
-                else:
-                    providers = ("zoominfo", "apollo", "rocketreach")
-            vol = parse_research_limits(user_msg)
+            # Always ZoomInfo — ignore apollo/rocketreach even if classifier asks
+            providers = ("zoominfo",)            vol = parse_research_limits(user_msg)
             limit = int(
                 q.pop("limit", None)
                 or q.pop("limit_per_provider", None)
