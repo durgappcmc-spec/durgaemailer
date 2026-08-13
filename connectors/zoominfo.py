@@ -1011,6 +1011,10 @@ def _build_contact_search_body(query: dict[str, Any], limit: int = 10) -> dict[s
     if query.get("company_domains"):
         body["companyWebsite"] = _join(query["company_domains"])
 
+    company_id = query.get("company_id") or query.get("companyId")
+    if company_id:
+        body["companyId"] = str(company_id)
+
     # Never send free-text `location` / `city` — they 400 on this ZoomInfo account
     body.update(_geo_filters(query))
 
