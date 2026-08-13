@@ -207,7 +207,27 @@ def ensure_session_sync(session_state: Any, *, light: bool = False) -> dict[str,
 
 
 def auto_ingest_prospects(prospects: list[dict[str, Any]]) -> list[str]:
-    """Save ZoomInfo / provider search hits into memory when enabled."""
+    """Save ZoomInfo / provider hits to Drive prospect list (then memory)."""
     if not _env_bool("AUTO_INGEST_PROSPECTS", True):
+        print("[auto_sync] AUTO_INGEST_PROSPECTS disabled — skip save", file=sys.stderr)
         return []
-    return ingest_prospects(prospects, source_tag="prospects")
+    try:
+        return ingest_prospects(prospects, source_tag="prospects")
+    except Exception as e:
+        # Last resort: durable list only (never lose ZoomInfo hits to memory errors)
+        print(f"[auto_sync] ingest_prospects failed: {e}", file=sys.stderr)
+        clean = [p for p in (prospects or []) if p and not p.get("error")]
+        if not clean:
+            return []
+        try:
+            from core.prospect_list import save_prospects
+
+            n = save_prospects(clean)
+            print(
+                f"[auto_sync] fallback Drive prospect_list upserted {n}",
+                file=sys.stderr,
+            )
+            return [f"list:{i}" for i in range(n)]
+        except Exception as e2:
+            print(f"[auto_sync] Drive fallback also failed: {e2}", file=sys.stderr)
+            return []

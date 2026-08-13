@@ -2233,16 +2233,22 @@ def answer(
             yield "\n"
 
             try:
-                auto_ingest_prospects(
-                    [c for c in prospect_out if not c.get("research_only")]
-                )
+                from core.prospect_list import save_prospects
+
+                research_clean = [
+                    c for c in prospect_out if not c.get("research_only") and not c.get("error")
+                ]
+                list_n = save_prospects(research_clean)
+                auto_ingest_prospects(research_clean)
                 yield (
-                    f"\nSaved contacts to your **prospect list** "
+                    f"\nAuto-saved **{list_n or len(research_clean)}** contacts to your "
+                    f"**Drive prospect list** "
                     f"(reused next time when email is already on file; "
                     f"missing email auto-checks ZoomInfo).\n"
                 )
             except Exception as e:
                 print(f"[router] research auto-ingest error: {e}", file=sys.stderr)
+                yield f"\n⚠️ Prospect list save issue: {e}\n"
 
             # Step 3: personalized drafts for contacts with email (review before send)
             if (do_draft or do_send) and with_email:
@@ -2484,9 +2490,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 prospect_out = ok
                 saved_ids: list[str] = []
                 try:
-                    saved_ids = auto_ingest_prospects(ok)
+                    from core.prospect_list import save_prospects
+
+                    kept_n = save_prospects(ok)
                 except Exception as e:
                     print(f"[router] list re-save error: {e}", file=sys.stderr)
+                    kept_n = 0
+                try:
+                    saved_ids = auto_ingest_prospects(ok)
+                except Exception as e:
+                    print(f"[router] list re-save ingest error: {e}", file=sys.stderr)
+                    saved_ids = []
                 ctx_lines = [f"{i}. {prospect_to_text(p)}" for i, p in enumerate(ok[:100], 1)]
                 with_email = count_with_email(ok)
                 yield (
@@ -2494,8 +2508,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     f"(**{with_email}** with email).\n\n"
                 )
                 yield "\n".join(ctx_lines)
-                if saved_ids:
-                    yield f"\n\nKept **{len(saved_ids)}** contacts on your list."
+                if kept_n or saved_ids:
+                    yield (
+                        f"\n\nKept **{kept_n or len(ok)}** contacts on your Drive list."
+                    )
                 draft_after = _should_draft_after_prospect_search(
                     user_msg or "", plan, q
                 ) and not (context or {}).get("_after_prospect_search")
@@ -2565,7 +2581,18 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 errs = [p for p in results if p.get("error")]
                 prospect_out = ok
                 saved_ids = []
+                list_saved = 0
                 if ok:
+                    try:
+                        from core.prospect_list import save_prospects
+
+                        # Explicit Drive upsert — do not rely on memory ingest alone
+                        list_saved = save_prospects(ok)
+                    except Exception as e:
+                        print(
+                            f"[router] prospect_list save error: {e}",
+                            file=sys.stderr,
+                        )
                     try:
                         saved_ids = auto_ingest_prospects(ok)
                     except Exception as e:
@@ -2596,10 +2623,21 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         f"(**{with_email}** with email) via {', '.join(providers)}.\n\n"
                     )
                     yield "\n".join(ctx_lines)
-                    if saved_ids:
+                    if list_saved or saved_ids:
                         yield (
-                            f"\n\nSaved **{len(saved_ids)}** contacts to your prospect list "
-                            f"(reused when email is on file; missing email auto-checks ZoomInfo)."
+                            f"\n\nAuto-saved **{list_saved or len(ok)}** contacts to your "
+                            f"**Drive prospect list** (`relay_prospects.json`)"
+                            + (
+                                f" · memory ids {len(saved_ids)}"
+                                if saved_ids
+                                else ""
+                            )
+                            + "."
+                        )
+                    else:
+                        yield (
+                            "\n\n⚠️ Could not auto-save to Drive — check "
+                            "`BOOTSTRAP_TOKEN_JSON` / `RELAY_DRIVE_FOLDER_ID`."
                         )
                     draft_after = _should_draft_after_prospect_search(
                         user_msg or "", plan, q

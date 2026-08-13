@@ -68,7 +68,17 @@ def _persist(rows: list[dict[str, Any]]) -> None:
         from core.durable_store import save_json_blob
 
         # Sync to Drive — async-only saves were lost on Render restarts mid-upload
-        save_json_blob("prospect_list", rows[-1000:])
+        ok = save_json_blob("prospect_list", rows[-1000:])
+        print(
+            f"[prospect_list] persist n={len(rows)} drive_ok={ok}",
+            file=sys.stderr,
+        )
+        if not ok:
+            print(
+                "[prospect_list] WARNING: Drive/Sheets sync reported failure "
+                "— contacts may be local-only until next successful save",
+                file=sys.stderr,
+            )
     except Exception as e:
         print(f"[prospect_list] save failed: {e}", file=sys.stderr)
 

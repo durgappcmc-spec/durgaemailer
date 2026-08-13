@@ -1,6 +1,7 @@
 # NOTE: Skips error rows when ingesting so a single provider failure won't pollute memory.
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pandas as pd
@@ -30,35 +31,57 @@ def ingest_prospects(
     prospects: list[dict[str, Any]],
     source_tag: str = "prospects",
 ) -> list[str]:
-    """Add prospects to Chroma/JSONL memory and the durable prospect list."""
-    ids: list[str] = []
+    """Add prospects to the durable Drive list first, then Chroma/JSONL memory.
+
+    Drive persistence must not depend on memory/Chroma succeeding — otherwise
+    ZoomInfo hits appear in chat but never land in relay_prospects.json.
+    """
     clean: list[dict[str, Any]] = []
     for p in prospects:
         if not p or p.get("error"):
             continue
         clean.append(p)
-        text = prospect_to_text(p)
-        title = f"{p.get('name') or 'Unknown'} @ {p.get('company') or '?'}"
-        added = memory.add(
-            texts=text,
-            source=source_tag,
-            source_id=str(p.get("source_id") or p.get("email") or ""),
-            title=title,
-            metadata={
-                "email": p.get("email") or "",
-                "company": p.get("company") or "",
-                "provider": p.get("source") or "",
-                "name": p.get("name") or "",
-            },
-        )
-        ids.extend(added)
+
     if clean:
         try:
             from core.prospect_list import save_prospects
 
-            save_prospects(clean)
-        except Exception:
-            pass
+            n = save_prospects(clean)
+            print(
+                f"[ingest] prospect_list saved/updated {n} "
+                f"(from {len(clean)} rows, source={source_tag})",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"[ingest] prospect_list save FAILED ({source_tag}): {e}",
+                file=sys.stderr,
+            )
+
+    ids: list[str] = []
+    for p in clean:
+        text = prospect_to_text(p)
+        title = f"{p.get('name') or 'Unknown'} @ {p.get('company') or '?'}"
+        try:
+            added = memory.add(
+                texts=text,
+                source=source_tag,
+                source_id=str(p.get("source_id") or p.get("email") or ""),
+                title=title,
+                metadata={
+                    "email": p.get("email") or "",
+                    "company": p.get("company") or "",
+                    "provider": p.get("source") or "",
+                    "name": p.get("name") or "",
+                },
+            )
+            ids.extend(added)
+        except Exception as e:
+            print(
+                f"[ingest] memory add skipped for "
+                f"{p.get('email') or p.get('name') or '?'}: {e}",
+                file=sys.stderr,
+            )
     return ids
 
 

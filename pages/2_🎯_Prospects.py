@@ -190,7 +190,15 @@ with tab_search:
                 query, providers=providers or ["zoominfo"], limit_per_provider=limit
             )
         st.session_state.last_prospects = results
-        saved = auto_ingest_prospects([p for p in results if not p.get("error")])
+        clean = [p for p in results if not p.get("error")]
+        list_n = 0
+        try:
+            from core.prospect_list import save_prospects
+
+            list_n = save_prospects(clean)
+        except Exception as e:
+            st.warning(f"Drive prospect list save failed: {e}")
+        saved = auto_ingest_prospects(clean)
         try:
             from core import durable_store
 
@@ -198,7 +206,8 @@ with tab_search:
         except Exception:
             pass
         st.success(
-            f"Got {len(results)} rows. Auto-saved **{len(saved)}** contacts to your list."
+            f"Got {len(results)} rows. Auto-saved **{list_n or len(saved)}** "
+            f"contacts to your Drive prospect list."
         )
 
     prospects = st.session_state.get("last_prospects") or []
