@@ -1,4 +1,4 @@
-# NOTE: Shared draft inspector — Intelligence Panel + Agent Trace + tracked pill.
+# NOTE: Shared draft inspector — preview, tracking pill, edit, send now.
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -18,18 +18,77 @@ def render_draft_inspector(
         return
 
     tid = draft.get("tracking_id") or ""
+    has_pixel = bool(draft.get("has_open_pixel")) or (
+        "/.netlify/functions/open" in (draft.get("body_html") or "")
+        or "/t/o/" in (draft.get("body_html") or "")
+    )
+    if not tid and has_pixel:
+        try:
+            from core.tracking import extract_tracking_id
+
+            tid = extract_tracking_id(draft.get("body_html") or "") or ""
+            draft["tracking_id"] = tid
+        except Exception:
+            pass
+
     cols = st.columns([3, 1])
     with cols[0]:
         st.subheader(draft.get("subject") or "(no subject)")
         st.caption(f"To: {draft.get('recipient') or draft.get('to') or '—'}")
+        if draft.get("gmail_draft_id") or str(draft.get("draft_id") or "").startswith("gmail:"):
+            st.caption(f"Gmail draft · `{draft.get('gmail_draft_id') or draft.get('draft_id')}`")
     with cols[1]:
-        if tid:
-            st.markdown("🔒 **tracked**")
-            st.code(tid[:18] + "…", language=None)
+        if tid or has_pixel:
+            st.markdown("🔒 **tracked** (open pixel)")
+            if tid:
+                st.code(tid[:18] + "…", language=None)
         else:
-            st.warning("untracked")
+            st.warning("untracked — open pixel missing")
 
-    tab_intel, tab_trace, tab_edit = st.tabs(["Intelligence", "Agent Trace", "Edit"])
+    tab_preview, tab_intel, tab_trace, tab_edit = st.tabs(
+        ["Preview", "Intelligence", "Agent Trace", "Edit"]
+    )
+
+    with tab_preview:
+        body = draft.get("body_html") or draft.get("html") or ""
+        if not body:
+            st.info("No HTML body stored for this draft.")
+        else:
+            st.markdown(body, unsafe_allow_html=True)
+            if tid or has_pixel:
+                st.success("Open-tracking pixel present in this draft.")
+            else:
+                st.error("No open-tracking pixel detected.")
+
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("📨 Send now", type="primary", key=f"{key_prefix}_send"):
+                result = _send_draft_now(draft)
+                if result.get("error"):
+                    st.error(result["error"])
+                else:
+                    st.success(
+                        f"Sent · message_id={result.get('message_id')} · "
+                        f"tracking={result.get('tracking_id') or tid or '—'}"
+                    )
+                    # mark drive copy sent
+                    try:
+                        from core import drive_db
+
+                        did = draft.get("draft_id")
+                        if did:
+                            draft["status"] = "sent"
+                            draft["tracking_id"] = result.get("tracking_id") or tid
+                            drive_db.save_draft(did, draft)
+                    except Exception:
+                        pass
+                st.json(result)
+        with s2:
+            if st.button("🔒 Ensure tracking", key=f"{key_prefix}_ensure_track"):
+                updated = _ensure_tracking(draft)
+                draft.update(updated)
+                st.success(f"Tracking id: {draft.get('tracking_id')}")
+                st.rerun()
 
     with tab_intel:
         brief = org_brief or draft.get("org_brief") or {}
@@ -67,6 +126,8 @@ def render_draft_inspector(
         conf = draft.get("confidence")
         if conf is not None:
             st.metric("Confidence", f"{float(conf):.0%}" if float(conf) <= 1 else str(conf))
+        if not brief and not ledger:
+            st.caption("No intelligence brief attached (Chat/Gmail drafts are still sendable).")
 
     with tab_trace:
         events = trace or []
@@ -113,6 +174,7 @@ def render_draft_inspector(
             draft["subject"] = subject
             draft["body_html"] = html
             draft["tracking_id"] = new_tid
+            draft["has_open_pixel"] = True
             did = draft.get("draft_id")
             if did:
                 drive_db.save_draft(did, draft)
@@ -120,3 +182,77 @@ def render_draft_inspector(
             else:
                 st.warning("No draft_id — local only")
             st.markdown(html, unsafe_allow_html=True)
+
+
+def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
+    from core.tracking import inject_tracking
+    from core import drive_db
+
+    html, tid = inject_tracking(
+        draft.get("body_html") or "",
+        tracking_id=draft.get("tracking_id") or None,
+        recipient_email=draft.get("to") or draft.get("recipient") or "",
+        subject=draft.get("subject") or "",
+        register=True,
+    )
+    draft["body_html"] = html
+    draft["tracking_id"] = tid
+    draft["has_open_pixel"] = True
+    did = draft.get("draft_id")
+    if did:
+        try:
+            drive_db.save_draft(did, draft)
+        except Exception:
+            pass
+    # Also update Gmail draft MIME if applicable
+    gmail_id = draft.get("gmail_draft_id") or (
+        str(did).removeprefix("gmail:") if str(did).startswith("gmail:") else ""
+    )
+    if gmail_id:
+        try:
+            from gmail_client.drafts import _update_draft_html
+
+            _update_draft_html(gmail_id, draft, html)
+        except Exception:
+            pass
+    return {"body_html": html, "tracking_id": tid, "has_open_pixel": True}
+
+
+def _send_draft_now(draft: dict[str, Any]) -> dict[str, Any]:
+    """Send Drive or Gmail draft, always ensuring open-tracking pixel."""
+    gmail_id = draft.get("gmail_draft_id") or ""
+    did = str(draft.get("draft_id") or "")
+    if not gmail_id and did.startswith("gmail:"):
+        gmail_id = did.removeprefix("gmail:")
+
+    # Prefer Gmail drafts.send so the existing MIME (with pixel) is used
+    if gmail_id:
+        from gmail_client.drafts import send_gmail_draft
+
+        return send_gmail_draft(gmail_id)
+
+    # Drive-only draft → send via Gmail API preserving tracking_id
+    from gmail_client.send import send_email
+    from core.tracking import inject_tracking
+
+    to = draft.get("to") or draft.get("recipient") or ""
+    if not to:
+        return {"error": "missing recipient"}
+    html, tid = inject_tracking(
+        draft.get("body_html") or "",
+        tracking_id=draft.get("tracking_id") or None,
+        recipient_email=to,
+        subject=draft.get("subject") or "",
+        register=True,
+    )
+    return send_email(
+        to=to,
+        subject=draft.get("subject") or "(no subject)",
+        html_body=html,
+        recipient_name=draft.get("recipient_name") or "",
+        tracking_id=tid,
+        source=draft.get("source") or "drafts_page_send",
+        from_email=draft.get("from") or None,
+        cc=draft.get("cc") or None,
+        include_signature=False,  # already in body if saved with sig
+    )

@@ -177,6 +177,131 @@ def _build_raw_message(
     return raw, tracking_id
 
 
+def create_draft(
+    to: str,
+    subject: str,
+    html_body: str,
+    recipient_name: Optional[str] = None,
+    attachments: Optional[list[dict[str, Any]]] = None,
+    *,
+    track: bool = True,
+    campaign: Optional[str] = None,
+    source: Optional[str] = None,
+    from_email: Optional[str] = None,
+    cc: Optional[str | list[str]] = None,
+    include_signature: bool = True,
+) -> dict[str, Any]:
+    """Create a new Gmail draft for review.
+
+    Tracking is ON by default so open/click pixels survive when you send
+    the draft from Gmail later. Also mirrors a copy into Drive drafts index.
+    """
+    from_addr = from_email or default_from_email()
+    src = (source or "relay_draft").strip() or "relay_draft"
+    if track and "draft" not in src.lower():
+        src = f"{src}_draft"
+    raw, tracking_id = _build_raw_message(
+        to,
+        subject,
+        html_body,
+        recipient_name=recipient_name,
+        attachments=attachments,
+        instrument=track,
+        campaign=campaign,
+        source=src,
+        from_email=from_addr,
+        cc=cc,
+        include_signature=include_signature,
+    )
+    # Keep the instrumented HTML for Drive mirror / Drafts page preview
+    instrumented_html = html_body
+    if track and tracking_id:
+        try:
+            from core.tracking import inject_tracking
+
+            instrumented_html, tracking_id = inject_tracking(
+                append_signature(html_body, from_email=from_addr)
+                if include_signature
+                else html_body,
+                tracking_id=tracking_id,
+                recipient_email=to,
+                subject=subject,
+                register=False,
+            )
+        except Exception:
+            pass
+    try:
+        svc = gmail_service()
+        draft = (
+            svc.users()
+            .drafts()
+            .create(userId="me", body={"message": {"raw": raw}})
+            .execute()
+        )
+        message = draft.get("message") or {}
+        result = {
+            "draft_id": draft.get("id"),
+            "message_id": message.get("id"),
+            "thread_id": message.get("threadId"),
+            "tracking_id": tracking_id,
+            "tracked": bool(track and tracking_id),
+            "from": from_addr,
+            "to": to,
+            "cc": _normalize_cc(cc),
+            "subject": subject,
+            "body_html": instrumented_html,
+        }
+        _mirror_draft_to_drive(result, recipient_name=recipient_name, source=src)
+        return result
+    except Exception as e:
+        print(f"[gmail] create_draft error: {e}", file=sys.stderr)
+        return {
+            "error": str(e),
+            "tracking_id": tracking_id,
+            "tracked": False,
+            "from": from_addr,
+            "to": to,
+            "cc": _normalize_cc(cc),
+            "subject": subject,
+        }
+
+
+def _mirror_draft_to_drive(
+    result: dict[str, Any],
+    *,
+    recipient_name: Optional[str] = None,
+    source: str = "",
+) -> None:
+    """Persist Chat/Schedule drafts so the Drafts page can list/send them."""
+    gmail_id = result.get("draft_id")
+    if not gmail_id or result.get("error"):
+        return
+    try:
+        from core import drive_db
+
+        drive_id = f"gmail:{gmail_id}"
+        drive_db.save_draft(
+            drive_id,
+            {
+                "draft_id": drive_id,
+                "gmail_draft_id": gmail_id,
+                "gmail_message_id": result.get("message_id") or "",
+                "to": result.get("to") or "",
+                "recipient": result.get("to") or "",
+                "recipient_name": recipient_name or "",
+                "cc": result.get("cc") or "",
+                "subject": result.get("subject") or "",
+                "body_html": result.get("body_html") or "",
+                "tracking_id": result.get("tracking_id") or "",
+                "status": "draft",
+                "source": source or "gmail_create_draft",
+                "from": result.get("from") or "",
+            },
+        )
+    except Exception as e:
+        print(f"[gmail] drive draft mirror skipped: {e}", file=sys.stderr)
+
+
 def send_email(
     to: str,
     subject: str,
@@ -189,21 +314,57 @@ def send_email(
     from_email: Optional[str] = None,
     cc: Optional[str | list[str]] = None,
     include_signature: bool = True,
+    tracking_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Send an HTML email via Gmail with open/click tracking."""
-    raw, tracking_id = _build_raw_message(
-        to,
-        subject,
-        html_body,
-        recipient_name=recipient_name,
-        attachments=attachments,
-        instrument=True,
-        campaign=campaign,
-        source=source,
-        from_email=from_email,
-        cc=cc,
-        include_signature=include_signature,
-    )
+    """Send an HTML email via Gmail with open/click tracking.
+
+    If tracking_id is provided, re-inject that same id (preserve draft tracking).
+    """
+    body = html_body
+    tid = tracking_id or ""
+    if tid:
+        try:
+            from core.tracking import inject_tracking
+
+            body, tid = inject_tracking(
+                body,
+                tracking_id=tid,
+                recipient_email=to,
+                subject=subject or "",
+                prospect_source=source or "relay_send",
+                recipient_name=recipient_name or "",
+                register=True,
+            )
+        except Exception as e:
+            print(f"[gmail] preserve-tracking inject failed: {e}", file=sys.stderr)
+        raw, built_tid = _build_raw_message(
+            to,
+            subject,
+            body,
+            recipient_name=recipient_name,
+            attachments=attachments,
+            instrument=False,
+            campaign=campaign,
+            source=source,
+            from_email=from_email,
+            cc=cc,
+            include_signature=include_signature,
+        )
+        tracking_id = tid or built_tid
+    else:
+        raw, tracking_id = _build_raw_message(
+            to,
+            subject,
+            html_body,
+            recipient_name=recipient_name,
+            attachments=attachments,
+            instrument=True,
+            campaign=campaign,
+            source=source,
+            from_email=from_email,
+            cc=cc,
+            include_signature=include_signature,
+        )
     try:
         svc = gmail_service()
         sent = (
@@ -223,75 +384,6 @@ def send_email(
     except Exception as e:
         print(f"[gmail] send error: {e}", file=sys.stderr)
         return {"error": str(e), "tracking_id": tracking_id}
-
-
-def create_draft(
-    to: str,
-    subject: str,
-    html_body: str,
-    recipient_name: Optional[str] = None,
-    attachments: Optional[list[dict[str, Any]]] = None,
-    *,
-    track: bool = True,
-    campaign: Optional[str] = None,
-    source: Optional[str] = None,
-    from_email: Optional[str] = None,
-    cc: Optional[str | list[str]] = None,
-    include_signature: bool = True,
-) -> dict[str, Any]:
-    """Create a new Gmail draft for review.
-
-    Tracking is ON by default so open/click pixels survive when you send
-    the draft from Gmail later.
-    """
-    from_addr = from_email or default_from_email()
-    src = (source or "relay_draft").strip() or "relay_draft"
-    if track and "draft" not in src.lower():
-        src = f"{src}_draft"
-    raw, tracking_id = _build_raw_message(
-        to,
-        subject,
-        html_body,
-        recipient_name=recipient_name,
-        attachments=attachments,
-        instrument=track,
-        campaign=campaign,
-        source=src,
-        from_email=from_addr,
-        cc=cc,
-        include_signature=include_signature,
-    )
-    try:
-        svc = gmail_service()
-        draft = (
-            svc.users()
-            .drafts()
-            .create(userId="me", body={"message": {"raw": raw}})
-            .execute()
-        )
-        message = draft.get("message") or {}
-        return {
-            "draft_id": draft.get("id"),
-            "message_id": message.get("id"),
-            "thread_id": message.get("threadId"),
-            "tracking_id": tracking_id,
-            "tracked": bool(track and tracking_id),
-            "from": from_addr,
-            "to": to,
-            "cc": _normalize_cc(cc),
-            "subject": subject,
-        }
-    except Exception as e:
-        print(f"[gmail] create_draft error: {e}", file=sys.stderr)
-        return {
-            "error": str(e),
-            "tracking_id": tracking_id,
-            "tracked": False,
-            "from": from_addr,
-            "to": to,
-            "cc": _normalize_cc(cc),
-            "subject": subject,
-        }
 
 
 def create_drafts(
@@ -378,6 +470,7 @@ def send_bulk_serial(
                 from_email=job.get("from_email") or job.get("from"),
                 cc=job.get("cc") or job.get("cc_emails"),
                 include_signature=job.get("include_signature", True),
+                tracking_id=tracking_id,
             )
             if tracking_id and not result.get("tracking_id"):
                 result["tracking_id"] = tracking_id
