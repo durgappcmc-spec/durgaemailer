@@ -80,12 +80,42 @@ def sheet_id() -> str:
 
 
 _TAB_OK: set[str] = set()
+_SSL_FAILS = 0
+_SSL_BREAKER_UNTIL = 0.0
+_SSL_BREAKER_SEC = float(os.getenv("RELAY_SHEETS_SSL_COOLDOWN_SEC", "300") or 300)
+_SSL_FAIL_TRIP = int(os.getenv("RELAY_SHEETS_SSL_FAIL_TRIP", "2") or 2)
+
+
+def is_sheets_degraded() -> bool:
+    """True while Sheets HTTPS is circuit-broken (skip ensure/mirror thrash)."""
+    return time.time() < _SSL_BREAKER_UNTIL
+
+
+def _trip_sheets_ssl(exc: BaseException) -> None:
+    global _SSL_FAILS, _SSL_BREAKER_UNTIL
+    msg = str(exc).lower()
+    if not any(
+        x in msg
+        for x in ("ssl", "record layer", "timeout", "timed out", "connection")
+    ):
+        return
+    _SSL_FAILS += 1
+    if _SSL_FAILS < max(1, _SSL_FAIL_TRIP):
+        return
+    _SSL_BREAKER_UNTIL = time.time() + max(60.0, _SSL_BREAKER_SEC)
+    print(
+        f"[sheets] SSL circuit open for {int(_SSL_BREAKER_SEC)}s after "
+        f"{_SSL_FAILS} failures — pausing AppState ensure/mirror ({exc})",
+        file=sys.stderr,
+    )
 
 
 def ensure_tab(title: str, headers: list[str]) -> bool:
     """Create a sheet tab with header row if missing. Cached per process."""
     if title in _TAB_OK:
         return True
+    if is_sheets_degraded():
+        return False
     sid = sheet_id()
     svc = sheets_service()
     if not sid or not svc:
@@ -123,5 +153,6 @@ def ensure_tab(title: str, headers: list[str]) -> bool:
         _TAB_OK.add(title)
         return True
     except Exception as e:
+        _trip_sheets_ssl(e)
         print(f"[sheets] ensure_tab {title} failed: {e}", file=sys.stderr)
         return False

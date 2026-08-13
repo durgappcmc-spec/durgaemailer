@@ -2617,7 +2617,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     )
                 yield (
                     f"Searching **{', '.join(providers)}** "
-                    f"(Google → LinkedIn → ZoomInfo for CSR first, then broader contacts; "
+                    f"(ZoomInfo CSR emails first; if none, Google CSR Head email "
+                    f"+ LinkedIn → ZoomInfo; then broader contacts; "
                     f"limit **{limit}**)…\n"
                 )
                 results = search_all(

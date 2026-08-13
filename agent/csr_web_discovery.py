@@ -1,4 +1,5 @@
 # NOTE: Google/DDG find CSR LinkedIn profiles, then ZoomInfo enrich (titles on ZI are often stale).
+# Also: Google "CSR Head email {company}" when ZoomInfo has no CSR emails.
 from __future__ import annotations
 
 import json
@@ -19,6 +20,24 @@ from connectors.zoominfo import (
 _LINKEDIN_RE = re.compile(
     r"https?://(?:[\w.-]+\.)?linkedin\.com/in/([\w\-%]+)/?",
     re.I,
+)
+_EMAIL_RE = re.compile(
+    r"\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b"
+)
+_GENERIC_EMAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "yahoo.com",
+        "yahoo.co.in",
+        "hotmail.com",
+        "outlook.com",
+        "icloud.com",
+        "protonmail.com",
+        "aol.com",
+        "live.com",
+        "msn.com",
+        "rediffmail.com",
+    }
 )
 
 
@@ -108,6 +127,179 @@ def discover_csr_via_web_then_zoominfo(
 
     out.sort(key=_contact_relevance_key)
     return out[:limit]
+
+
+def discover_csr_emails_via_google(
+    *,
+    company: str,
+    domains: Optional[list[str]] = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Google Search for public CSR Head / Head of CSR emails at a company.
+
+    Used when ZoomInfo company/title search returned no CSR contacts with email.
+    Never invents addresses — only emails that appear in grounded search notes.
+    """
+    company = (company or "").strip()
+    if not company or limit <= 0:
+        return []
+
+    domains = [str(d).strip().lower() for d in (domains or []) if str(d).strip()]
+    domain_hint = ", ".join(domains[:3]) if domains else "(official company domain)"
+
+    try:
+        from core.llm import extract_json, grounded_collect
+    except Exception as e:
+        print(f"[csr_web] email search unavailable: {e}", file=sys.stderr)
+        return []
+
+    prompt = f"""Search Google for CSR / Sustainability head emails at "{company}".
+
+Try queries like:
+- "{company}" "CSR Head" email
+- "{company}" "Head of CSR" email
+- "{company}" "Head CSR" email OR contact
+- "{company}" CSR Sustainability email @{domain_hint if domains else 'company'}
+
+Find publicly listed email addresses for people whose role is CSR, Head of CSR,
+CSR & Sustainability, ESG, or Corporate Social Responsibility at {company}.
+Prefer @{domain_hint} addresses when available.
+
+Return a short note listing name, title, and email only when clearly published.
+Do not invent emails.
+"""
+    try:
+        notes, sources = grounded_collect(
+            prompt,
+            system=(
+                "Find public CSR Head / Head of CSR emails via Google Search. "
+                "Never invent email addresses. If unsure, omit."
+            ),
+        )
+    except Exception as e:
+        print(f"[csr_web] Google CSR email search failed: {e}", file=sys.stderr)
+        return []
+
+    blob_text = notes or ""
+    for src in sources or []:
+        blob_text += "\n" + str(src.get("url") or "") + " " + str(src.get("title") or "")
+
+    raw = ""
+    try:
+        raw = extract_json(
+            f"""Extract CSR contact emails from these Google Search notes for {company}.
+
+Notes:
+{blob_text[:9000]}
+
+Return JSON:
+{{"contacts":[{{"name":"Full Name or empty","title":"CSR Head or similar","email":"a@b.com","linkedin_url":""}}]}}
+
+Rules:
+- Only include emails that appear in the notes.
+- Prefer CSR / Sustainability / ESG titles.
+- Max {limit} contacts.
+- Never invent emails.
+""",
+            system="Return JSON only. Never invent email addresses.",
+            max_tokens=900,
+        )
+    except Exception as e:
+        print(f"[csr_web] CSR email JSON extract failed: {e}", file=sys.stderr)
+
+    contacts: list[dict[str, Any]] = []
+    try:
+        data = json.loads(raw or "{}") if raw else {}
+    except Exception:
+        data = _extract_json_object(raw or "") or {}
+    if isinstance(data, dict):
+        for row in data.get("contacts") or []:
+            if not isinstance(row, dict):
+                continue
+            email = (row.get("email") or "").strip().lower()
+            if not _is_plausible_csr_email(email, domains):
+                continue
+            title = (row.get("title") or "CSR Head").strip() or "CSR Head"
+            name = (row.get("name") or "").strip()
+            if name and "@" in name:
+                name = ""
+            first = name.split()[0] if name else ""
+            contacts.append(
+                {
+                    "name": name,
+                    "first_name": first,
+                    "email": email,
+                    "title": title,
+                    "company": company,
+                    "linkedin_url": _normalize_linkedin(
+                        row.get("linkedin_url") or row.get("linkedin") or ""
+                    ),
+                    "location": "",
+                    "source": "google_csr_email",
+                    "source_id": email,
+                    "matched_on": "Google CSR Head email",
+                }
+            )
+
+    # Harvest any leftover emails from notes that look corporate
+    seen = {(c.get("email") or "").lower() for c in contacts}
+    for m in _EMAIL_RE.finditer(blob_text):
+        if len(contacts) >= limit:
+            break
+        email = m.group(1).strip().lower()
+        if email in seen or not _is_plausible_csr_email(email, domains):
+            continue
+        # Require CSR context near the email in notes
+        start = max(0, m.start() - 80)
+        end = min(len(blob_text), m.end() + 80)
+        ctx = blob_text[start:end].lower()
+        if not re.search(r"\bcsr\b|sustainab|esg\b|corporate\s+social", ctx):
+            if domains and not any(email.endswith("@" + d) for d in domains):
+                continue
+        seen.add(email)
+        contacts.append(
+            {
+                "name": "",
+                "first_name": "",
+                "email": email,
+                "title": "CSR Head",
+                "company": company,
+                "linkedin_url": "",
+                "location": "",
+                "source": "google_csr_email",
+                "source_id": email,
+                "matched_on": "Google CSR Head email",
+            }
+        )
+
+    print(
+        f"[csr_web] Google CSR emails found {len(contacts)} for {company!r}",
+        file=sys.stderr,
+    )
+    return contacts[:limit]
+
+
+def _is_plausible_csr_email(email: str, domains: list[str]) -> bool:
+    email = (email or "").strip().lower()
+    if not email or not re.match(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$", email):
+        return False
+    try:
+        from core.prospect_list import email_blocked_for_company_search
+
+        if email_blocked_for_company_search(email):
+            return False
+    except Exception:
+        pass
+    domain = email.rsplit("@", 1)[-1]
+    if domain in _GENERIC_EMAIL_DOMAINS:
+        return False
+    # If we know company domains, prefer them (but allow other corporate domains)
+    if domains:
+        if any(domain == d or domain.endswith("." + d) for d in domains):
+            return True
+        # Soft allow other non-generic domains (press releases sometimes use parent brand)
+        return "." in domain and len(domain) > 4
+    return "." in domain and len(domain) > 4
 
 
 def find_csr_linkedin_candidates(

@@ -94,10 +94,20 @@ def _local_is_miss(payload: Any) -> bool:
 def _ensure_app_state() -> bool:
     if APP_STATE_TAB in _ENSURED_TABS:
         return True
+    try:
+        from core.google_sheets import is_sheets_degraded
+
+        # AppState tab almost always exists — don't hammer Sheets during SSL flakes
+        if is_sheets_degraded():
+            return True
+    except Exception:
+        pass
     ok = ensure_tab(APP_STATE_TAB, ["key", "chunk", "value", "updated_at"])
     if ok:
         _ENSURED_TABS.add(APP_STATE_TAB)
-    return ok
+        return True
+    # Soft-allow reads/writes: ensure failed but tab is usually already there
+    return True
 
 
 def _read_appstate_map(*, force: bool = False) -> dict[str, str]:
@@ -146,6 +156,12 @@ def _read_appstate_map(*, force: bool = False) -> dict[str, str]:
         return dict(flat)
     except Exception as e:
         print(f"[durable] appstate read failed: {e}", file=sys.stderr)
+        try:
+            from core.google_sheets import _trip_sheets_ssl
+
+            _trip_sheets_ssl(e)
+        except Exception:
+            pass
         return {}
 
 
@@ -240,6 +256,14 @@ def _protect_drive_upload(key: str, payload: Any, *, allow_empty: bool) -> Any:
     # concurrent Gmail-only save or a stale in-memory cache.
     if key == "prospect_list" and isinstance(existing, list) and isinstance(payload, list):
         merged = _merge_prospect_lists(existing, payload)
+        # Scrub mailbox / marketplace noise BEFORE writing back to Drive,
+        # otherwise every save rehydrates ~gmail rows and thrash 96↔63.
+        try:
+            from core.prospect_list import _scrub_mailbox_noise
+
+            merged = _scrub_mailbox_noise(merged)
+        except Exception:
+            pass
         if len(merged) != new_n or len(merged) != old_n:
             print(
                 f"[durable] merge Drive {key}: cloud={old_n} local={new_n} → {len(merged)}",
@@ -338,6 +362,9 @@ def save_json_blob(
                 if to_upload is None:
                     drive_ok = True  # intentionally skipped (protect cloud)
                 else:
+                    # Keep local cache aligned with what we actually upload
+                    if to_upload is not payload:
+                        _save_local(key, to_upload)
                     drive_ok = bool(
                         upload_json(_DRIVE_FILE.get(key, f"{key}.json"), to_upload)
                     )
@@ -347,18 +374,36 @@ def save_json_blob(
         # Second durable store: Sheets AppState (survives if Drive folder drifts)
         if key in ("prospect_list", "memory_rows", "contact_aliases", "chat_messages"):
             try:
-                if to_upload is not None and (
-                    not _is_empty_payload(to_upload) or allow_empty
-                ):
-                    text = json.dumps(to_upload, ensure_ascii=False, default=str)
-                    sheets_ok = _write_appstate_key(key, text)
-                    if sheets_ok:
-                        print(
-                            f"[durable] mirrored {key} to Sheets AppState",
-                            file=sys.stderr,
-                        )
-            except Exception as e:
-                print(f"[durable] sheets mirror {key} failed: {e}", file=sys.stderr)
+                from core.google_sheets import is_sheets_degraded
+
+                sheets_paused = is_sheets_degraded()
+            except Exception:
+                sheets_paused = False
+            if sheets_paused:
+                print(
+                    f"[durable] skip Sheets mirror {key} (ssl circuit open)",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    if to_upload is not None and (
+                        not _is_empty_payload(to_upload) or allow_empty
+                    ):
+                        text = json.dumps(to_upload, ensure_ascii=False, default=str)
+                        sheets_ok = _write_appstate_key(key, text)
+                        if sheets_ok:
+                            print(
+                                f"[durable] mirrored {key} to Sheets AppState",
+                                file=sys.stderr,
+                            )
+                except Exception as e:
+                    print(f"[durable] sheets mirror {key} failed: {e}", file=sys.stderr)
+                    try:
+                        from core.google_sheets import _trip_sheets_ssl
+
+                        _trip_sheets_ssl(e)
+                    except Exception:
+                        pass
         # Sheets mirror counts as durable when Drive SSL is circuit-broken
         if not drive_ok:
             try:

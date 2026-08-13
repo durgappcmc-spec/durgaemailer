@@ -38,3 +38,25 @@ def test_prefer_google_csr_title_over_wrong_zi():
     assert merged.get("email") == "anupam.das@stl.tech"
     assert "linkedin.com/in/anupam-das" in (merged.get("linkedin_url") or "")
     assert merged.get("zi_title") == "Manager"
+
+
+def test_plausible_csr_email_filters():
+    from agent.csr_web_discovery import _is_plausible_csr_email
+
+    assert _is_plausible_csr_email("anupam.das@stl.tech", ["stl.tech"]) is True
+    assert _is_plausible_csr_email("x@gmail.com", ["stl.tech"]) is False
+    assert _is_plausible_csr_email("a@indiamart.com", ["stl.tech"]) is False
+    assert _is_plausible_csr_email("not-an-email", []) is False
+
+
+def test_contact_relevance_csr_email_beats_csr_without():
+    from connectors.zoominfo import _contact_relevance_key
+
+    rows = [
+        {"name": "No Mail", "title": "Head CSR", "email": ""},
+        {"name": "With Mail", "title": "Head CSR", "email": "a@stl.tech"},
+        {"name": "Engineer", "title": "Engineer", "email": "e@stl.tech"},
+    ]
+    ranked = sorted(rows, key=_contact_relevance_key)
+    assert ranked[0]["name"] == "With Mail"
+

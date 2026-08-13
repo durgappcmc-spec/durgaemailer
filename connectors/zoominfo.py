@@ -185,41 +185,13 @@ class ZoomInfoConnector(ProspectConnector):
             names = _join(cn_list)
             rank_needle = names
 
-        # Google → LinkedIn → ZoomInfo enrich FIRST for corporate CSR searches.
-        # Public titles are often more accurate than ZoomInfo's jobTitle field.
-        if (
-            names
-            and not _is_nonprofit_query(query)
-            and not query.get("skip_web_csr")
-            and not (query.get("linkedin_url") or query.get("linkedin"))
-        ):
-            try:
-                from agent.csr_web_discovery import discover_csr_via_web_then_zoominfo
+        company_hits: list[dict[str, Any]] = []
+        cascade_titles: list[str] = []
+        expand = True
+        domain_list: list[str] = []
 
-                domains = query.get("company_domains") or query.get("domains") or []
-                if isinstance(domains, str):
-                    domains = [domains] if domains.strip() else []
-                web_n = min(max(limit // 2, 3), limit)
-                web_hits = discover_csr_via_web_then_zoominfo(
-                    company=rank_needle or names.split(",")[0],
-                    domains=[str(d) for d in domains if d],
-                    limit=web_n,
-                    zi=self,
-                )
-                if web_hits:
-                    results.extend(web_hits)
-                    print(
-                        f"[zoominfo] web→LI→ZI CSR: {len(web_hits)} contacts "
-                        f"for {rank_needle!r}",
-                        file=sys.stderr,
-                    )
-            except Exception as e:
-                print(f"[zoominfo] web CSR discovery skipped: {e}", file=sys.stderr)
-
-        # Company-first: resolve firm via /search/company, then contacts by
-        # companyId. Free-text companyName on /search/contact is unreliable for
-        # short names like "sterlite tech" (often 0 hits after we stopped
-        # merging polluted Saved-list rows).
+        # 1) ZoomInfo company-first CSR title cascade FIRST (emails from ZI).
+        #    Do not expand to non-CSR yet — keep slots for CSR email fallbacks.
         if names or _is_nonprofit_query(query):
             company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
             company_hits = _rank_companies_for_query(company_hits, rank_needle)
@@ -228,24 +200,116 @@ class ZoomInfoConnector(ProspectConnector):
             if isinstance(domains, str):
                 domains = [domains] if domains.strip() else []
             domain_list = [str(d) for d in domains if d]
-            remaining = max(limit - len(results), 0)
-            if remaining and (company_hits or domain_list):
+            if company_hits or domain_list:
                 results.extend(
                     self._contacts_for_companies(
                         company_hits[:5] if company_hits else [],
-                        limit=remaining,
+                        limit=limit,
                         titles=cascade_titles,
-                        expand=expand,
+                        expand=False,
                         domains=domain_list,
                     )
                 )
                 print(
-                    f"[zoominfo] company-first: {len(company_hits)} firms → "
-                    f"{len(results)} contacts total (q={rank_needle!r}, "
-                    f"titles={cascade_titles[:3]!r}{'…' if len(cascade_titles) > 3 else ''}, "
-                    f"domains={domain_list!r}, expand={expand})",
+                    f"[zoominfo] company-first CSR: {len(company_hits)} firms → "
+                    f"{len(results)} contacts (q={rank_needle!r}, "
+                    f"titles={cascade_titles[:3]!r}"
+                    f"{'…' if len(cascade_titles) > 3 else ''}, "
+                    f"domains={domain_list!r})",
                     file=sys.stderr,
                 )
+
+        def _csr_with_email(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                p
+                for p in rows
+                if (p.get("email") or "").strip()
+                and _CSR_TITLE_RE.search(str(p.get("title") or p.get("jobTitle") or ""))
+            ]
+
+        # Keep emailed CSR when available (free slots from email-less CSR stubs)
+        if _csr_with_email(results):
+            results = [
+                p
+                for p in results
+                if (p.get("email") or "").strip()
+                or not _CSR_TITLE_RE.search(
+                    str(p.get("title") or p.get("jobTitle") or "")
+                )
+            ]
+
+        # 2) If ZoomInfo found no CSR emails → Google "CSR Head email {company}"
+        #    plus LinkedIn → ZoomInfo enrich (public titles are often better).
+        if (
+            names
+            and not _csr_with_email(results)
+            and not _is_nonprofit_query(query)
+            and not query.get("skip_web_csr")
+            and not (query.get("linkedin_url") or query.get("linkedin"))
+        ):
+            company_label = rank_needle or names.split(",")[0]
+            remaining = max(limit - len(results), 3)
+            try:
+                from agent.csr_web_discovery import (
+                    discover_csr_emails_via_google,
+                    discover_csr_via_web_then_zoominfo,
+                )
+
+                email_hits = discover_csr_emails_via_google(
+                    company=company_label,
+                    domains=domain_list,
+                    limit=min(remaining, 5),
+                )
+                if email_hits:
+                    results.extend(email_hits)
+                    print(
+                        f"[zoominfo] Google CSR emails: +{len(email_hits)} "
+                        f"for {company_label!r}",
+                        file=sys.stderr,
+                    )
+
+                if not _csr_with_email(results):
+                    web_n = min(max(remaining, 3), limit)
+                    web_hits = discover_csr_via_web_then_zoominfo(
+                        company=company_label,
+                        domains=domain_list,
+                        limit=web_n,
+                        zi=self,
+                    )
+                    # Prefer enriched rows that actually have email
+                    with_mail = [h for h in web_hits if (h.get("email") or "").strip()]
+                    add = with_mail or web_hits
+                    if add:
+                        results.extend(add)
+                        print(
+                            f"[zoominfo] Google→LI→ZI CSR: +{len(add)} "
+                            f"({len(with_mail)} with email) for {company_label!r}",
+                            file=sys.stderr,
+                        )
+            except Exception as e:
+                print(f"[zoominfo] Google CSR fallback skipped: {e}", file=sys.stderr)
+
+        # 3) Still under limit → broaden to other contacts at the firm
+        if (
+            expand
+            and (company_hits or domain_list)
+            and len(results) < limit
+        ):
+            remaining = limit - len(results)
+            results.extend(
+                self._contacts_for_companies(
+                    company_hits[:5] if company_hits else [],
+                    limit=remaining,
+                    titles=[],
+                    expand=True,
+                    domains=domain_list,
+                )
+            )
+            print(
+                f"[zoominfo] expand non-CSR: total={len(results)} "
+                f"(limit={limit})",
+                file=sys.stderr,
+            )
 
         body = _build_contact_search_body(query, limit=limit)
         if not body and not results:
@@ -309,7 +373,7 @@ class ZoomInfoConnector(ProspectConnector):
                 if not results:
                     return [{"source": self.name, "error": str(e)}]
 
-        # Dedupe; prefer CSR/Sustainability titles, then rows that have email
+        # Dedupe; prefer CSR contacts that have email
         seen: set[str] = set()
         merged: list[dict[str, Any]] = []
         for p in sorted(results, key=_contact_relevance_key):
@@ -488,11 +552,20 @@ class ZoomInfoConnector(ProspectConnector):
                 ),
             )
             if prefer_csr:
-                ranked = [
+                csr_only = [
                     r
                     for r in ranked
                     if _CSR_TITLE_RE.search(str(r.get("jobTitle") or ""))
-                ] or ranked
+                ]
+                if csr_only:
+                    with_email = [
+                        r
+                        for r in csr_only
+                        if r.get("hasEmail") or r.get("hasSupplementalEmail")
+                    ]
+                    # Prefer CSR rows ZoomInfo flags as having email
+                    ranked = with_email or csr_only
+                # else keep full ranked (title filter may have been too strict)
             before = len(out)
             batch = self._enrich_contact_rows(ranked, limit=limit - len(out))
             for p in batch:
@@ -1222,16 +1295,17 @@ _STL_EMAIL_RE = re.compile(r"@(?:stl\.tech|sterlitetech\.com)\b", re.I)
 
 
 def _contact_relevance_key(row: dict[str, Any]) -> tuple:
-    """Sort key: CSR/Sustainability titles first, then stl.tech emails, then any email."""
+    """Sort key: CSR-with-email first, then CSR, then stl.tech, then any email."""
     title = str(row.get("title") or row.get("jobTitle") or "")
     email = str(row.get("email") or "").strip().lower()
-    csr = 0 if _CSR_TITLE_RE.search(title) else 1
-    # Stronger boost when title literally has CSR (Anupam / Swati style)
+    is_csr = bool(_CSR_TITLE_RE.search(title))
+    # 0 = CSR + email, 1 = CSR no email, 2 = non-CSR
+    csr_tier = 0 if (is_csr and email) else (1 if is_csr else 2)
     csr_strong = 0 if re.search(r"\bcsr\b", title, re.I) else 1
     stl = 0 if email and _STL_EMAIL_RE.search(email) else 1
     has_email = 0 if email else 1
     name = str(row.get("name") or "").lower()
-    return (csr, csr_strong, stl, has_email, name)
+    return (csr_tier, csr_strong, stl, has_email, name)
 
 NGO_TITLE_PRIORITY: list[str] = [
     "Founder",

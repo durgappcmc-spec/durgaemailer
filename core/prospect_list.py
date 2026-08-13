@@ -137,11 +137,18 @@ def _persist(rows: list[dict[str, Any]]) -> bool:
     _CACHE = slimmed
     _LOADED = True
     try:
-        from core.durable_store import save_json_blob
+        from core.durable_store import _load_local, save_json_blob
 
         ok = bool(save_json_blob("prospect_list", slimmed[-1000:]))
+        # Align in-memory cache with merged/scrubbed payload written to Drive
+        try:
+            written = _load_local("prospect_list")
+            if isinstance(written, list) and written:
+                _CACHE = [r for r in written if isinstance(r, dict)]
+        except Exception:
+            pass
         print(
-            f"[prospect_list] persist n={len(slimmed)} drive_ok={ok}",
+            f"[prospect_list] persist n={len(_CACHE or slimmed)} drive_ok={ok}",
             file=sys.stderr,
         )
         if not ok:
