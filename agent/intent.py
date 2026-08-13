@@ -397,6 +397,54 @@ def resolve_like_sent_from_history(
     return out
 
 
+def parse_explicit_draft_company(user_msg: str) -> str:
+    """Extract company from 'draft to Sterlite Tech like …' / 'to Sterlite Tech'."""
+    msg = (user_msg or "").strip()
+    if not msg:
+        return ""
+    company = (
+        r"([A-Za-z0-9][A-Za-z0-9&.\'\-]*"
+        r"(?:\s+(?!for\b|about\b|targeting\b|like\b|as\b|cc\b|from\b|and\b|with\b|"
+        r"in\b|sent\b|items?\b|using\b|based\b)"
+        r"[A-Za-z0-9][A-Za-z0-9&.\'\-]*){0,6})"
+    )
+    patterns = [
+        # draft/create … to Sterlite Tech like email@…
+        rf"\b(?:draft|create|compose|write|make|send)\b.{{0,40}}?\bto\s+{company}"
+        rf"(?=\s+like\b|\s+similar\b|\s*[.?!]|$)",
+        # to Sterlite Tech like …
+        rf"\bto\s+{company}\s+(?=like\b|similar\b)",
+        # for Sterlite Tech (when like-sent is also present)
+        rf"\b(?:for|about|targeting)\s+{company}"
+        rf"(?=\s+like\b|\s+similar\b|\s*[.?!]|$)",
+    ]
+    stop_tail = re.compile(
+        r"\s+\b(?:and|with|cc|from|subject|attach|draft|send|please|thanks|"
+        r"using|based|that|which|who|like|similar|as|in|sent|items?)\b.*$",
+        re.I,
+    )
+    for pat in patterns:
+        m = re.search(pat, msg, re.I | re.S)
+        if not m:
+            continue
+        name = (m.group(1) or "").strip(" .,;:!?'\"")
+        name = stop_tail.sub("", name).strip(" .,;:")
+        # Reject pronouns / vague words
+        if not name or len(name) < 2:
+            continue
+        if re.match(
+            r"^(them|him|her|that|this|it|above|previous|prior|earlier|last|"
+            r"everyone|all|contacts?|prospects?|people|list|chat|email|mail)$",
+            name,
+            re.I,
+        ):
+            continue
+        if "@" in name:
+            continue
+        return name
+    return ""
+
+
 def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
     """Detect 'create email like sent to IndiaMART' or 'like info@x.org in sent'.
 
@@ -412,12 +460,12 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
     company = (
         r"([A-Za-z0-9][A-Za-z0-9&.\'\-]*"
         r"(?:\s+(?!for\b|about\b|targeting\b|to\b|cc\b|from\b|and\b|with\b|"
-        r"in\b|from\b|sent\b|items?\b)"
+        r"in\b|from\b|sent\b|items?\b|like\b)"
         r"[A-Za-z0-9][A-Za-z0-9&.\'\-]*){0,6})"
     )
     stop_tail = re.compile(
         r"\s+\b(?:and|with|cc|from|subject|attach|draft|send|please|thanks|"
-        r"using|based|that|which|who|to|in|sent|items?)\b.*$",
+        r"using|based|that|which|who|to|in|sent|items?|like)\b.*$",
         re.I,
     )
 
@@ -427,6 +475,9 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
         return name
 
     def _target_from_msg(reference: str) -> str:
+        explicit = parse_explicit_draft_company(msg)
+        if explicit and explicit.lower() != reference.lower():
+            return explicit
         for fm in re.finditer(
             rf"\b(?:for|about|targeting)\s+{company}",
             msg,
@@ -439,6 +490,8 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
 
     # --- Email-address references (highest priority) ---
     email_patterns = [
+        # draft to Sterlite Tech like info@x.org
+        rf"\blike\s+{email_pat}",
         # create draft email like info@x.org in sent [items]
         rf"(?:create|write|draft|compose|make)\s+(?:an?\s+)?(?:similar\s+)?"
         rf"(?:email|mail|message).{{0,60}}?like\s+{email_pat}"
@@ -508,13 +561,25 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
 
 
 def wants_previous_chat_recipient(user_msg: str) -> bool:
-    """True when user wants the To address from earlier chat, not the template."""
+    """True when user wants the To address from earlier chat, not the template.
+
+    'Use the previous email from chat' + 'draft to Sterlite like X@y.com' means
+    reuse the *body/style*, not the prior To (e.g. Magic Bus). Explicit company
+    or like-sent email → do not steal recipients from chat history.
+    """
     msg = user_msg or ""
+    if parse_explicit_draft_company(msg):
+        return False
+    if parse_like_sent_request(msg):
+        # Style clone — recipients come from named company / prospect list
+        return False
     return bool(
         re.search(
             r"\b("
             r"(?:previous|prior|earlier|same|last)\s+"
-            r"(?:email|recipient|contact|address|person|one|org|organisation|organization)|"
+            r"(?:recipient|contact|address|person|one|org|organisation|organization)|"
+            r"(?:previous|prior|earlier|same|last)\s+email\s+"
+            r"(?:recipient|address|to|contact)|"
             r"as per (?:the )?chat|"
             r"from (?:the )?(?:chat|history|conversation)|"
             r"current (?:org|organisation|organization|company|prospect)|"
@@ -530,6 +595,8 @@ def wants_previous_chat_recipient(user_msg: str) -> bool:
 def wants_prospect_list_recipients(user_msg: str) -> bool:
     """True when To should be the last ZoomInfo / prospect search (e.g. 'to above')."""
     msg = user_msg or ""
+    if parse_explicit_draft_company(msg):
+        return True
     return bool(
         re.search(
             r"\b("
@@ -824,6 +891,8 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     like_sent = parse_like_sent_request(msg)
     like_sent_to = (like_sent or {}).get("reference") or ""
     like_sent_for = (like_sent or {}).get("target") or ""
+    if not like_sent_for:
+        like_sent_for = parse_explicit_draft_company(msg)
     like_sent_message_id = parse_gmail_message_id(msg)
     clone_from_hist = looks_like_history_email_clone(msg)
     clone_from_index = parse_mailbox_list_index(msg) is not None and bool(
@@ -1098,6 +1167,8 @@ Return JSON:
     )
     like_sent_to = resolved.get("reference") or like_sent_to
     like_sent_for = resolved.get("target") or like_sent_for
+    if not like_sent_for:
+        like_sent_for = parse_explicit_draft_company(user_msg)
     like_sent_message_id = resolved.get("message_id") or like_sent_message_id
     if like_sent_to and "@" in like_sent_to:
         to_emails = [
@@ -1105,8 +1176,12 @@ Return JSON:
         ]
         exclude.add(like_sent_to.lower())
 
-    # For like-sent / "previous email as per chat", take To from recent history
-    if (
+    # Named company target (e.g. Sterlite) → never pull Magic Bus To from history
+    explicit_company = parse_explicit_draft_company(user_msg) or like_sent_for
+    if explicit_company or wants_prospect_list_recipients(user_msg):
+        to_emails = []
+    # For like-sent / "previous recipient as per chat", take To from recent history
+    elif (
         like_sent_to or like_sent_message_id or wants_previous_chat_recipient(user_msg)
     ) and not to_emails:
         to_emails = resolve_to_emails_from_history(history, exclude=exclude)

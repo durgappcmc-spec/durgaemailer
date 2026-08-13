@@ -20,6 +20,7 @@ from agent.intent import (
     filter_recipient_emails,
     org_label_from_email,
     parse_contact_search_company,
+    parse_explicit_draft_company,
     parse_gmail_message_id,
     parse_like_sent_request,
     parse_mailbox_list_index,
@@ -2827,11 +2828,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             like_ref = dom.group(1).split(".")[0]
 
             if like_ref or like_mid:
-                # Clone angle from a prior sent email → draft to chat/prospect recipients
+                # Clone angle from a prior sent email → draft to named company /
+                # last-search prospects — never the Sent template (Magic Bus / IndiaMART).
+                explicit_company = (
+                    parse_explicit_draft_company(user_msg or "")
+                    or (like_for or "").strip()
+                )
                 use_prospect_batch = bool(
                     _prospects_with_email(prospects)
                     and (
-                        wants_prospect_list_recipients(user_msg or "")
+                        bool(explicit_company)
+                        or wants_prospect_list_recipients(user_msg or "")
                         or (
                             not plan.to_emails
                             and not wants_previous_chat_recipient(user_msg or "")
@@ -2839,12 +2846,14 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     )
                 )
                 target_company = _infer_like_sent_target(
-                    explicit=like_for,
+                    explicit=explicit_company or like_for,
                     reference=like_ref,
                     prospects=prospects,
                     history=history,
-                    prefer_per_prospect=use_prospect_batch and not like_for,
+                    prefer_per_prospect=use_prospect_batch and not explicit_company,
                 )
+                if explicit_company and not target_company:
+                    target_company = explicit_company
                 yield (
                     "**Like-sent:** "
                     + (
@@ -3057,13 +3066,31 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 pass
 
                         early_matched: list[dict[str, Any]] = []
-                        if use_prospect_batch:
+                        if use_prospect_batch or target_company:
                             early_matched = list(_prospects_with_email(prospects))
-                            if like_for and target_company:
-                                early_matched = (
-                                    _prospects_for_company(early_matched, target_company)
-                                    or early_matched
+                            # If chat lost last_prospects, pull saved Sterlite/etc. contacts
+                            if target_company and not early_matched:
+                                try:
+                                    from core.prospect_list import find_by_company
+
+                                    early_matched = [
+                                        p
+                                        for p in find_by_company(
+                                            target_company, limit=50, require_email=True
+                                        )
+                                        if (p.get("email") or "").strip()
+                                    ]
+                                except Exception as e:
+                                    print(
+                                        f"[router] prospect_list fallback: {e}",
+                                        file=sys.stderr,
+                                    )
+                            if target_company and early_matched:
+                                filtered_co = _prospects_for_company(
+                                    early_matched, target_company
                                 )
+                                if filtered_co:
+                                    early_matched = filtered_co
                             filtered_early: list[dict[str, Any]] = []
                             for p in early_matched:
                                 em = (p.get("email") or "").strip()
@@ -3073,8 +3100,21 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     dom = like_ref.split("@", 1)[1].lower()
                                     if em.lower().endswith("@" + dom):
                                         continue
+                                # Never draft back to common template orgs from prior runs
+                                em_l = em.lower()
+                                if any(
+                                    em_l.endswith(d)
+                                    for d in (
+                                        "@magicbusindia.org",
+                                        "@indiamart.com",
+                                        "@indiamart.co.in",
+                                    )
+                                ):
+                                    continue
                                 filtered_early.append(p)
                             early_matched = filtered_early
+                            if early_matched:
+                                use_prospect_batch = True
 
                         companies_to_research: list[str] = []
                         if target_company and target_company not in (
@@ -3209,26 +3249,40 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 payload["from_prospects"] = True
                                 prospects = matched
                                 yield (
-                                    f"_To (from last search / above): "
-                                    f"**{len(matched)}** contacts — each draft is "
-                                    f"**Gemini-researched** for that company_\n"
+                                    f"_To (**{target_company or 'searched company'}** "
+                                    f"contacts): **{len(matched)}** — each draft is "
+                                    f"**Gemini-researched** for that company "
+                                    f"(not the Sent template)_\n"
                                 )
                             else:
                                 yield (
-                                    "_No emailed contacts on the last prospect list. "
-                                    "Search contacts first, then ask again._\n"
+                                    f"_No emailed contacts found for "
+                                    f"**{target_company or 'that company'}**. "
+                                    f"Search contacts for that org first, then ask again._\n"
                                 )
                         elif not recipients or wants_previous_chat_recipient(
                             user_msg or ""
                         ):
-                            hist_tos = resolve_to_emails_from_history(
-                                history, exclude=block
-                            )
-                            # Prefer history when user asked for previous/chat recipient
-                            if wants_previous_chat_recipient(user_msg or "") and hist_tos:
-                                recipients = hist_tos
-                            elif not recipients:
-                                recipients = hist_tos
+                            # Never use history when an explicit company was named
+                            if target_company or parse_explicit_draft_company(
+                                user_msg or ""
+                            ):
+                                yield (
+                                    f"_Need Sterlite/company contacts on the prospect "
+                                    f"list for **{target_company or 'the named company'}** "
+                                    f"— not prior Magic Bus drafts from chat._\n"
+                                )
+                            else:
+                                hist_tos = resolve_to_emails_from_history(
+                                    history, exclude=block
+                                )
+                                # Prefer history when user asked for previous/chat recipient
+                                if wants_previous_chat_recipient(
+                                    user_msg or ""
+                                ) and hist_tos:
+                                    recipients = hist_tos
+                                elif not recipients:
+                                    recipients = hist_tos
 
                         if not use_prospect_batch and recipients:
                             if len(recipients) == 1:

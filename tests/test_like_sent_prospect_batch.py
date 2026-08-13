@@ -7,11 +7,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent.intent import wants_prospect_list_recipients
+from agent.intent import (
+    parse_explicit_draft_company,
+    parse_like_sent_request,
+    wants_previous_chat_recipient,
+    wants_prospect_list_recipients,
+)
 from agent.router import (
     _infer_like_sent_target,
     _personalize_like_sent_job,
     _reference_org_aliases,
+    _unique_prospect_companies,
 )
 
 
@@ -24,6 +30,21 @@ def test_to_above_means_prospect_list():
     assert not wants_prospect_list_recipients(
         "draft like info@magicbusindia.org for Flipkart"
     )
+
+
+def test_sterlite_like_indiamart_query():
+    msg = (
+        "use the previous email from chat and draft to sterlite tech "
+        "like khurshidalam.qureshi@indiamart.com"
+    )
+    parsed = parse_like_sent_request(msg)
+    assert parsed is not None
+    assert parsed["reference"].lower() == "khurshidalam.qureshi@indiamart.com"
+    assert "sterlite" in (parsed.get("target") or "").lower()
+    assert parse_explicit_draft_company(msg).lower().startswith("sterlite")
+    # "previous email from chat" is style — not prior Magic Bus To
+    assert not wants_previous_chat_recipient(msg)
+    assert wants_prospect_list_recipients(msg)
 
 
 def test_infer_target_empty_for_multi_company_list():
@@ -44,8 +65,6 @@ def test_infer_target_empty_for_multi_company_list():
 
 
 def test_unique_prospect_companies_ordered():
-    from agent.router import _unique_prospect_companies
-
     rows = [
         {"company": "Sterlite Tech", "email": "a@s.com"},
         {"company": "Sterlite Tech", "email": "b@s.com"},
