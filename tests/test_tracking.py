@@ -40,6 +40,23 @@ def test_strip_removes_pixel():
     assert "/.netlify/functions/open" not in cleaned
 
 
+def test_draft_mode_hides_netlify_click_urls():
+    """Drafts keep original hrefs; only a hidden open pixel is added."""
+    from core.tracking import inject_tracking, html_for_preview
+
+    html = '<p>Hi <a href="https://karuna.org/program">our program</a></p>'
+    drafted, tid = inject_tracking(
+        html, register=False, track_clicks=False, track_opens=True
+    )
+    assert tid
+    assert "/.netlify/functions/open?id=" in drafted
+    assert "karuna.org/program" in drafted
+    assert "/.netlify/functions/click" not in drafted
+    preview = html_for_preview(drafted)
+    assert "netlify" not in preview.lower()
+    assert "karuna.org/program" in preview
+
+
 @pytest.mark.parametrize("surface", ["bulk_grid", "chat_inspector", "drafts_inspector"])
 def test_save_path_reinjects(surface, monkeypatch, tmp_path):
     """Every save surface must strip→inject with same tracking_id."""

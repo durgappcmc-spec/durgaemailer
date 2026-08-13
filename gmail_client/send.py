@@ -118,6 +118,8 @@ def _build_raw_message(
     attachments: Optional[list[dict[str, Any]]] = None,
     *,
     instrument: bool = True,
+    track_clicks: bool = True,
+    track_opens: bool = True,
     campaign: Optional[str] = None,
     source: Optional[str] = None,
     from_email: Optional[str] = None,
@@ -139,6 +141,8 @@ def _build_raw_message(
                 campaign=campaign,
                 prospect_source=source,
                 recipient_name=recipient_name,
+                track_clicks=track_clicks,
+                track_opens=track_opens,
             )
         except Exception as e:
             print(f"[gmail] instrument failed, continuing untracked: {e}", file=sys.stderr)
@@ -195,13 +199,15 @@ def create_draft(
 ) -> dict[str, Any]:
     """Create a new Gmail draft for review.
 
-    Tracking is ON by default so open/click pixels survive when you send
-    the draft from Gmail later. Also mirrors a copy into Drive drafts index.
+    Open-pixel tracking is embedded (hidden). Click links stay as original
+    URLs in the draft so Netlify tracking URLs are not visible while reviewing;
+    clicks are wrapped at send time.
     """
     from_addr = from_email or default_from_email()
     src = (source or "relay_draft").strip() or "relay_draft"
     if track and "draft" not in src.lower():
         src = f"{src}_draft"
+    # Drafts: open pixel only — never rewrite hrefs to Netlify click URLs
     raw, tracking_id = _build_raw_message(
         to,
         subject,
@@ -209,6 +215,8 @@ def create_draft(
         recipient_name=recipient_name,
         attachments=attachments,
         instrument=track,
+        track_clicks=False,
+        track_opens=True,
         campaign=campaign,
         source=src,
         from_email=from_addr,
@@ -229,6 +237,8 @@ def create_draft(
                 recipient_email=to,
                 subject=subject,
                 register=False,
+                track_clicks=False,
+                track_opens=True,
             )
         except Exception:
             pass

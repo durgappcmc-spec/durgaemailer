@@ -135,32 +135,32 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
 
 
 def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
-    """Send an existing Gmail draft (preserves MIME + open pixel already in body)."""
+    """Send an existing Gmail draft (injects click tracking, preserves open pixel)."""
     did = (gmail_draft_id or "").removeprefix("gmail:")
-    # Ensure tracking pixel present before send
     draft = get_gmail_draft(did)
     if draft.get("error"):
         return draft
     body = draft.get("body_html") or ""
     tid = draft.get("tracking_id") or ""
-    if not draft.get("has_open_pixel"):
-        try:
-            from core.tracking import inject_tracking
+    try:
+        from core.tracking import inject_tracking
 
-            body, tid = inject_tracking(
-                body,
-                tracking_id=tid or None,
-                recipient_email=draft.get("to") or "",
-                subject=draft.get("subject") or "",
-                register=True,
-            )
-            # Update draft MIME then send
-            _update_draft_html(did, draft, body)
-            draft["body_html"] = body
-            draft["tracking_id"] = tid
-            draft["has_open_pixel"] = True
-        except Exception as e:
-            print(f"[gmail] tracking inject before send failed: {e}", file=sys.stderr)
+        # At send time: wrap clicks + keep/add open pixel (Netlify URLs OK in sent mail)
+        body, tid = inject_tracking(
+            body,
+            tracking_id=tid or None,
+            recipient_email=draft.get("to") or "",
+            subject=draft.get("subject") or "",
+            register=True,
+            track_clicks=True,
+            track_opens=True,
+        )
+        _update_draft_html(did, draft, body)
+        draft["body_html"] = body
+        draft["tracking_id"] = tid
+        draft["has_open_pixel"] = True
+    except Exception as e:
+        print(f"[gmail] tracking inject before send failed: {e}", file=sys.stderr)
 
     try:
         svc = gmail_service()

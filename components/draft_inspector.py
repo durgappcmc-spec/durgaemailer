@@ -106,9 +106,16 @@ def render_draft_inspector(
         if not body:
             st.info("No HTML body stored for this draft.")
         else:
-            st.markdown(body, unsafe_allow_html=True)
+            try:
+                from core.tracking import html_for_preview
+
+                # Never show Netlify open/click URLs in the preview
+                preview_body = html_for_preview(body)
+            except Exception:
+                preview_body = body
+            st.markdown(preview_body, unsafe_allow_html=True)
             if tid or has_pixel:
-                st.success("Open-tracking pixel present in this draft.")
+                st.caption("🔒 Open tracking is embedded (hidden). Links shown as originals.")
             else:
                 st.error("No open-tracking pixel detected.")
 
@@ -332,6 +339,8 @@ def _render_edit_tab(
         recipient_email=draft.get("to") or draft.get("recipient") or "",
         subject=subject,
         register=False,
+        track_clicks=False,
+        track_opens=True,
     )
     draft["subject"] = subject
     draft["body_html"] = html
@@ -484,6 +493,8 @@ def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
         recipient_email=draft.get("to") or draft.get("recipient") or "",
         subject=draft.get("subject") or "",
         register=True,
+        track_clicks=False,
+        track_opens=True,
     )
     draft["body_html"] = html
     draft["tracking_id"] = tid

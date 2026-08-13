@@ -51,7 +51,10 @@ def extract_tracking_id(html: str) -> Optional[str]:
 
 
 def strip_tracking(html: str) -> str:
-    """Remove open pixels and unwrap click-tracked hrefs back to originals when possible."""
+    """Remove open pixels and unwrap click-tracked hrefs back to originals.
+
+    Used for draft preview/edit so Netlify tracking URLs stay hidden from the user.
+    """
     if not html:
         return html or ""
     soup = BeautifulSoup(html, "html.parser")
@@ -59,25 +62,27 @@ def strip_tracking(html: str) -> str:
 
     for img in list(soup.find_all("img", src=True)):
         src = img.get("src") or ""
-        if any(m in src for m in _OPEN_MARKERS):
+        if any(m in src for m in _OPEN_MARKERS) or img.get("data-tracking") == "open":
             img.decompose()
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
-        if not any(m in href for m in _CLICK_MARKERS):
-            if base and base in href and any(m in href for m in _CLICK_MARKERS):
-                pass
-            else:
-                continue
-        # We cannot recover original URL from click wrapper alone without registry;
-        # leave as-is if unknown. Prefer data-original-url if present.
+        is_click = any(m in href for m in _CLICK_MARKERS) or (
+            bool(base) and base in href and "click" in href
+        )
+        if not is_click:
+            continue
         original = a.get("data-original-url")
         if original:
             a["href"] = original
             if a.has_attr("data-original-url"):
                 del a["data-original-url"]
             continue
-        # If already a tracked link without original, leave href (do not invent)
+        # No original stored — drop the broken Netlify href rather than show it
+        # (keep link text so the email still reads naturally)
+        a["href"] = "#"
+        if a.has_attr("data-original-url"):
+            del a["data-original-url"]
 
     return str(soup)
 
@@ -97,14 +102,13 @@ def inject_tracking(
 ) -> tuple[str, str]:
     """Idempotent strip → inject. Preserves tracking_id when provided.
 
-    When tracking_id is set, we strip then re-instrument using that id by
-    temporarily wrapping instrument_html's uuid generation.
+    For drafts, pass track_clicks=False so Netlify click URLs are not shown
+    in Gmail/Drafts preview (open pixel stays hidden as a 1×1 image).
     """
     cleaned = strip_tracking(body_html or "")
     existing = tracking_id or extract_tracking_id(body_html or "")
 
     if not register:
-        # Local-only inject without Apps Script register (tests / re-edit)
         return _inject_local(
             cleaned,
             existing,
@@ -112,8 +116,6 @@ def inject_tracking(
             track_opens=track_opens,
         )
 
-    # instrument_html always mints a new uuid — if we need to preserve id,
-    # do local inject then optionally register is already done for that id.
     if existing:
         return _inject_local(
             cleaned,
@@ -169,7 +171,9 @@ def _inject_local(
         if not already:
             pixel = (
                 f'<img src="{base}/.netlify/functions/open?id={email_id}" '
-                f'width="1" height="1" alt="" style="display:block;border:0;">'
+                f'width="1" height="1" alt="" '
+                f'style="display:none;width:1px;height:1px;border:0;opacity:0;" '
+                f'data-tracking="open">'
             )
             if "</body>" in instrumented.lower():
                 idx = instrumented.lower().rfind("</body>")
@@ -178,3 +182,8 @@ def _inject_local(
                 instrumented = instrumented + pixel
 
     return instrumented, email_id
+
+
+def html_for_preview(html: str) -> str:
+    """Draft/UI preview without Netlify tracking URLs visible."""
+    return strip_tracking(html or "")

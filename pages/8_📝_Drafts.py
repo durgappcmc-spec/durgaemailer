@@ -68,6 +68,8 @@ def _send_one(draft: dict) -> dict:
         recipient_email=to,
         subject=draft.get("subject") or "",
         register=True,
+        track_clicks=True,
+        track_opens=True,
     )
     result = send_email(
         to=to,
@@ -372,6 +374,8 @@ if c2.button("🔒 Ensure tracking on selected") and action_ids:
             recipient_email=draft.get("to") or draft.get("recipient") or "",
             subject=draft.get("subject") or "",
             register=True,
+            track_clicks=False,
+            track_opens=True,
         )
         draft["body_html"] = html
         draft["tracking_id"] = tid

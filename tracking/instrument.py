@@ -43,14 +43,19 @@ def instrument_html(
             links.append(
                 {"link_id": link_id, "original_url": href, "label": label}
             )
+            # Keep original for draft preview / strip_tracking restore
+            a["data-original-url"] = href
             # Query-param form is reliable on Netlify (path splat can drop id)
             a["href"] = f"{base}/.netlify/functions/click?id={link_id}"
 
     instrumented = str(soup)
     if track_opens and base and "/.netlify/functions/open" not in instrumented and f"{base}/t/o/" not in instrumented:
+        # Hidden 1×1 open pixel — must not surface as a visible Netlify link
         pixel = (
             f'<img src="{base}/.netlify/functions/open?id={email_id}" '
-            f'width="1" height="1" alt="" style="display:block;border:0;">'
+            f'width="1" height="1" alt="" '
+            f'style="display:none;width:1px;height:1px;border:0;opacity:0;" '
+            f'data-tracking="open">'
         )
         if "</body>" in instrumented.lower():
             # Case-insensitive replace of closing body
