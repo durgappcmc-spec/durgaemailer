@@ -398,13 +398,11 @@ def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
     if not allow_sheets:
         return local
     cloud: Any = None
-    drive_ok = True
     if key in _DRIVE_KEYS:
         try:
             from core.drive_store import download_json, is_drive_degraded
 
             if is_drive_degraded():
-                drive_ok = False
                 print(
                     f"[durable] skip Drive load {key} (ssl circuit open)",
                     file=sys.stderr,
@@ -413,7 +411,57 @@ def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
                 cloud = download_json(_DRIVE_FILE.get(key, f"{key}.json"))
         except Exception as e:
             print(f"[durable] drive load {key} failed: {e}", file=sys.stderr)
-            drive_ok = False
+
+    sheets_data: Any = None
+    if allow_sheets and (
+        _local_is_miss(local) or cloud is None or _is_empty_payload(cloud) or key == "prospect_list"
+    ):
+        try:
+            flat = _read_appstate_map()
+            raw = flat.get(key)
+            if raw:
+                sheets_data = json.loads(raw)
+        except Exception as e:
+            print(f"[durable] sheets load {key} failed: {e}", file=sys.stderr)
+
+    # Prospect list: ALWAYS union sources. Preferring a larger stale Drive blob
+    # (old gmail rows) over a smaller local ZoomInfo save wiped Sterlite hits.
+    if key == "prospect_list":
+        merged: list[Any] = []
+        for part in (cloud, sheets_data, local):
+            if isinstance(part, list) and part:
+                merged = _merge_prospect_lists(
+                    merged if merged else [],
+                    [r for r in part if isinstance(r, dict)],
+                )
+        if merged:
+            # Drop mailbox noise before caching so Saved stays ZoomInfo-quality
+            try:
+                from core.prospect_list import _scrub_mailbox_noise
+
+                cleaned = _scrub_mailbox_noise(merged)
+            except Exception:
+                cleaned = [r for r in merged if isinstance(r, dict)]
+            if cleaned:
+                if (
+                    not isinstance(local, list)
+                    or len(cleaned) != len(local)
+                    or cleaned != local
+                ):
+                    print(
+                        f"[durable] merge prospect_list → {len(cleaned)} "
+                        f"(drive={_payload_len(cloud)} sheets={_payload_len(sheets_data)} "
+                        f"local={_payload_len(local)})",
+                        file=sys.stderr,
+                    )
+                    _save_local(key, cleaned)
+                return cleaned
+        if isinstance(local, list):
+            return local
+        return cloud if isinstance(cloud, list) else (
+            sheets_data if isinstance(sheets_data, list) else local
+        )
+
     if cloud is not None and not _is_empty_payload(cloud):
         # Prefer Drive when local is missing, empty, or much smaller (post-deploy wipe)
         if _local_is_miss(local):
@@ -445,20 +493,11 @@ def load_json_blob(key: str, *, allow_sheets: bool = True) -> Optional[Any]:
         if not _is_empty_payload(cloud):
             _save_local(key, cloud)
         return cloud
-    try:
-        flat = _read_appstate_map()
-        raw = flat.get(key)
-        if not raw:
-            return local
-        data = json.loads(raw)
-        if not _is_empty_payload(data):
-            print(f"[durable] restored {key} from Sheets AppState", file=sys.stderr)
-            _save_local(key, data)
-            return data
-        return local if local is not None else data
-    except Exception as e:
-        print(f"[durable] sheets load {key} failed: {e}", file=sys.stderr)
-        return local
+    if sheets_data is not None and not _is_empty_payload(sheets_data):
+        print(f"[durable] restored {key} from Sheets AppState", file=sys.stderr)
+        _save_local(key, sheets_data)
+        return sheets_data
+    return local
 
 
 def _slim_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

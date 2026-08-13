@@ -21,6 +21,27 @@ if not require_login():
 logout_button()
 ensure_session_sync(st.session_state)
 
+# Chat ZoomInfo hits live in session — merge into Saved before any Drive reload
+# can show a stale empty list.
+if st.session_state.get("last_prospects") and not st.session_state.get(
+    "_session_prospects_merged"
+):
+    st.session_state._session_prospects_merged = True
+    try:
+        from core.prospect_list import save_prospects
+
+        clean = [
+            p
+            for p in (st.session_state.last_prospects or [])
+            if p and not p.get("error") and not p.get("research_only")
+        ]
+        if clean:
+            n = save_prospects(clean)
+            if n:
+                st.toast(f"Merged **{n}** session contacts into Saved list")
+    except Exception:
+        pass
+
 # After each deploy Render disk is empty — pull Drive before any save can clobber it
 if not st.session_state.get("_prospects_drive_hydrated"):
     st.session_state._prospects_drive_hydrated = True

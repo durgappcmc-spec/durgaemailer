@@ -99,20 +99,36 @@ def reload_from_drive() -> int:
     """Invalidate cache and pull contacts from Google Drive. Returns count."""
     global _CACHE, _LOADED
     with _LOCK:
+        # Keep any ZoomInfo rows saved this session — a stale Drive blob must
+        # not replace them on Prospects "Refresh" / page open.
+        prev = list(_CACHE) if _LOADED and isinstance(_CACHE, list) else []
         _LOADED = False
         _CACHE = None
-        rows = _load()
+        rows = list(_load())
+        if prev:
+            try:
+                from core.durable_store import _merge_prospect_lists
+
+                rows = _merge_prospect_lists(rows, prev)
+            except Exception:
+                # Fallback: prefer previous session rows when merge helper missing
+                by_key = {_prospect_key(r): r for r in rows if isinstance(r, dict)}
+                for r in prev:
+                    if not isinstance(r, dict):
+                        continue
+                    by_key[_prospect_key(r)] = {**by_key.get(_prospect_key(r), {}), **r}
+                rows = list(by_key.values())
         cleaned = _scrub_mailbox_noise(rows)
-        if len(cleaned) != len(rows):
-            removed = len(rows) - len(cleaned)
-            print(
-                f"[prospect_list] scrubbed {removed} "
-                f"gmail mailbox rows from Saved list",
-                file=sys.stderr,
-            )
+        if len(cleaned) != len(rows) or (prev and cleaned):
+            removed = max(0, len(rows) - len(cleaned))
+            if removed:
+                print(
+                    f"[prospect_list] scrubbed {removed} "
+                    f"gmail mailbox rows from Saved list",
+                    file=sys.stderr,
+                )
             _CACHE = cleaned
             _LOADED = True
-            # Avoid Drive HTTPS during OpenSSL storms — Sheets mirror is enough.
             try:
                 from core.drive_store import is_drive_degraded
 
@@ -128,6 +144,10 @@ def reload_from_drive() -> int:
                     print(f"[prospect_list] sheets-only scrub save failed: {e}", file=sys.stderr)
             else:
                 _persist(cleaned)
+            rows = cleaned
+        else:
+            _CACHE = cleaned
+            _LOADED = True
             rows = cleaned
         return len(rows)
 
