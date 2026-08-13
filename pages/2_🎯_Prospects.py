@@ -177,45 +177,83 @@ with tab_saved:
 
     if not saved_rows:
         st.info(
-            "No saved contacts yet. Run a Search or Enrich, or find orgs in Chat — "
-            "they’ll appear here automatically."
+            "No saved contacts yet. In **Chat**, run "
+            "`search contacts from sterlite tech` — you should see a green "
+            "**Saved to Prospects → Saved** banner, then refresh this tab."
         )
     else:
-        df_saved = prospects_to_dataframe(saved_rows)
-        # Prefer stable column order; drop empty-only cols for readability
-        show_cols = [
-            c
-            for c in [
-                "name",
-                "title",
-                "company",
-                "email",
-                "phone",
-                "mobile",
-                "linkedin_url",
-                "location",
-                "source",
-            ]
-            if c in df_saved.columns
+        _PLACEHOLDER_EMAILS = {"a@b.com", "test@test.com", "example@example.com"}
+        placeholders = [
+            p
+            for p in saved_rows
+            if (p.get("email") or "").strip().lower() in _PLACEHOLDER_EMAILS
         ]
-        st.dataframe(df_saved[show_cols] if show_cols else df_saved, use_container_width=True)
-
-        fname = "saved_prospects.csv"
-        if (q_name or q_org or "").strip():
-            fname = "saved_prospects_filtered.csv"
-        st.download_button(
-            "⬇ Export CSV",
-            df_saved.to_csv(index=False).encode("utf-8"),
-            fname,
-            "text/csv",
-            key="saved_csv",
-        )
-        if st.button("Use these for bulk draft (session)", key="saved_to_session"):
-            st.session_state.last_prospects = list(saved_rows)
-            st.success(
-                f"Loaded **{len(saved_rows)}** contacts into session — "
-                f"open Chat and say `draft emails to all these prospects`."
+        real_rows = [
+            p
+            for p in saved_rows
+            if (p.get("email") or "").strip().lower() not in _PLACEHOLDER_EMAILS
+        ]
+        if placeholders and not real_rows:
+            st.warning(
+                "Only a placeholder test contact is on the list "
+                f"(`{placeholders[0].get('email')}`). "
+                "Chat search results were not saved — run the Sterlite search again "
+                "after this deploy and look for the green save banner in Chat."
             )
+            if st.button("Remove placeholder test contact", key="del_placeholders"):
+                try:
+                    from core import prospect_list as pl
+
+                    keep = [
+                        p
+                        for p in pl.all_prospects()
+                        if (p.get("email") or "").strip().lower()
+                        not in ("a@b.com", "test@test.com", "example@example.com")
+                    ]
+                    pl._persist(keep)
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"Could not delete placeholder: {e}")
+        saved_rows = real_rows if real_rows else saved_rows
+
+        if not real_rows and placeholders:
+            pass  # warning already shown
+        else:
+            df_saved = prospects_to_dataframe(saved_rows)
+            # Prefer stable column order; drop empty-only cols for readability
+            show_cols = [
+                c
+                for c in [
+                    "name",
+                    "title",
+                    "company",
+                    "email",
+                    "phone",
+                    "mobile",
+                    "linkedin_url",
+                    "location",
+                    "source",
+                ]
+                if c in df_saved.columns
+            ]
+            st.dataframe(df_saved[show_cols] if show_cols else df_saved, use_container_width=True)
+
+            fname = "saved_prospects.csv"
+            if (q_name or q_org or "").strip():
+                fname = "saved_prospects_filtered.csv"
+            st.download_button(
+                "⬇ Export CSV",
+                df_saved.to_csv(index=False).encode("utf-8"),
+                fname,
+                "text/csv",
+                key="saved_csv",
+            )
+            if st.button("Use these for bulk draft (session)", key="saved_to_session"):
+                st.session_state.last_prospects = list(saved_rows)
+                st.success(
+                    f"Loaded **{len(saved_rows)}** contacts into session — "
+                    f"open Chat and say `draft emails to all these prospects`."
+                )
 
 with tab_search:
     with st.form("prospect_search"):

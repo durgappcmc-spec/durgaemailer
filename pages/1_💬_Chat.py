@@ -433,7 +433,11 @@ if prompt:
                     meta = {**(meta or {}), "cancelled": True, "routing": "STOPPED"}
                     break
                 if isinstance(chunk, dict) and "__meta__" in chunk:
-                    meta = chunk["__meta__"]
+                    incoming = chunk["__meta__"] or {}
+                    prev_prospects = meta.get("prospects")
+                    meta = {**meta, **incoming}
+                    if not meta.get("prospects") and prev_prospects:
+                        meta["prospects"] = prev_prospects
                 else:
                     text += str(chunk)
                     placeholder.markdown(text + "▌")
@@ -450,28 +454,54 @@ if prompt:
         if meta.get("mailbox_messages"):
             st.session_state.last_mailbox = meta["mailbox_messages"]
             st.caption(f"Saved {len(meta['mailbox_messages'])} mailbox rows for follow-ups.")
-        if meta.get("prospects"):
-            st.session_state.last_prospects = meta["prospects"]
-            with_email = sum(
-                1 for p in meta["prospects"] if (p.get("email") or "").strip()
-            )
-            list_n = 0
+
+        # Persist ZoomInfo / contact-search hits into Prospects → Saved
+        prospects = list(meta.get("prospects") or [])
+        try:
+            from agent.intent import parse_contact_search_company, wants_contact_search
+            from core.prospect_parse import parse_prospects_from_agent_text
+
+            if wants_contact_search(user_text) or str(meta.get("routing") or "").startswith(
+                "PROSPECT_SEARCH"
+            ):
+                company = parse_contact_search_company(user_text) or ""
+                parsed = parse_prospects_from_agent_text(
+                    text, default_company=company, default_source="zoominfo"
+                )
+                if parsed:
+                    if not prospects:
+                        prospects = parsed
+                    else:
+                        seen = {
+                            (p.get("email") or p.get("name") or "").strip().lower()
+                            for p in prospects
+                        }
+                        for p in parsed:
+                            key = (p.get("email") or p.get("name") or "").strip().lower()
+                            if key and key not in seen:
+                                prospects.append(p)
+                                seen.add(key)
+        except Exception:
+            pass
+
+        if prospects:
+            st.session_state.last_prospects = prospects
+            with_email = sum(1 for p in prospects if (p.get("email") or "").strip())
             try:
                 from core.prospect_list import save_prospects_to_drive
 
-                status = save_prospects_to_drive(meta["prospects"])
-                list_n = int(status.get("upserted") or 0)
-                st.caption(
-                    f"Saved {len(meta['prospects'])} prospects "
-                    f"({with_email} with email) · "
-                    f"**{list_n}** upserted to Drive list "
-                    f"(total **{status.get('total', '?')}**)."
+                save_status = save_prospects_to_drive(prospects)
+                list_n = int(save_status.get("upserted") or 0)
+                total_n = int(save_status.get("total") or 0)
+                st.success(
+                    f"Saved **{list_n or len(prospects)}** contacts to "
+                    f"**Prospects → Saved** ({with_email} with email · "
+                    f"list total **{total_n or '?'}**)."
                 )
             except Exception as e:
                 st.caption(
-                    f"Saved {len(meta['prospects'])} prospects "
-                    f"({with_email} with email) for bulk draft/send "
-                    f"— Drive list save failed: {e}"
+                    f"Session has {len(prospects)} prospects "
+                    f"({with_email} with email) — Drive list save failed: {e}"
                 )
 
         sources = meta.get("sources") or []

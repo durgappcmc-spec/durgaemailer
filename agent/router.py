@@ -2526,20 +2526,6 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         "\n\nNext: `draft emails to all these prospects` or "
                         "`send personalized emails to this list`."
                     )
-                system = (
-                    "Summarize these saved prospect list results for the user. "
-                    "Highlight emails when present.\n\n" + "\n\n".join(ctx_lines)
-                )
-                if used_docs:
-                    system += "\n\nUploaded file context:\n" + doc_context
-                if not draft_after:
-                    for chunk in chat_grounded(
-                        user_msg, history=history, system=system, use_search=False
-                    ):
-                        if isinstance(chunk, dict) and "__meta__" in chunk:
-                            sources = chunk["__meta__"].get("sources") or []
-                        else:
-                            yield chunk
                 sources.append(
                     {
                         "title": "prospect_list",
@@ -2629,13 +2615,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     if list_saved or saved_ids:
                         yield (
                             f"\n\nAuto-saved **{list_saved or len(ok)}** contacts to your "
-                            f"**Drive prospect list** (`relay_prospects.json`)"
+                            f"**Prospects → Saved** list"
                             + (
                                 f" · memory ids {len(saved_ids)}"
                                 if saved_ids
                                 else ""
                             )
-                            + "."
+                            + ". Open **🎯 Prospects** to view them."
                         )
                     else:
                         yield (
@@ -2659,25 +2645,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             "\n\nNext: `draft emails to all these prospects` or "
                             "`send personalized emails to this ZoomInfo list`."
                         )
-                system = (
-                    "Summarize these prospect search results for the user. "
-                    "Highlight emails when present. If emails exist, remind them they can "
-                    "bulk draft/send personalized emails to this list.\n\n"
-                    + "\n\n".join(ctx_lines)
-                )
-                if used_docs:
-                    system += "\n\nUploaded file context:\n" + doc_context
-                draft_after_live = bool(ok) and _should_draft_after_prospect_search(
-                    user_msg or "", plan, q
-                ) and not (context or {}).get("_after_prospect_search")
-                if not draft_after_live:
-                    for chunk in chat_grounded(
-                        user_msg, history=history, system=system, use_search=False
-                    ):
-                        if isinstance(chunk, dict) and "__meta__" in chunk:
-                            sources = chunk["__meta__"].get("sources") or []
-                        else:
-                            yield chunk
+                # Do NOT run a second Gemini pass over ZoomInfo hits — it can invent
+                # extra emails and Chat then has nothing structured to put in Saved.
                 sources.append(
                     {
                         "title": "prospect_search",
