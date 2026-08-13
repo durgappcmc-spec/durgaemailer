@@ -2436,7 +2436,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
             if isinstance(providers, str):
                 providers = [providers]
             # Always ZoomInfo — ignore apollo/rocketreach even if classifier asks
-            providers = ("zoominfo",)            vol = parse_research_limits(user_msg)
+            providers = ("zoominfo",)
+            vol = parse_research_limits(user_msg)
             limit = int(
                 q.pop("limit", None)
                 or q.pop("limit_per_provider", None)
