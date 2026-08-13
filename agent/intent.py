@@ -527,6 +527,28 @@ def wants_previous_chat_recipient(user_msg: str) -> bool:
     )
 
 
+def wants_prospect_list_recipients(user_msg: str) -> bool:
+    """True when To should be the last ZoomInfo / prospect search (e.g. 'to above')."""
+    msg = user_msg or ""
+    return bool(
+        re.search(
+            r"\b("
+            r"to\s+(?:the\s+)?(?:above|above\s+(?:contacts?|list|prospects?|people|results?))|"
+            r"(?:above|previous|prior|earlier|last)\s+"
+            r"(?:contacts?|prospects?|people|results?|search|list)|"
+            r"these\s+(?:contacts?|prospects?|people|results?)|"
+            r"this\s+(?:list|search|result)|"
+            r"all\s+(?:these\s+|the\s+)?(?:contacts?|prospects?)|"
+            r"everyone\s+(?:we\s+|you\s+)?found|"
+            r"zoominfo\s+list|"
+            r"all\s+of\s+them"
+            r")\b",
+            msg,
+            re.I,
+        )
+    )
+
+
 def resolve_to_emails_from_history(
     history: Optional[list[dict[str, str]]] = None,
     *,

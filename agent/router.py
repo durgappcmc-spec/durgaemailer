@@ -31,6 +31,7 @@ from agent.intent import (
     wants_contact_search,
     wants_live_zoominfo_search,
     wants_previous_chat_recipient,
+    wants_prospect_list_recipients,
 )
 from agent.research_pipeline import (
     discover_orgs_from_web,
@@ -492,6 +493,7 @@ def _build_draft_jobs(
     from_prospects = bool(
         payload.get("from_prospects")
         or payload.get("use_prospects")
+        or wants_prospect_list_recipients(user_msg or "")
         or (
             payload.get("batch")
             and re.search(
@@ -897,21 +899,37 @@ def _infer_like_sent_target(
     reference: str,
     prospects: Optional[list[dict[str, Any]]],
     history: Optional[list[dict[str, str]]],
+    prefer_per_prospect: bool = False,
 ) -> str:
-    """Pick the company to adapt the cloned email for."""
+    """Pick the company to adapt the cloned email for.
+
+    When drafting to a multi-company prospect list ("to above"), return "" so
+    each recipient is personalized with their own company — never the Sent
+    template org (e.g. Magic Bus).
+    """
     target = (explicit or "").strip()
-    if target and target.lower() != (reference or "").strip().lower():
+    ref_l = (reference or "").strip().lower()
+    if target and target.lower() != ref_l and "@" not in target:
         return target
+    if prefer_per_prospect:
+        return ""
     companies: list[str] = []
     for p in prospects or []:
         c = (p.get("company") or "").strip()
-        if c and c.lower() != (reference or "").strip().lower():
-            companies.append(c)
+        if not c:
+            continue
+        cl = c.lower()
+        if cl == ref_l or (ref_l and ref_l in cl and "@" in (reference or "")):
+            continue
+        if "@" in (reference or "") and org_label_from_email(reference).lower() in cl:
+            continue
+        companies.append(c)
     uniq = list(dict.fromkeys(companies))
     if len(uniq) == 1:
         return uniq[0]
-    if uniq:
-        return uniq[-1]
+    # Multiple companies on the list → personalize per row, not one global swap
+    if len(uniq) > 1:
+        return ""
     # Last user/assistant turn may name a company after "for/about"
     if history:
         for m in reversed(history[-16:]):
@@ -923,7 +941,7 @@ def _infer_like_sent_target(
             )
             if fm:
                 cand = fm.group(1).strip(" .,;:")
-                if cand.lower() != (reference or "").strip().lower():
+                if cand.lower() != ref_l and "@" not in cand:
                     return cand
             # From prior like-sent planner lines
             m_for = re.search(
@@ -933,10 +951,99 @@ def _infer_like_sent_target(
             )
             if m_for:
                 cand = m_for.group(1).strip()
-                if cand.lower() != (reference or "").strip().lower():
+                if cand.lower() != ref_l and "@" not in cand:
                     return cand
-    return target or ""
+    return ""
 
+
+def _reference_org_aliases(
+    like_ref: str,
+    ref_msg: Optional[dict[str, Any]],
+    ref_org: str,
+) -> list[str]:
+    """All names/phrases to scrub from a cloned Magic Bus-style email."""
+    msg = ref_msg or {}
+    aliases: list[str] = []
+    for raw in (
+        ref_org,
+        like_ref,
+        org_label_from_email(like_ref) if "@" in (like_ref or "") else "",
+    ):
+        raw = (raw or "").strip()
+        if raw:
+            aliases.append(raw)
+    if "@" in (like_ref or ""):
+        try:
+            domain = like_ref.split("@", 1)[1].strip().lower()
+            aliases.append(domain)
+            aliases.append(domain.split(".")[0])
+        except Exception:
+            pass
+    to_hdr = str(msg.get("to") or "")
+    m_name = re.match(r'\s*"?([^"<]+?)"?\s*<', to_hdr)
+    if m_name:
+        display = m_name.group(1).strip()
+        if display and "@" not in display and len(display) > 1:
+            aliases.append(display)
+    body = _full_reference_text(
+        str(msg.get("body_text") or ""),
+        str(msg.get("body_html") or ""),
+    )
+    subj = str(msg.get("subject") or "")
+    blob = f"{subj}\n{body}"
+    for m in re.finditer(
+        r"(?:Dear|Hi|Hello)\s+([A-Z][^,\n]{1,50}?)\s+Team\b",
+        blob,
+        re.I,
+    ):
+        aliases.append(m.group(1).strip())
+    # Dedup longest-first later; keep order stable
+    out: list[str] = []
+    seen: set[str] = set()
+    for a in aliases:
+        key = a.lower()
+        if len(a) < 2 or key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
+def _personalize_like_sent_job(
+    *,
+    subject: str,
+    html_body: str,
+    prospect: dict[str, Any],
+    scrub_names: list[str],
+) -> dict[str, str]:
+    """Fill {company}/{first_name} and scrub template org (Magic Bus) → prospect company."""
+    company = (
+        str(prospect.get("company") or prospect.get("organization") or "").strip()
+        or "your organization"
+    )
+    pctx = {**prospect, "company": company}
+    subj = _apply_template(subject or "", pctx)
+    body = _apply_template(html_body or "", pctx)
+    for old in scrub_names:
+        if not old or old.lower() in {"{company}", "your organization"}:
+            continue
+        if old.lower() == company.lower():
+            continue
+        subj = _replace_company_names(subj, old, company)
+        body = _replace_company_names(body, old, company)
+    # Greetings like "Dear Magic Bus Team" → Dear {First} / Dear {Company} team
+    first = str(pctx.get("first_name") or "").strip()
+    if not first:
+        name = str(pctx.get("name") or "").strip()
+        first = name.split(None, 1)[0] if name else ""
+    greet_to = first or company
+    body = re.sub(
+        rf"(Dear|Hi|Hello)\s+{re.escape(company)}\s+Team\b",
+        rf"\1 {greet_to}",
+        body,
+        flags=re.I,
+    )
+    return {"subject": subj, "html_body": body}
 
 def _prospects_for_company(
     prospects: Optional[list[dict[str, Any]]],
@@ -985,6 +1092,22 @@ def _company_name_variants(company: str) -> list[str]:
     if compact:
         variants.add(compact)
         variants.add(compact.lower())
+    # Domain-style labels: magicbusindia → Magic Bus / Magic Bus India
+    low = re.sub(r"[^a-z0-9]+", "", name.lower())
+    for brand, pretty in (
+        ("magicbus", "Magic Bus"),
+        ("indiamart", "IndiaMART"),
+        ("sterlitetech", "Sterlite Tech"),
+    ):
+        if brand in low:
+            variants.update({pretty, pretty.lower(), pretty.title()})
+            if "india" in low and "india" not in pretty.lower():
+                variants.update(
+                    {
+                        f"{pretty} India",
+                        f"{pretty} India".lower(),
+                    }
+                )
     return sorted({v for v in variants if v}, key=len, reverse=True)
 
 
@@ -1199,6 +1322,98 @@ Return JSON: {{"section_body": "...full rewritten section body only..."}}
     except Exception as e:
         print(f"[router] why-section adapt failed: {e}", file=sys.stderr)
     return full_text
+
+
+def _research_company_for_like_sent(
+    *,
+    company: str,
+    ref_subj: str,
+    ref_to: str,
+    ref_body: str,
+    user_msg: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Gemini + Google Search alignment notes for one target company (never the template org)."""
+    company = (company or "").strip()
+    if not company or company in ("{company}",):
+        return "", []
+    try:
+        notes, web_sources = grounded_collect(
+            f"""Research {company} and how it aligns with
+this prior outreach email's FULL content (offers, asks, themes).
+
+Prior subject: {ref_subj}
+Prior To: {ref_to}
+Prior body:
+{(ref_body or '')[:12000]}
+
+User request: {user_msg}
+
+Cover: what {company} does, relevant CSR/partnerships/programs, and concrete
+ways each major point in the prior email maps to {company}. Be specific.
+Do NOT write about the prior recipient organization as if it were the new target.
+""",
+            system=(
+                "You are a careful company researcher. Use Google Search. "
+                f"Focus only on {company} and how the outreach maps to them."
+            ),
+        )
+        return (notes or ""), list(web_sources or [])
+    except Exception as e:
+        print(f"[router] like-sent research ({company}): {e}", file=sys.stderr)
+        return "", []
+
+
+def _compose_like_sent_for_company(
+    *,
+    user_msg: str,
+    reference_msg: dict[str, Any],
+    reference_company: str,
+    scrub_names: list[str],
+    target_company: str,
+    research_notes: str,
+    document_context: str = "",
+) -> dict[str, str]:
+    """Compose one company-personalized clone; scrub all template-org aliases."""
+    target = (target_company or "").strip() or "{company}"
+    composed = _compose_like_sent_email(
+        user_msg=user_msg,
+        reference_msg=reference_msg,
+        reference_company=reference_company,
+        target_company=target,
+        research_notes=research_notes,
+        document_context=document_context,
+    )
+    for old in scrub_names:
+        if not old or old.lower() == target.lower():
+            continue
+        composed["html_body"] = _replace_company_names(
+            composed.get("html_body") or "", old, target
+        )
+        composed["subject"] = _replace_company_names(
+            composed.get("subject") or "", old, target
+        )
+    return composed
+
+
+def _unique_prospect_companies(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in rows:
+        c = str(p.get("company") or p.get("organization") or "").strip()
+        if not c:
+            continue
+        key = c.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _compose_like_sent_email(
@@ -1548,6 +1763,9 @@ def answer(
             seed_json["like_sent_for"] = plan.like_sent_for
         if plan.like_sent_message_id:
             seed_json["like_sent_message_id"] = plan.like_sent_message_id
+        if wants_prospect_list_recipients(user_msg or ""):
+            seed_json["batch"] = True
+            seed_json["from_prospects"] = True
         routing = "DRAFT_EMAIL:" + json.dumps(seed_json, ensure_ascii=False)
         meta_routing = routing
     elif (plan.like_sent_to or plan.like_sent_message_id) and (
@@ -1563,6 +1781,9 @@ def answer(
             seed_json["like_sent_for"] = plan.like_sent_for
         if plan.like_sent_message_id:
             seed_json["like_sent_message_id"] = plan.like_sent_message_id
+        if wants_prospect_list_recipients(user_msg or ""):
+            seed_json["batch"] = True
+            seed_json["from_prospects"] = True
         if len(plan.to_emails) == 1:
             seed_json["recipient_email"] = plan.to_emails[0]
         elif plan.to_emails:
@@ -2592,12 +2813,23 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             like_ref = dom.group(1).split(".")[0]
 
             if like_ref or like_mid:
-                # Clone angle from a prior sent email → research target → draft
+                # Clone angle from a prior sent email → draft to chat/prospect recipients
+                use_prospect_batch = bool(
+                    _prospects_with_email(prospects)
+                    and (
+                        wants_prospect_list_recipients(user_msg or "")
+                        or (
+                            not plan.to_emails
+                            and not wants_previous_chat_recipient(user_msg or "")
+                        )
+                    )
+                )
                 target_company = _infer_like_sent_target(
                     explicit=like_for,
                     reference=like_ref,
                     prospects=prospects,
                     history=history,
+                    prefer_per_prospect=use_prospect_batch and not like_for,
                 )
                 yield (
                     "**Like-sent:** "
@@ -2609,7 +2841,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     + (
                         f", adapting for **{target_company}**"
                         if target_company
-                        else ""
+                        else (
+                            ", personalizing per prospect company"
+                            if use_prospect_batch
+                            else ""
+                        )
                     )
                     + "…\n"
                 )
@@ -2787,77 +3023,134 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 "Paste the complete email in chat if sections are missing._\n"
                             )
                         research_notes = ""
-                        research_target = target_company or like_ref
-                        yield (
-                            f"**Researching** how **{research_target}** aligns "
-                            "with that outreach content…\n"
-                        )
-                        try:
-                            notes, web_sources = grounded_collect(
-                                f"""Research {research_target} and how it aligns with
-this prior outreach email's FULL content (offers, asks, themes).
-
-Prior subject: {ref_subj}
-Prior To: {ref_msg.get('to') or ''}
-Prior body:
-{(ref_msg.get('body_text') or body_preview)[:12000]}
-
-User request: {user_msg}
-
-Cover: what the company does, relevant CSR/partnerships/programs, and concrete
-ways each major point in the prior email maps to {research_target}. Be specific.
-""",
-                                system=(
-                                    "You are a careful company researcher. Use Google Search. "
-                                    "Focus on alignment with the prior outreach content."
-                                ),
-                            )
-                            research_notes = notes or ""
-                            sources.extend(web_sources or [])
-                        except Exception as e:
-                            print(f"[router] like-sent research: {e}", file=sys.stderr)
-                            yield f"_Research limited: {e}_\n"
-
+                        composed_by_company: dict[str, dict[str, str]] = {}
                         ref_org = _reference_org_for_swap(like_ref, ref_msg)
+                        scrub_names = _reference_org_aliases(like_ref, ref_msg, ref_org)
                         if "@" in (like_ref or ""):
                             yield (
                                 f"_Template recipient: `{like_ref}` · "
-                                f"org label for rewrite: **{ref_org}**_\n"
+                                f"scrub labels: **{', '.join(scrub_names[:4])}**_\n"
                             )
-                        composed = _compose_like_sent_email(
-                            user_msg=user_msg,
-                            reference_msg=ref_msg,
-                            reference_company=ref_org,
-                            target_company=target_company,
-                            research_notes=research_notes,
-                            document_context=doc_context,
-                        )
-                        # Also scrub the literal Sent recipient email / domain token
-                        if "@" in (like_ref or "") and target_company:
-                            for old in (
-                                like_ref,
-                                org_label_from_email(like_ref),
-                                ref_org,
-                            ):
-                                if not old:
+
+                        # Resolve prospect recipients early so we know which
+                        # companies need Gemini research (not Magic Bus).
+                        block = set(plan.non_recipient_emails())
+                        if like_ref and "@" in like_ref:
+                            block.add(like_ref.lower())
+                            try:
+                                block.add(like_ref.split("@", 1)[1].lower())
+                            except Exception:
+                                pass
+
+                        early_matched: list[dict[str, Any]] = []
+                        if use_prospect_batch:
+                            early_matched = list(_prospects_with_email(prospects))
+                            if like_for and target_company:
+                                early_matched = (
+                                    _prospects_for_company(early_matched, target_company)
+                                    or early_matched
+                                )
+                            filtered_early: list[dict[str, Any]] = []
+                            for p in early_matched:
+                                em = (p.get("email") or "").strip()
+                                if not em or em.lower() in block:
                                     continue
-                                composed["html_body"] = _replace_company_names(
-                                    composed.get("html_body") or "",
-                                    old,
-                                    target_company,
+                                if like_ref and "@" in like_ref:
+                                    dom = like_ref.split("@", 1)[1].lower()
+                                    if em.lower().endswith("@" + dom):
+                                        continue
+                                filtered_early.append(p)
+                            early_matched = filtered_early
+
+                        companies_to_research: list[str] = []
+                        if target_company and target_company not in (
+                            "{company}",
+                            like_ref,
+                            org_label_from_email(like_ref)
+                            if "@" in (like_ref or "")
+                            else "",
+                        ):
+                            companies_to_research = [target_company]
+                        elif early_matched:
+                            companies_to_research = _unique_prospect_companies(
+                                early_matched, limit=8
+                            )
+                        elif like_for:
+                            companies_to_research = [like_for]
+
+                        ref_body_for_research = (
+                            (ref_msg.get("body_text") or body_preview) or ""
+                        )[:12000]
+                        for company in companies_to_research:
+                            if _stop_now():
+                                yield stopped_message()
+                                break
+                            yield (
+                                f"**Gemini research** for **{company}** "
+                                "(grounded web search)…\n"
+                            )
+                            notes, web_sources = _research_company_for_like_sent(
+                                company=company,
+                                ref_subj=ref_subj,
+                                ref_to=str(ref_msg.get("to") or ""),
+                                ref_body=ref_body_for_research,
+                                user_msg=user_msg or "",
+                            )
+                            if web_sources:
+                                sources.extend(web_sources)
+                            if not notes:
+                                yield f"_Research limited for **{company}** — still personalizing names._\n"
+                            composed_by_company[company.lower()] = (
+                                _compose_like_sent_for_company(
+                                    user_msg=user_msg or "",
+                                    reference_msg=ref_msg,
+                                    reference_company=ref_org,
+                                    scrub_names=scrub_names,
+                                    target_company=company,
+                                    research_notes=notes,
+                                    document_context=doc_context,
                                 )
-                                composed["subject"] = _replace_company_names(
-                                    composed.get("subject") or "",
-                                    old,
-                                    target_company,
+                            )
+                            research_notes = notes or research_notes
+                            if notes:
+                                align = (
+                                    composed_by_company[company.lower()].get(
+                                        "alignment_summary"
+                                    )
+                                    or ""
                                 )
-                        if composed.get("alignment_summary"):
-                            yield f"_{composed['alignment_summary']}_\n"
+                                if align:
+                                    yield f"_{company}: {align}_\n"
+
+                        # Fallback template with {company} when no research targets
+                        compose_target = target_company or (
+                            "{company}" if use_prospect_batch or early_matched else ""
+                        )
+                        if composed_by_company:
+                            # Prefer explicit target, else first researched company
+                            pick = (target_company or companies_to_research[0]).lower()
+                            composed = composed_by_company.get(pick) or next(
+                                iter(composed_by_company.values())
+                            )
+                        else:
+                            if use_prospect_batch:
+                                yield (
+                                    "_No company names on the prospect list for Gemini "
+                                    "research — using name-swap personalization only._\n"
+                                )
+                            composed = _compose_like_sent_for_company(
+                                user_msg=user_msg or "",
+                                reference_msg=ref_msg,
+                                reference_company=ref_org,
+                                scrub_names=scrub_names,
+                                target_company=compose_target or "{company}",
+                                research_notes="",
+                                document_context=doc_context,
+                            )
                         yield (
                             f"_Draft keeps **{composed.get('paragraph_count') or '?'}** "
                             f"sections · **{composed.get('char_count') or '?'}** chars "
-                            f"(full Sent body preserved; company names → "
-                            f"**{target_company or 'target'}**)._\n"
+                            f"(Gemini-personalized per company; scrubbed template org)._\n"
                         )
                         if int(composed.get("char_count") or 0) < 1500:
                             yield (
@@ -2879,17 +3172,6 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                         if plan.ignore_emails:
                             payload["ignore_emails"] = plan.ignore_emails
 
-                        # Recipients = current org / prior chat To — NEVER the Sent template
-                        block = set(plan.non_recipient_emails())
-                        if like_ref and "@" in like_ref:
-                            block.add(like_ref.lower())
-                        # Domain of template (e.g. magicbusindia.org) — don't draft to same domain by mistake
-                        if like_ref and "@" in like_ref:
-                            try:
-                                block.add(like_ref.split("@", 1)[1].lower())
-                            except Exception:
-                                pass
-
                         recipients: list[str] = [
                             e
                             for e in (plan.to_emails or [])
@@ -2903,7 +3185,26 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                                 )
                             )
                         ]
-                        if not recipients or wants_previous_chat_recipient(
+                        # "to above" / last search → always use prospect list, not
+                        # history To addresses and never the Magic Bus template.
+                        if use_prospect_batch:
+                            recipients = []
+                            matched = early_matched
+                            if matched:
+                                payload["batch"] = True
+                                payload["from_prospects"] = True
+                                prospects = matched
+                                yield (
+                                    f"_To (from last search / above): "
+                                    f"**{len(matched)}** contacts — each draft is "
+                                    f"**Gemini-researched** for that company_\n"
+                                )
+                            else:
+                                yield (
+                                    "_No emailed contacts on the last prospect list. "
+                                    "Search contacts first, then ask again._\n"
+                                )
+                        elif not recipients or wants_previous_chat_recipient(
                             user_msg or ""
                         ):
                             hist_tos = resolve_to_emails_from_history(
@@ -2915,7 +3216,7 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                             elif not recipients:
                                 recipients = hist_tos
 
-                        if recipients:
+                        if not use_prospect_batch and recipients:
                             if len(recipients) == 1:
                                 payload["recipient_email"] = recipients[0]
                             else:
@@ -2931,7 +3232,7 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                                 )
                                 + "_\n"
                             )
-                        elif prospects:
+                        elif not use_prospect_batch and prospects:
                             matched = _prospects_for_company(
                                 prospects, target_company
                             )
@@ -2951,17 +3252,32 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                                 payload["batch"] = True
                                 payload["from_prospects"] = True
                                 prospects = matched
-                                for p in matched:
-                                    if target_company and not (p.get("company") or ""):
-                                        p["company"] = target_company
-                                    if target_company and not (p.get("org_focus") or ""):
-                                        p["org_focus"] = (
-                                            composed.get("alignment_summary") or ""
-                                        )[:240]
-                                    if target_company and not (p.get("why_match") or ""):
-                                        p["why_match"] = (
-                                            composed.get("alignment_summary") or ""
-                                        )[:240]
+                                # Research any companies not covered yet
+                                for company in _unique_prospect_companies(matched):
+                                    if company.lower() in composed_by_company:
+                                        continue
+                                    yield (
+                                        f"**Gemini research** for **{company}**…\n"
+                                    )
+                                    notes, web_sources = _research_company_for_like_sent(
+                                        company=company,
+                                        ref_subj=ref_subj,
+                                        ref_to=str(ref_msg.get("to") or ""),
+                                        ref_body=ref_body_for_research,
+                                        user_msg=user_msg or "",
+                                    )
+                                    sources.extend(web_sources)
+                                    composed_by_company[company.lower()] = (
+                                        _compose_like_sent_for_company(
+                                            user_msg=user_msg or "",
+                                            reference_msg=ref_msg,
+                                            reference_company=ref_org,
+                                            scrub_names=scrub_names,
+                                            target_company=company,
+                                            research_notes=notes,
+                                            document_context=doc_context,
+                                        )
+                                    )
                             else:
                                 yield (
                                     "_No matching prospects for the **current** org "
@@ -3032,43 +3348,57 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                                     not in block
                                 ]
                         jobs = safe_jobs
-                        # Fill company / alignment placeholders for explicit To rows
-                        if jobs and (
-                            target_company or composed.get("alignment_summary")
-                        ):
+                        # Per-recipient: Gemini-composed body for that company + name fill
+                        if jobs:
+                            by_email = {
+                                (p.get("email") or "").strip().lower(): p
+                                for p in (prospects or [])
+                                if (p.get("email") or "").strip()
+                            }
                             for job in jobs:
-                                pctx = {
+                                em = (job.get("recipient_email") or "").strip().lower()
+                                pctx = by_email.get(em) or {
                                     "name": job.get("recipient_name") or "",
-                                    "first_name": (
-                                        (job.get("recipient_name") or "").split(
-                                            None, 1
-                                        )
-                                        or [""]
-                                    )[0],
                                     "email": job.get("recipient_email") or "",
-                                    "recipient_email": job.get("recipient_email")
+                                    "recipient_email": job.get("recipient_email") or "",
+                                    "company": target_company
+                                    or job.get("company")
                                     or "",
-                                    "company": target_company,
-                                    "title": "",
-                                    "org_focus": (
-                                        composed.get("alignment_summary") or ""
-                                    )[:240],
-                                    "why_match": (
-                                        composed.get("alignment_summary") or ""
-                                    )[:240],
-                                    "prior_subject": "",
-                                    "prior_summary": "",
                                 }
-                                # Only re-apply when templates still have braces
-                                subj = job.get("subject") or ""
-                                body = job.get("html_body") or ""
-                                if "{" in subj or "{" in body:
-                                    job["subject"] = _apply_template(
-                                        composed.get("subject") or subj, pctx
-                                    )
-                                    job["html_body"] = _apply_template(
-                                        composed.get("html_body") or body, pctx
-                                    )
+                                company = (
+                                    str(pctx.get("company") or "").strip()
+                                    or target_company
+                                    or ""
+                                )
+                                if company and not (pctx.get("company") or "").strip():
+                                    pctx = {**pctx, "company": company}
+                                company_composed = (
+                                    composed_by_company.get(company.lower())
+                                    if company
+                                    else None
+                                ) or composed
+                                personalized = _personalize_like_sent_job(
+                                    subject=company_composed.get("subject")
+                                    or job.get("subject")
+                                    or "",
+                                    html_body=company_composed.get("html_body")
+                                    or job.get("html_body")
+                                    or "",
+                                    prospect=pctx,
+                                    scrub_names=scrub_names
+                                    + (
+                                        ["{company}"]
+                                        if "{company}"
+                                        in (
+                                            (company_composed.get("subject") or "")
+                                            + (company_composed.get("html_body") or "")
+                                        )
+                                        else []
+                                    ),
+                                )
+                                job["subject"] = personalized["subject"]
+                                job["html_body"] = personalized["html_body"]
+                                job["company"] = company
 
                         email_cap = min(
                             max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS
@@ -3185,13 +3515,8 @@ ways each major point in the prior email maps to {research_target}. Be specific.
                     re.I,
                 ):
                     seed = {**seed, "batch": True, "from_mailbox": True}
-                # Bulk to last ZoomInfo / prospect search
-                if prospects and re.search(
-                    r"\b(these prospects|this list|all (these |the )?prospects|"
-                    r"zoominfo list|everyone (we |you )?found|all of them)\b",
-                    user_msg or "",
-                    re.I,
-                ):
+                # Bulk to last ZoomInfo / prospect search ("to above", etc.)
+                if prospects and wants_prospect_list_recipients(user_msg or ""):
                     seed = {**seed, "batch": True, "from_prospects": True}
                 payload = _extract_email_job(
                     user_msg,
