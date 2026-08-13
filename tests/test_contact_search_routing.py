@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT))
 from agent.intent import (
     _heuristic_plan,
     parse_contact_search_company,
+    parse_named_person_contact,
     wants_contact_search,
 )
 
@@ -28,6 +29,18 @@ def test_find_contacts_at_company():
     assert wants_contact_search(msg)
     assert "Magic Bus" in parse_contact_search_company(msg)
     assert _heuristic_plan(msg).action == "prospect_search"
+
+
+def test_named_person_from_domain_goes_to_enrich():
+    msg = "check for contact of Saswati Swain from soprasteria.com"
+    assert wants_contact_search(msg)
+    parsed = parse_named_person_contact(msg)
+    assert parsed.get("first_name") == "Saswati"
+    assert parsed.get("last_name") == "Swain"
+    assert parsed.get("company_domain") == "soprasteria.com"
+    plan = _heuristic_plan(msg)
+    assert plan.action == "prospect_enrich"
+    assert plan.draft is False
 
 
 def test_draft_still_drafts():
