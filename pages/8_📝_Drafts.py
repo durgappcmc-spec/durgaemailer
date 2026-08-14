@@ -50,7 +50,8 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             st.session_state.bcc_cache = {}
         gmail_bcc = fetched.get("bcc") or ""
         shown_bcc = gmail_bcc or st.session_state.bcc_cache.get(gid, "")
-        body = fetched.get("body") or ""
+        body = fetched.get("body") or fetched.get("body_text") or ""
+        body_html = fetched.get("body_html") or ""
         to = fetched.get("to") or ""
         out = {
             **fallback,
@@ -66,6 +67,7 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             "body": body,
             "body_text": body,
             "body_cleaned": body,
+            "body_html": body_html,
             "source": "gmail_fetch",
             "gmail_api_status": fetched.get("gmail_api_status"),
             "error": fetched.get("error"),
@@ -187,6 +189,49 @@ if _profile:
     else:
         st.session_state["gmail_profile_email"] = _profile
     st.caption(f"Gmail account: {_profile}")
+
+with st.expander("Signatures", expanded=False):
+    from core.signatures import load_signatures, save_signature
+
+    _sig_user = _profile or st.session_state.get("gmail_profile_email") or ""
+    _sigs = load_signatures(_sig_user)
+    _sid = st.selectbox(
+        "Signature to edit",
+        list(_sigs.keys()),
+        format_func=lambda k: (_sigs.get(k) or {}).get("name") or k,
+        key="drafts_sig_pick",
+    )
+    if _sid == "none":
+        st.caption("None — drafts will have no signature block.")
+    else:
+        try:
+            from streamlit_quill import st_quill
+
+            _edited = st_quill(
+                value=(_sigs.get(_sid) or {}).get("html") or "",
+                html=True,
+                toolbar=[["bold", "italic", "underline", "link"], ["clean"]],
+                key=f"drafts_sig_quill_{_sid}",
+                placeholder="Signature…",
+            )
+            if _edited is None:
+                _edited = (_sigs.get(_sid) or {}).get("html") or ""
+        except Exception:
+            _edited = st.text_area(
+                "Signature HTML",
+                value=(_sigs.get(_sid) or {}).get("html") or "",
+                height=160,
+                key=f"drafts_sig_html_{_sid}",
+            )
+        if st.button("Save signature", key="drafts_sig_save"):
+            save_signature(
+                _sig_user,
+                _sid,
+                name=(_sigs.get(_sid) or {}).get("name") or _sid,
+                html=_edited or "",
+            )
+            st.success("Signature saved — new drafts and the dropdown will use it.")
+            st.rerun()
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
     "select with checkboxes to send or remove · designation shown per recipient."
@@ -537,27 +582,31 @@ if opened:
         st.rerun()
     draft = _load_full_draft(opened, by_id.get(opened) or {})
     gid = draft.get("gmail_draft_id") or ""
-    preview_body = draft.get("body") or draft.get("body_cleaned") or ""
-    edit_body = st.session_state.get(f"body_{gid}", preview_body) if gid else preview_body
+    preview_body = draft.get("body_html") or draft.get("body") or ""
+    edit_body = preview_body
+    if gid:
+        for k, v in st.session_state.items():
+            if str(k).startswith(f"quill_{gid}"):
+                edit_body = v or edit_body
     with st.expander("Debug · Preview / Edit / Gmail hashes", expanded=False):
         st.write(f"draft_id: `{draft.get('draft_id') or opened}`")
         st.write(f"source: `{draft.get('source') or 'session'}`")
         st.write(f"Gmail API status: `{draft.get('gmail_api_status') or draft.get('error') or '—'}`")
         if draft.get("error"):
             st.error(draft["error"])
-        st.write(f"md5(body_shown_in_preview): `{_md5(preview_body)}`")
-        st.write(f"md5(body_in_edit_textarea): `{_md5(edit_body)}`")
+        st.write(f"md5(body_html_in_preview): `{_md5(preview_body)}`")
+        st.write(f"md5(body_in_quill): `{_md5(str(edit_body or ''))}`")
         st.write(f"md5(body_returned_by_gmail): `{_md5(preview_body if gid else '')}`")
         st.write(f"Cc header: `{draft.get('cc') or ''}`")
         st.write(f"Bcc header: `{draft.get('bcc') or ''}`")
         if draft.get("bcc_local"):
             st.caption(f"Bcc (local cache): {draft.get('shown_bcc') or ''}")
         gmail_hash = _md5(preview_body) if gid else ""
-        if gid and _md5(preview_body) == _md5(edit_body) == gmail_hash:
+        if gid and _md5(preview_body) == _md5(str(edit_body or "")) == gmail_hash:
             st.success("Preview / Edit / Gmail body hashes match")
         elif gid:
             st.warning(
                 "Body hashes differ — Edit may have unsaved changes, "
-                "or the textarea has not mounted yet."
+                "or the editor has not mounted yet."
             )
     render_draft_inspector(draft, key_prefix="drafts_page")

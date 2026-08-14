@@ -102,32 +102,35 @@ def render_draft_inspector(
     )
 
     with tab_preview:
-        # Gmail drafts: verbatim body from fetch. Drive-only: existing HTML path.
-        body = draft.get("body")
-        if body is None or body == "":
-            body = draft.get("body_cleaned") or ""
-        if not body and draft.get("source") != "gmail_fetch":
-            raw = draft.get("body_html") or draft.get("html") or ""
-            if raw:
+        # Inject Gmail HTML as-is — Streamlit markdown must not escape the body.
+        body_html = draft.get("body_html") or draft.get("html") or ""
+        if not body_html:
+            plain = draft.get("body") or draft.get("body_cleaned") or ""
+            if plain:
                 try:
-                    from gmail_client.html_format import prepare_draft_bodies
+                    from gmail_client.html_format import (
+                        html_from_cleaned_body,
+                        looks_like_html,
+                    )
 
-                    body, _h = prepare_draft_bodies(raw)
+                    body_html = (
+                        plain if looks_like_html(plain) else html_from_cleaned_body(plain)
+                    )
                 except Exception:
-                    body = ""
-        draft["_preview_body"] = body or ""
-        if not body:
+                    body_html = plain
+        draft["_preview_body"] = body_html or ""
+        if not body_html:
             st.info("No body stored for this draft.")
         else:
             try:
-                from gmail_client.html_format import render_draft_html
+                from gmail_client.html_format import render_gmail_preview
 
                 st.markdown(
-                    render_draft_html(
+                    render_gmail_preview(
                         draft.get("subject") or "",
                         draft.get("to") or draft.get("recipient") or "",
                         draft.get("cc") or "",
-                        body,
+                        body_html,
                         bcc=draft.get("shown_bcc") or draft.get("bcc") or "",
                         bcc_local=bool(draft.get("bcc_local")),
                     ),
@@ -135,7 +138,7 @@ def render_draft_inspector(
                 )
             except Exception:
                 st.markdown(
-                    f'<div class="email-preview">{body}</div>',
+                    f'<div class="gm-preview">{body_html}</div>',
                     unsafe_allow_html=True,
                 )
             if tid or has_pixel:
@@ -276,17 +279,33 @@ def render_draft_inspector(
             _render_edit_tab(draft, tid=tid, key_prefix=key_prefix)
 
 
+_GMAIL_QUILL_TOOLBAR = [
+    ["bold", "italic", "underline", "strike"],
+    [{"list": "ordered"}, {"list": "bullet"}],
+    [{"indent": "-1"}, {"indent": "+1"}],
+    ["link", "blockquote"],
+    [{"header": [1, 2, 3, False]}],
+    [{"color": []}, {"background": []}],
+    ["clean"],
+]
+
+
 def _render_gmail_edit_tab(
     draft: dict[str, Any], *, gid: str, key_prefix: str
 ) -> None:
-    """Edit To/Cc/Bcc/subject/body from the same Gmail fetch as Preview."""
+    """Edit To/Cc/Bcc/subject/HTML body from the same Gmail fetch as Preview."""
+    from core.signatures import (
+        load_signatures,
+        replace_signature,
+        save_signature,
+    )
     from gmail_client.drafts import (
         delete_gmail_draft,
         fetch_gmail_draft,
         save_gmail_draft,
         send_draft,
     )
-    from gmail_client.html_format import clean_email_body
+    from gmail_client.html_format import clean_email_body, plain_from_html
 
     if "bcc_cache" not in st.session_state:
         st.session_state.bcc_cache = {}
@@ -318,13 +337,81 @@ def _render_gmail_edit_tab(
         value=draft.get("subject") or "",
         key=f"sub_{gid}",
     )
-    new_body = st.text_area(
-        "Body",
-        value=draft.get("body") or "",
-        height=400,
-        key=f"body_{gid}",
+
+    user_email = (
+        draft.get("from")
+        or st.session_state.get("gmail_profile_email")
+        or ""
+    )
+    sigs = load_signatures(user_email)
+    sig_ids = list(sigs.keys())
+    seed_key = f"quill_seed_{gid}"
+    nonce_key = f"quill_nonce_{gid}"
+    prev_sig_key = f"sig_prev_{gid}"
+    if seed_key not in st.session_state:
+        html0 = draft.get("body_html") or ""
+        st.session_state[seed_key] = html0
+        st.session_state[nonce_key] = 0
+
+    nonce = int(st.session_state.get(nonce_key, 0) or 0)
+    quill_key = f"quill_{gid}_{nonce}"
+    new_body = _rich_text_editor(
+        st.session_state.get(seed_key) or draft.get("body_html") or "",
+        key=quill_key,
+        toolbar=_GMAIL_QUILL_TOOLBAR,
     )
     draft["_edit_body"] = new_body or ""
+
+    sig_col, edit_col = st.columns([4, 1])
+    with sig_col:
+        default_idx = sig_ids.index("default") if "default" in sig_ids else 0
+        sig_choice = st.selectbox(
+            "Signature",
+            sig_ids,
+            index=default_idx,
+            format_func=lambda k: (sigs.get(k) or {}).get("name") or k,
+            key=f"sig_{gid}",
+        )
+    with edit_col:
+        st.write("")
+        edit_sig = st.button("✏️ Edit", key=f"sig_edit_btn_{gid}", disabled=sig_choice == "none")
+
+    if st.session_state.get(prev_sig_key) is None:
+        st.session_state[prev_sig_key] = sig_choice
+    elif sig_choice != st.session_state[prev_sig_key]:
+        current = new_body or st.session_state.get(seed_key) or ""
+        st.session_state[seed_key] = replace_signature(
+            str(current), (sigs.get(sig_choice) or {}).get("html") or ""
+        )
+        st.session_state[nonce_key] = nonce + 1
+        st.session_state[prev_sig_key] = sig_choice
+        st.rerun()
+
+    if edit_sig:
+        st.session_state[f"sig_editing_{gid}"] = True
+    if st.session_state.get(f"sig_editing_{gid}") and sig_choice != "none":
+        st.caption(f"Editing signature: {(sigs.get(sig_choice) or {}).get('name')}")
+        edited_sig = _rich_text_editor(
+            (sigs.get(sig_choice) or {}).get("html") or "",
+            key=f"sig_quill_{gid}_{sig_choice}",
+            toolbar=[["bold", "italic", "underline", "link"], ["clean"]],
+        )
+        s1, s2 = st.columns(2)
+        if s1.button("Save signature", key=f"sig_save_{gid}"):
+            save_signature(
+                user_email,
+                sig_choice,
+                name=(sigs.get(sig_choice) or {}).get("name") or sig_choice,
+                html=edited_sig or "",
+            )
+            current = new_body or st.session_state.get(seed_key) or ""
+            st.session_state[seed_key] = replace_signature(str(current), edited_sig or "")
+            st.session_state[nonce_key] = nonce + 1
+            st.session_state[f"sig_editing_{gid}"] = False
+            st.rerun()
+        if s2.button("Cancel", key=f"sig_cancel_{gid}"):
+            st.session_state[f"sig_editing_{gid}"] = False
+            st.rerun()
 
     col_a, col_b, col_c = st.columns([1, 1, 1])
     save_clicked = col_a.button("💾 Save to Gmail", key=f"save_{gid}")
@@ -378,14 +465,18 @@ def _render_gmail_edit_tab(
         pass
 
     fetched = fetch_gmail_draft(gid)
-    cleaned = saved.get("body_cleaned") or clean_email_body(new_body)
+    cleaned = (
+        saved.get("body_cleaned")
+        or clean_email_body(plain_from_html(new_body or ""))
+    )
     to_n = saved.get("to") or ""
     cc_n = saved.get("cc") or ""
     issues: list[str] = []
-    if (fetched.get("body") or "").strip() != cleaned.strip():
+    gmail_plain = (fetched.get("body_text") or fetched.get("body") or "").strip()
+    if gmail_plain != (cleaned or "").strip():
         issues.append(
             "body mismatch\n--- written ---\n"
-            f"{cleaned}\n--- gmail ---\n{fetched.get('body')}"
+            f"{cleaned}\n--- gmail ---\n{gmail_plain}"
         )
     if (fetched.get("to") or "").lower() != to_n.lower():
         issues.append(f"To mismatch: written={to_n!r} gmail={fetched.get('to')!r}")
@@ -422,8 +513,27 @@ def _render_gmail_edit_tab(
 
 
 def _clear_gmail_edit_keys(gid: str) -> None:
-    for suffix in ("to", "cc", "bcc", "sub", "body"):
-        st.session_state.pop(f"{suffix}_{gid}", None)
+    prefixes = (
+        f"to_{gid}",
+        f"cc_{gid}",
+        f"bcc_{gid}",
+        f"sub_{gid}",
+        f"body_{gid}",
+        f"quill_{gid}",
+        f"quill_seed_{gid}",
+        f"quill_nonce_{gid}",
+        f"sig_{gid}",
+        f"sig_prev_{gid}",
+        f"sig_edit_btn_{gid}",
+        f"sig_quill_{gid}",
+        f"sig_save_{gid}",
+        f"sig_cancel_{gid}",
+        f"sig_editing_{gid}",
+    )
+    for k in list(st.session_state.keys()):
+        sk = str(k)
+        if any(sk == p or sk.startswith(p) for p in prefixes):
+            st.session_state.pop(k, None)
 
 
 def _render_edit_tab(
@@ -573,7 +683,9 @@ def _render_edit_tab(
     st.rerun()
 
 
-def _rich_text_editor(html: str, *, key: str) -> str:
+def _rich_text_editor(
+    html: str, *, key: str, toolbar: Optional[list] = None
+) -> str:
     """WYSIWYG editor; falls back to text_area if Quill is unavailable."""
     try:
         from streamlit_quill import st_quill
@@ -581,7 +693,7 @@ def _rich_text_editor(html: str, *, key: str) -> str:
         result = st_quill(
             value=html or "",
             html=True,
-            toolbar=_QUILL_TOOLBAR,
+            toolbar=toolbar or _QUILL_TOOLBAR,
             key=key,
             placeholder="Write your email…",
         )
@@ -596,7 +708,7 @@ def _rich_text_editor(html: str, *, key: str) -> str:
         return st.text_area(
             "Email body (HTML)",
             value=html or "",
-            height=320,
+            height=400,
             key=f"{key}_fallback",
         )
 

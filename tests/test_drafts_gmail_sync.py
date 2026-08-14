@@ -79,3 +79,92 @@ def test_render_draft_html_includes_cc_and_local_bcc():
     assert "cc@x.com" in html
     assert "blind@x.com" in html
     assert "(local)" in html
+
+
+def test_extract_html_prefers_text_html():
+    from gmail_client.drafts import _extract_html_body
+
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {
+                "mimeType": "text/plain",
+                "body": {"data": _b64("Hello plain\n\nSecond")},
+            },
+            {
+                "mimeType": "text/html",
+                "body": {
+                    "data": _b64(
+                        "<p>Hello</p><ul><li>One</li></ul>"
+                        '<div class="gmail_signature">Best</div>'
+                    )
+                },
+            },
+        ],
+    }
+    html = _extract_html_body(payload)
+    assert "<ul>" in html
+    assert "<li>One</li>" in html
+    assert "gmail_signature" in html
+    assert "Hello plain" not in html
+
+
+def test_extract_html_falls_back_to_wrapped_plain():
+    from gmail_client.drafts import _extract_html_body
+
+    payload = {
+        "mimeType": "text/plain",
+        "body": {"data": _b64("Hi Jane,\n\nThanks.")},
+    }
+    html = _extract_html_body(payload)
+    assert "<p>" in html
+    assert "Hi Jane," in html
+    assert "Thanks." in html
+
+
+def test_sanitize_strips_script_iframe_and_on_handlers():
+    from gmail_client.html_format import sanitize_email_html
+
+    out = sanitize_email_html(
+        '<p>Hi</p><script>alert(1)</script><iframe src="x"></iframe>'
+        '<p onclick="evil()">ok</p>'
+    )
+    low = out.lower()
+    assert "<script" not in low
+    assert "<iframe" not in low
+    assert "onclick" not in low
+    assert "ok" in out
+
+
+def test_render_gmail_preview_keeps_raw_lists_and_signature():
+    from gmail_client.html_format import render_gmail_preview
+
+    body = (
+        "<p>Hi</p><ul><li>One</li></ul>"
+        '<div class="gmail_signature" data-smartmail="gmail_signature">'
+        "<p>Best,<br>Durga</p></div>"
+    )
+    html = render_gmail_preview("Hello", "jane@acme.com", "cc@x.com", body)
+    assert "<ul>" in html
+    assert "<li>One</li>" in html
+    assert "gmail_signature" in html
+    assert "&lt;ul&gt;" not in html
+    assert "gm-preview" in html
+    assert "jane@acme.com" in html
+
+
+def test_with_signature_appends_once_and_replace_can_remove():
+    from core.signatures import replace_signature, with_signature
+
+    body = "<p>Hi Jane,</p><p>Thanks.</p>"
+    sig = "<p>Best,<br>Durga</p>"
+    once = with_signature(body, sig)
+    assert 'class="gmail_signature"' in once
+    twice = with_signature(once, sig)
+    assert twice.count('class="gmail_signature"') == 1
+    swapped = replace_signature(once, "<p>Short</p>")
+    assert "Short" in swapped
+    assert "Hi Jane" in swapped
+    removed = replace_signature(swapped, "")
+    assert "gmail_signature" not in removed
+    assert "Hi Jane" in removed

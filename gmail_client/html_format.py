@@ -438,7 +438,11 @@ def html_from_cleaned_body(cleaned: str) -> str:
 
 def looks_like_html(body: str) -> bool:
     return bool(
-        re.search(r"</?(?:p|div|br|ul|ol|li|table|strong|em|a|h\d)\b", body or "", re.I)
+        re.search(
+            r"</?(?:p|div|br|ul|ol|li|table|strong|em|a|h\d|u|s|strike|blockquote)\b",
+            body or "",
+            re.I,
+        )
     )
 
 
@@ -549,3 +553,84 @@ def render_draft_html(subject, to, cc, body_cleaned, bcc="", bcc_local=False):
       {body_html}
     </div>
     """
+
+
+GMAIL_PREVIEW_CSS = """
+<style>
+.gm-preview {
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #202124;
+  background: #ffffff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 20px;
+  max-width: 720px;
+}
+.gm-preview p           { margin: 0 0 12px 0; }
+.gm-preview ul,
+.gm-preview ol          { margin: 0 0 12px 24px; padding: 0; }
+.gm-preview li          { margin: 0 0 4px 0; }
+.gm-preview blockquote  { border-left: 3px solid #e0e0e0;
+                          margin: 0 0 12px 0; padding: 0 12px;
+                          color: #5f6368; }
+.gm-preview a           { color: #1a73e8; text-decoration: underline; }
+.gm-preview strong,
+.gm-preview b           { font-weight: 700; }
+.gm-preview em,
+.gm-preview i           { font-style: italic; }
+.gm-preview u           { text-decoration: underline; }
+.gm-preview s,
+.gm-preview strike      { text-decoration: line-through; }
+.gm-preview hr          { border: none; border-top: 1px solid #eee;
+                          margin: 12px 0; }
+.gm-preview .gmail_signature { color: #202124; }
+.gm-headers             { font-size: 12px; color: #5f6368;
+                          margin-bottom: 12px; }
+</style>
+"""
+
+
+def sanitize_email_html(html: str) -> str:
+    """Strip scripts/iframes/on* handlers before preview or save."""
+    raw = html or ""
+    if not raw.strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup.find_all(["script", "style", "iframe", "object", "embed"]):
+            tag.decompose()
+        for tag in soup.find_all(True):
+            for attr in list(tag.attrs or {}):
+                if str(attr).lower().startswith("on"):
+                    del tag.attrs[attr]
+        return str(soup)
+    except Exception:
+        return re.sub(
+            r"<(script|iframe|object|embed)\b[^>]*>.*?</\1>",
+            "",
+            raw,
+            flags=re.I | re.S,
+        )
+
+
+def render_gmail_preview(subject, to, cc, body_html, bcc="", bcc_local=False):
+    """Inject Gmail-like CSS + raw HTML body (not markdown-escaped)."""
+    safe = sanitize_email_html(body_html or "")
+    bcc_line = ""
+    if bcc:
+        tag = " (local)" if bcc_local else ""
+        bcc_line = f"<b>Bcc:</b> {_html.escape(str(bcc))}{tag}<br>"
+    headers = (
+        f'<div class="gm-headers">'
+        f"<b>To:</b> {_html.escape(str(to or ''))}<br>"
+        + (f"<b>Cc:</b> {_html.escape(str(cc))}<br>" if cc else "")
+        + bcc_line
+        + f"<b>Subject:</b> {_html.escape(str(subject or ''))}"
+        + "</div><hr>"
+    )
+    return GMAIL_PREVIEW_CSS + f'<div class="gm-preview">{headers}{safe}</div>'
+

@@ -76,21 +76,21 @@ def get_signature(send_as_email: Optional[str] = None) -> str:
 
 
 def append_signature(html_body: str, *, from_email: Optional[str] = None) -> str:
-    """Append the Gmail send-as signature once — never duplicate."""
+    """Append the Gmail send-as / default signature once — never duplicate."""
+    from core.signatures import get_default_signature_html, with_signature
     from gmail_client.html_format import body_looks_signed, normalize_email_html
 
     body = normalize_email_html(html_body or "<p></p>")
-    sig = get_signature(from_email)
+    sig = get_signature(from_email) or get_default_signature_html(from_email or "")
     if not sig:
         return body
     if body_looks_signed(body, sig):
         return body
-    # Legacy short-needle check
     needle = re.sub(r"\s+", "", sig[:80]).lower()
     compact_body = re.sub(r"\s+", "", body).lower()
     if needle and needle in compact_body:
         return body
-    return f"{body}<br><br>{sig}"
+    return with_signature(body, sig)
 
 
 def _normalize_cc(cc: Optional[str | list[str]]) -> str:
@@ -249,16 +249,20 @@ def create_draft(
     URLs in the draft so Netlify tracking URLs are not visible while reviewing;
     clicks are wrapped at send time.
     """
-    from gmail_client.html_format import prepare_draft_bodies
+    from gmail_client.html_format import (
+        clean_email_body,
+        normalize_email_html,
+        plain_from_html,
+        sanitize_email_html,
+    )
 
     from_addr = from_email or default_from_email()
     src = (source or "relay_draft").strip() or "relay_draft"
     if track and "draft" not in src.lower():
         src = f"{src}_draft"
 
-    # Clean LLM/plain/HTML → body_cleaned (source of truth) + simple HTML
-    body_cleaned, html_core = prepare_draft_bodies(html_body or "")
-    body = html_core
+    # Keep lists/links/signature HTML; derive text/plain from that HTML.
+    body = sanitize_email_html(normalize_email_html(html_body or ""))
     try:
         from core.tracking import strip_tracking, strip_visible_tracking_urls
 
@@ -267,6 +271,7 @@ def create_draft(
         pass
     if include_signature:
         body = append_signature(body, from_email=from_addr)
+    body_cleaned = clean_email_body(plain_from_html(body)) or ""
 
     # Drafts: open pixel only — never rewrite hrefs to Netlify click URLs
     raw, tracking_id = _build_raw_message(

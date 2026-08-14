@@ -93,22 +93,53 @@ def _extract_plain_body(payload: dict) -> str:
     return ""
 
 
+def _extract_html_body(payload: dict) -> str:
+    """Prefer text/html; fall back to paragraph-wrapped plain text."""
+    html = ""
+    text = ""
+
+    def walk(part: dict) -> None:
+        nonlocal html, text
+        mime = (part.get("mimeType") or "").lower()
+        data = (part.get("body") or {}).get("data")
+        if data and mime in ("text/html", "text/plain"):
+            decoded = _decode_b64url(data)
+            if mime == "text/html" and not html:
+                html = decoded
+            elif mime == "text/plain" and not text:
+                text = decoded
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload or {})
+    if (html or "").strip():
+        return html.replace("\r\n", "\n").replace("\r", "\n")
+    plain = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    paras = [p for p in plain.split("\n\n") if p.strip()]
+    return "".join(
+        f"<p>{_html.escape(p).replace(chr(10), '<br>')}</p>" for p in paras
+    )
+
+
 def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
-    """Gmail is the source of truth. Does not re-clean the body on read."""
+    """Gmail is the source of truth. HTML is primary; plain is derived."""
     did = (draft_id or "").removeprefix("gmail:")
+    empty = {
+        "id": did,
+        "to": "",
+        "cc": "",
+        "bcc": "",
+        "subject": "",
+        "body": "",
+        "body_html": "",
+        "body_text": "",
+        "raw_msg": {},
+        "source": "gmail_fetch",
+        "gmail_draft_id": did,
+        "draft_id": f"gmail:{did}" if did else "",
+    }
     if not did:
-        return {
-            "id": "",
-            "to": "",
-            "cc": "",
-            "bcc": "",
-            "subject": "",
-            "body": "",
-            "raw_msg": {},
-            "error": "missing gmail draft id",
-            "gmail_api_status": "error",
-            "source": "gmail_fetch",
-        }
+        return {**empty, "error": "missing gmail draft id", "gmail_api_status": "error"}
     try:
         svc = gmail_service()
         d = svc.users().drafts().get(userId="me", id=did, format="full").execute()
@@ -116,33 +147,24 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
     except Exception as e:
         code = getattr(getattr(e, "resp", None), "status", None) or "error"
         print(f"[gmail] drafts.get failed: {e}", file=sys.stderr)
-        return {
-            "id": did,
-            "to": "",
-            "cc": "",
-            "bcc": "",
-            "subject": "",
-            "body": "",
-            "raw_msg": {},
-            "error": str(e),
-            "gmail_api_status": code,
-            "source": "gmail_fetch",
-            "gmail_draft_id": did,
-            "draft_id": f"gmail:{did}",
-        }
+        return {**empty, "error": str(e), "gmail_api_status": code}
     msg = d.get("message") or {}
+    payload = msg.get("payload") or {}
     headers = {
         h["name"].lower(): h["value"]
-        for h in (msg.get("payload") or {}).get("headers") or []
+        for h in payload.get("headers") or []
     }
-    body = _extract_plain_body(msg.get("payload") or {})
+    body_html = _extract_html_body(payload)
+    body_text = _extract_plain_body(payload)
     return {
         "id": did,
         "to": headers.get("to", ""),
         "cc": headers.get("cc", ""),
         "bcc": headers.get("bcc", ""),
         "subject": headers.get("subject", ""),
-        "body": body,
+        "body": body_text,
+        "body_html": body_html,
+        "body_text": body_text,
         "raw_msg": msg,
         "gmail_api_status": status,
         "source": "gmail_fetch",
@@ -162,18 +184,29 @@ def save_gmail_draft(
     attachments: Optional[list[dict[str, Any]]] = None,
     from_email: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Write cleaned body + To/Cc/Bcc back to Gmail. Cleaning runs only here."""
-    from gmail_client.html_format import clean_email_body, html_from_cleaned_body
+    """Write HTML + text/plain to Gmail. `body` may be HTML or plain."""
+    from gmail_client.html_format import (
+        clean_email_body,
+        html_from_cleaned_body,
+        looks_like_html,
+        plain_from_html,
+        sanitize_email_html,
+    )
     from gmail_client.send import _build_raw_message, default_from_email
 
     did = (draft_id or "").removeprefix("gmail:")
     if not did:
         return {"error": "missing gmail draft id"}
-    cleaned = clean_email_body(body)
+    raw_body = body or ""
+    if looks_like_html(raw_body):
+        html = sanitize_email_html(raw_body)
+        cleaned = clean_email_body(plain_from_html(html))
+    else:
+        cleaned = clean_email_body(raw_body)
+        html = html_from_cleaned_body(cleaned)
     to_n = normalize_addr_list(to)
     cc_n = _drop_addrs_already_in_to(normalize_addr_list(cc), to_n)
     bcc_n = _drop_addrs_already_in_to(normalize_addr_list(bcc), to_n)
-    html = html_from_cleaned_body(cleaned)
     try:
         raw, _tid = _build_raw_message(
             to=to_n,
@@ -202,6 +235,7 @@ def save_gmail_draft(
             "bcc": bcc_n,
             "subject": subject or "",
             "body_cleaned": cleaned,
+            "body_html": html,
             "updated": updated,
         }
     except Exception as e:
@@ -309,7 +343,7 @@ def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
-    """Full draft. Body is Gmail text/plain verbatim — never re-cleaned on read."""
+    """Full draft. HTML is primary; text/plain is not re-cleaned on read."""
     fetched = fetch_gmail_draft(gmail_draft_id)
     did = fetched.get("id") or (gmail_draft_id or "").removeprefix("gmail:")
     if fetched.get("error"):
@@ -321,8 +355,10 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         }
     msg = fetched.get("raw_msg") or {}
     html, text = _extract_bodies(msg.get("payload") or {})
-    body = fetched.get("body") or text or ""
-    body_html = html or (f"<pre>{text}</pre>" if text else "")
+    body_html = fetched.get("body_html") or html or ""
+    body = fetched.get("body_text") or fetched.get("body") or text or ""
+    if not body_html:
+        body_html = html or (f"<pre>{text}</pre>" if text else "")
     tracking_id = _extract_tracking_id(body_html)
     to = fetched.get("to") or ""
     to_email = (_EMAIL_RE.findall(to) or [to])[0] if to else ""
