@@ -12,7 +12,15 @@ sys.path.insert(0, str(ROOT))
 class FakeGemini:
     def generate(self, task_kind, prompt, **kwargs):
         if "Check whether" in prompt or task_kind == "grounding_check":
-            parsed = {"ok": True, "violations": []}
+            parsed = {
+                "ok": False,
+                "violations": [
+                    {
+                        "claim": "Lunar Cheese Program is your flagship",
+                        "reason": "not in org_brief",
+                    }
+                ],
+            }
         else:
             parsed = {
                 "subject": "Hello",

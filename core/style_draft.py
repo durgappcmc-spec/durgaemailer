@@ -350,23 +350,78 @@ User request:
 Return JSON only:
 {{"subject": "...", "body": "plain email body with paragraphs separated by blank lines"}}
 """
+    system = (
+        "You write CSR partnership emails. Never invent a recipient email. "
+        "Never copy a style template verbatim. Follow the user requirement "
+        "exactly (topic, asks, tone, constraints). Return JSON only."
+    )
     subject = ""
     body = ""
-    try:
-        raw = extract_json(
-            prompt,
-            system=(
-                "You write CSR partnership emails. Never invent a recipient email. "
-                "Never copy a style template verbatim. Return JSON only."
-            ),
-            max_tokens=2500,
-        )
-        data = json.loads(raw or "{}") if raw else {}
+    provider = "gemini"
+    quality: dict[str, Any] = {
+        "ok": True,
+        "score": 0.7,
+        "issues": [],
+        "missing_requirements": [],
+    }
+    critique = ""
+    for attempt in range(2):
+        run_prompt = prompt
+        if critique:
+            run_prompt = (
+                prompt
+                + "\n\nPrevious draft failed a requirement check. Fix ALL of:\n"
+                + critique
+            )
+        data: dict[str, Any] = {}
+        try:
+            from core.genspark_client import available as _gsk_on
+            from core.genspark_client import compose_json as _gsk_json
+
+            if _gsk_on():
+                provider = "genspark"
+                data = _gsk_json(run_prompt, system=system, max_tokens=2500)
+            else:
+                raw = extract_json(run_prompt, system=system, max_tokens=2500)
+                parsed = json.loads(raw or "{}") if raw else {}
+                data = parsed if isinstance(parsed, dict) else {}
+        except Exception as e:
+            print(f"[style_draft] compose failed: {e}", file=sys.stderr)
+            if provider == "genspark":
+                try:
+                    raw = extract_json(run_prompt, system=system, max_tokens=2500)
+                    parsed = json.loads(raw or "{}") if raw else {}
+                    data = parsed if isinstance(parsed, dict) else {}
+                    provider = "gemini_fallback"
+                except Exception as e2:
+                    print(f"[style_draft] gemini fallback failed: {e2}", file=sys.stderr)
+                    data = {}
         if isinstance(data, dict):
             subject = str(data.get("subject") or "").strip()
             body = str(data.get("body") or data.get("html_body") or "").strip()
-    except Exception as e:
-        print(f"[style_draft] compose failed: {e}", file=sys.stderr)
+        if not body:
+            break
+        try:
+            from core.genspark_client import available as _gsk_on
+            from core.genspark_client import review_email as _gsk_review
+
+            if _gsk_on():
+                quality = _gsk_review(
+                    user_msg=user_msg,
+                    subject=subject,
+                    body=body,
+                    to_email=to_email,
+                )
+        except Exception as e:
+            print(f"[style_draft] quality review skipped: {e}", file=sys.stderr)
+        if quality.get("ok"):
+            break
+        bits = list(quality.get("issues") or []) + list(
+            quality.get("missing_requirements") or []
+        )
+        critique = "\n".join(f"- {b}" for b in bits if b)
+        if not critique:
+            break
 
     if not body:
         first = str((enrichment or {}).get("first_name") or "").strip() or "there"
@@ -384,4 +439,9 @@ Return JSON only:
         "subject": subject,
         "body_cleaned": cleaned,
         "html_body": html_from_cleaned_body(cleaned),
+        "provider": provider,
+        "quality_ok": bool(quality.get("ok", True)),
+        "quality_score": float(quality.get("score") or 0),
+        "quality_issues": list(quality.get("issues") or [])
+        + list(quality.get("missing_requirements") or []),
     }

@@ -1054,6 +1054,24 @@ def _run_styled_directive_draft(
         style_template=style_ref,
         user_msg=user_msg,
     )
+    provider = composed.get("provider") or ""
+    if provider:
+        yield f"_Composer: `{provider}`_\n"
+    issues = composed.get("quality_issues") or []
+    if composed.get("quality_ok") is False:
+        score = composed.get("quality_score")
+        yield (
+            f"**Quality check** (score {score:.0%}): this draft may not match "
+            "your request:\n"
+            if isinstance(score, (int, float))
+            else "**Quality check:** this draft may not match your request:\n"
+        )
+        for issue in issues[:6]:
+            yield f"- {issue}\n"
+        yield (
+            "Saving it anyway — use **↩ Rollback last draft** under the chat "
+            "box if you want it deleted.\n"
+        )
     name = str((enrichment or {}).get("name") or "").strip()
     title = str((enrichment or {}).get("title") or "").strip()
     company = str((enrichment or {}).get("company") or "").strip()
@@ -4611,6 +4629,12 @@ HTML only in html_body. No markdown. Do not include a signature block.
             "prospects": prospect_out or None,
             "draft_previews": draft_previews or None,
             "draft_debug": draft_debug,
+            "draft_rollback_ids": [
+                str(pv.get("draft_id") or "")
+                for pv in (draft_previews or [])
+                if pv.get("draft_id")
+            ]
+            or None,
             "cancelled": cancelled,
             "pending_user_msg": user_msg if need_file else None,
         }
