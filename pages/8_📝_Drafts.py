@@ -28,20 +28,11 @@ from gmail_client.send import send_email
 
 
 def _load_full_draft(draft_id: str, fallback: dict) -> dict:
-    try:
-        d = drive_db.load_draft(draft_id)
-        if d.get("body_html"):
-            if not d.get("tracking_id"):
-                d["tracking_id"] = extract_tracking_id(d.get("body_html") or "") or ""
-            d["has_open_pixel"] = bool(
-                d.get("tracking_id")
-                or "/.netlify/functions/open" in (d.get("body_html") or "")
-            )
-            return d
-    except Exception:
-        pass
+    """Fetch each draft fresh from Gmail when possible (Gmail is source of truth)."""
+    gid = ""
     if str(draft_id).startswith("gmail:") or fallback.get("gmail_draft_id"):
         gid = fallback.get("gmail_draft_id") or str(draft_id).removeprefix("gmail:")
+    if gid:
         full = get_gmail_draft(gid)
         if not full.get("error"):
             try:
@@ -49,6 +40,25 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             except Exception:
                 pass
             return full
+    try:
+        d = drive_db.load_draft(draft_id)
+        if d.get("body_html") or d.get("body_cleaned"):
+            if not d.get("tracking_id"):
+                d["tracking_id"] = extract_tracking_id(d.get("body_html") or "") or ""
+            d["has_open_pixel"] = bool(
+                d.get("tracking_id")
+                or "/.netlify/functions/open" in (d.get("body_html") or "")
+            )
+            if not d.get("body_cleaned") and d.get("body_html"):
+                try:
+                    from gmail_client.html_format import prepare_draft_bodies
+
+                    d["body_cleaned"], _h = prepare_draft_bodies(d.get("body_html") or "")
+                except Exception:
+                    pass
+            return d
+    except Exception:
+        pass
     return dict(fallback)
 
 

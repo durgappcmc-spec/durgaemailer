@@ -102,6 +102,8 @@ def normalize(raw: dict[str, Any], source: str = "", source_id: str = "") -> dic
         "location": raw.get("location") or raw.get("city") or "",
         "seniority": raw.get("seniority") or raw.get("managementLevel") or "",
         "department": raw.get("department") or "",
+        "industry": raw.get("industry") or raw.get("companyIndustry") or "",
+        "about": raw.get("about") or raw.get("bio") or raw.get("personOverview") or "",
         "source": source or raw.get("source") or "",
         "source_id": source_id or str(raw.get("id") or raw.get("source_id") or ""),
         "raw": raw,

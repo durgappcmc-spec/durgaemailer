@@ -70,16 +70,30 @@ def search_all(
 def enrich_fallthrough(
     identifier: dict[str, Any],
     order: tuple[str, ...] | list[str] | None = None,
+    *,
+    linkedin_url: str | None = None,
+    allow_multi_provider: bool = False,
 ) -> dict[str, Any]:
-    """Try providers in order; return first result that has an email."""
+    """Try providers in order; return first result that has an email.
+
+    `linkedin_url=` is copied onto the identifier and routed to ZoomInfo
+    personLinkedInUrl / companyLinkedInUrl. Apollo/RocketReach run only when
+    `allow_multi_provider` is True (or they are listed in `order`).
+    """
+    ident = dict(identifier or {})
+    if linkedin_url:
+        ident["linkedin_url"] = linkedin_url
     if order is None:
-        order = ("zoominfo",)
+        order = ("zoominfo", "apollo", "rocketreach") if allow_multi_provider else ("zoominfo",)
     errors: list[dict[str, str]] = []
     last_without_email: Optional[dict[str, Any]] = None
     for name in order:
         try:
             conn = get_connector(name)
-            result = conn.enrich(identifier)
+            kwargs: dict[str, Any] = {}
+            if ident.get("linkedin_url") and name == "zoominfo":
+                kwargs["linkedin_url"] = ident["linkedin_url"]
+            result = conn.enrich(ident, **kwargs) if kwargs else conn.enrich(ident)
             if result and result.get("email"):
                 return result
             if result:
@@ -87,6 +101,21 @@ def enrich_fallthrough(
                 errors.append({"source": name, "error": "no email in result"})
             else:
                 errors.append({"source": name, "error": "no match"})
+        except TypeError:
+            # Connector enrich() without linkedin_url kwarg
+            try:
+                conn = get_connector(name)
+                result = conn.enrich(ident)
+                if result and result.get("email"):
+                    return result
+                if result:
+                    last_without_email = result
+                    errors.append({"source": name, "error": "no email in result"})
+                else:
+                    errors.append({"source": name, "error": "no match"})
+            except Exception as e:
+                print(f"[{name}] enrich_fallthrough error: {e}", file=sys.stderr)
+                errors.append({"source": name, "error": str(e)})
         except Exception as e:
             print(f"[{name}] enrich_fallthrough error: {e}", file=sys.stderr)
             errors.append({"source": name, "error": str(e)})

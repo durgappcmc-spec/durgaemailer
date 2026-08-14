@@ -129,8 +129,14 @@ def _build_raw_message(
     from_email: Optional[str] = None,
     cc: Optional[str | list[str]] = None,
     include_signature: bool = True,
+    plain_body: Optional[str] = None,
+    bcc: Optional[str | list[str]] = None,
 ) -> tuple[str, str]:
-    """Build base64url raw MIME. Returns (raw, tracking_id)."""
+    """Build base64url raw MIME. Returns (raw, tracking_id).
+
+    multipart/alternative: text/plain first (cleaned prose), then text/html.
+    Never calls textwrap.fill().
+    """
     tracking_id = ""
     from_addr = (from_email or default_from_email()).strip()
     body = html_body
@@ -153,15 +159,20 @@ def _build_raw_message(
             tracking_id = ""
 
     cc_header = _normalize_cc(cc)
+    bcc_header = _normalize_cc(bcc)
     msg = MIMEMultipart("alternative")
     if from_addr:
         msg["From"] = from_addr
     msg["To"] = to
     if cc_header:
         msg["Cc"] = cc_header
+    if bcc_header:
+        msg["Bcc"] = bcc_header
     msg["Subject"] = subject
     if recipient_name:
         msg["X-Recipient-Name"] = recipient_name
+    if plain_body is not None:
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(MIMEText(body, "html", "utf-8"))
 
     if attachments:
@@ -171,6 +182,8 @@ def _build_raw_message(
         mixed["To"] = to
         if cc_header:
             mixed["Cc"] = cc_header
+        if bcc_header:
+            mixed["Bcc"] = bcc_header
         mixed["Subject"] = subject
         mixed.attach(msg)
         for att in attachments:
@@ -183,6 +196,34 @@ def _build_raw_message(
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     return raw, tracking_id
+
+
+def _verify_gmail_plain_matches(gmail_draft_id: str, body_cleaned: str) -> None:
+    """Re-fetch the draft; warn (do not raise) if text/plain ≠ body_cleaned."""
+    did = (gmail_draft_id or "").removeprefix("gmail:")
+    if not did:
+        return
+    try:
+        from gmail_client.drafts import _extract_bodies
+
+        svc = gmail_service()
+        full = (
+            svc.users()
+            .drafts()
+            .get(userId="me", id=did, format="full")
+            .execute()
+        )
+        _html, text = _extract_bodies((full.get("message") or {}).get("payload") or {})
+        fetched = (text or "").strip()
+        expected = (body_cleaned or "").strip()
+        if fetched != expected:
+            print(
+                "[gmail] Draft preview does not match Gmail draft "
+                f"(plain {len(fetched)} chars vs cleaned {len(expected)})",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[gmail] draft round-trip check skipped: {e}", file=sys.stderr)
 
 
 def create_draft(
@@ -200,6 +241,7 @@ def create_draft(
     include_signature: bool = True,
     recipient_title: Optional[str] = None,
     company: Optional[str] = None,
+    bcc: Optional[str | list[str]] = None,
 ) -> dict[str, Any]:
     """Create a new Gmail draft for review.
 
@@ -207,15 +249,16 @@ def create_draft(
     URLs in the draft so Netlify tracking URLs are not visible while reviewing;
     clicks are wrapped at send time.
     """
-    from gmail_client.html_format import normalize_email_html
+    from gmail_client.html_format import prepare_draft_bodies
 
     from_addr = from_email or default_from_email()
     src = (source or "relay_draft").strip() or "relay_draft"
     if track and "draft" not in src.lower():
         src = f"{src}_draft"
 
-    # Normalize markdown → HTML once, then append signature at most once
-    body = normalize_email_html(html_body or "")
+    # Clean LLM/plain/HTML → body_cleaned (source of truth) + simple HTML
+    body_cleaned, html_core = prepare_draft_bodies(html_body or "")
+    body = html_core
     try:
         from core.tracking import strip_tracking, strip_visible_tracking_urls
 
@@ -240,6 +283,8 @@ def create_draft(
         from_email=from_addr,
         cc=cc,
         include_signature=False,  # already applied above — do not double-insert
+        plain_body=body_cleaned,
+        bcc=bcc,
     )
     # Drive mirror uses the same signed body (no second append_signature)
     instrumented_html = body
@@ -278,9 +323,11 @@ def create_draft(
             "cc": _normalize_cc(cc),
             "subject": subject,
             "body_html": instrumented_html,
+            "body_cleaned": body_cleaned,
             "title": (recipient_title or "").strip(),
             "company": (company or "").strip(),
         }
+        _verify_gmail_plain_matches(result.get("draft_id") or "", body_cleaned)
         _mirror_draft_to_drive(
             result,
             recipient_name=recipient_name,
@@ -316,6 +363,7 @@ def create_draft(
             "to": to,
             "cc": _normalize_cc(cc),
             "subject": subject,
+            "body_cleaned": body_cleaned,
         }
 
 
@@ -355,6 +403,7 @@ def _mirror_draft_to_drive(
                 "cc": result.get("cc") or "",
                 "subject": result.get("subject") or "",
                 "body_html": result.get("body_html") or "",
+                "body_cleaned": result.get("body_cleaned") or "",
                 "tracking_id": result.get("tracking_id") or "",
                 "status": "draft",
                 "source": source or "gmail_create_draft",
@@ -399,6 +448,7 @@ def _save_drive_only_draft(
             "cc": _normalize_cc(cc),
             "subject": subject or "(no subject)",
             "body_html": html_body or "",
+            "body_cleaned": "",
             "tracking_id": tracking_id or "",
             "status": "draft",
             "source": source or "drive_fallback_draft",
@@ -415,6 +465,7 @@ def _save_drive_only_draft(
             "cc": _normalize_cc(cc),
             "subject": subject or "(no subject)",
             "body_html": html_body or "",
+            "body_cleaned": "",
             "title": title,
             "company": co,
             "drive_only": True,

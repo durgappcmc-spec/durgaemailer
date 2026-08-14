@@ -15,6 +15,7 @@ from agent.limits import (
     parse_research_limits,
 )
 from core.llm import extract_json
+from core.style_draft import parse_directives
 from gmail_client.send import default_cc_emails, default_from_email
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -242,6 +243,28 @@ def classify_email_roles(user_msg: str) -> EmailRoles:
         to,
         exclude=ignore_set | {from_email.lower()} | {e.lower() for e in cc},
     )
+
+    dirs = parse_directives(msg)
+    if dirs.get("ignore"):
+        ignore = _uniq(ignore + list(dirs["ignore"]))
+        ignore_set = {e.lower() for e in ignore}
+    if dirs.get("cc"):
+        cc = _uniq(cc + list(dirs["cc"]), exclude=ignore_set | {from_email.lower()})
+    if dirs.get("template_from"):
+        to = [e for e in to if e.lower() != dirs["template_from"].lower()]
+        cc = [e for e in cc if e.lower() != dirs["template_from"].lower()]
+    if dirs.get("to"):
+        to = _uniq(
+            [dirs["to"]],
+            exclude=ignore_set
+            | {from_email.lower()}
+            | {e.lower() for e in cc}
+            | (
+                {dirs["template_from"].lower()}
+                if dirs.get("template_from")
+                else set()
+            ),
+        )
 
     return EmailRoles(
         from_email=from_email or default_from_email(),
@@ -521,6 +544,10 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
         rf"(?:like|similar\s+to)\s+(?:the\s+)?"
         rf"(?:one\s+|email\s+|mail\s+)?(?:we\s+|you\s+|i\s+)?"
         rf"(?:sent|emailed)\s+to\s+{email_pat}",
+        # same style as sent to / same as sent to / modeled on the email to
+        rf"same\s+style\s+as\s+sent\s+to\s+{email_pat}",
+        rf"same\s+as\s+sent\s+to\s+{email_pat}",
+        rf"modeled\s+on\s+the\s+email\s+to\s+{email_pat}",
         # sent to info@x.org (with draft/create nearby)
         rf"(?:sent|emailed)\s+to\s+{email_pat}",
     ]
@@ -613,8 +640,13 @@ def wants_previous_chat_recipient(user_msg: str) -> bool:
 def wants_prospect_list_recipients(user_msg: str) -> bool:
     """True when To should be the last ZoomInfo / prospect search (e.g. 'to above')."""
     msg = user_msg or ""
-    if parse_explicit_draft_company(msg):
-        return True
+    company = parse_explicit_draft_company(msg)
+    if company:
+        like_sent = parse_like_sent_request(msg)
+        to_company = bool(re.search(rf"\bto\s+{re.escape(company)}\b", msg, re.I))
+        # "draft like alice@x.com for Flipkart" names a clone target, not the last search.
+        if not (like_sent and not to_company):
+            return True
     return bool(
         re.search(
             r"\b("
@@ -986,6 +1018,9 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     like_sent = parse_like_sent_request(msg)
     like_sent_to = (like_sent or {}).get("reference") or ""
     like_sent_for = (like_sent or {}).get("target") or ""
+    dirs = parse_directives(msg)
+    if dirs.get("template_from") and not like_sent_to:
+        like_sent_to = dirs["template_from"]
     if not like_sent_for:
         like_sent_for = parse_explicit_draft_company(msg)
     contact_company = parse_contact_search_company(msg)
@@ -1024,6 +1059,8 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
 
     # Never treat the like-sent reference address as the new draft's To
     to_emails = list(roles.to)
+    if dirs.get("to"):
+        to_emails = [dirs["to"]]
     if like_sent_to and "@" in like_sent_to:
         to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
 
@@ -1096,7 +1133,7 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
     ):
         action = "gmail_extract"
         agents = ["gmail"]
-    elif re.search(r"linkedin\.com/in/", msg, re.I):
+    elif re.search(r"linkedin\.com/(in|company)/", msg, re.I):
         action = "prospect_enrich"
         agents = ["zoominfo"]
         if draft or send or re.search(r"\b(email|mail|outreach)\b", msg, re.I):

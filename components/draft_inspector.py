@@ -102,28 +102,37 @@ def render_draft_inspector(
     )
 
     with tab_preview:
-        body = draft.get("body_html") or draft.get("html") or ""
-        if not body:
-            st.info("No HTML body stored for this draft.")
+        cleaned = draft.get("body_cleaned") or ""
+        if not cleaned:
+            raw = draft.get("body_html") or draft.get("html") or draft.get("body") or ""
+            if raw:
+                try:
+                    from gmail_client.html_format import prepare_draft_bodies
+
+                    cleaned, _h = prepare_draft_bodies(raw)
+                    draft["body_cleaned"] = cleaned
+                except Exception:
+                    cleaned = ""
+        if not cleaned:
+            st.info("No body stored for this draft.")
         else:
             try:
-                from gmail_client.html_format import normalize_email_html
-                from core.tracking import html_for_preview
+                from gmail_client.html_format import render_draft_html
 
-                # Render leftover markdown (**bold**) and hide Netlify URLs
-                preview_body = html_for_preview(normalize_email_html(body))
+                st.markdown(
+                    render_draft_html(
+                        draft.get("subject") or "",
+                        draft.get("to") or draft.get("recipient") or "",
+                        draft.get("cc") or "",
+                        cleaned,
+                    ),
+                    unsafe_allow_html=True,
+                )
             except Exception:
-                try:
-                    from core.tracking import html_for_preview
-
-                    preview_body = html_for_preview(body)
-                except Exception:
-                    preview_body = body
-            # Wrap so Streamlit does not re-parse leftover *text* as markdown
-            st.markdown(
-                f'<div class="email-preview">{preview_body}</div>',
-                unsafe_allow_html=True,
-            )
+                st.markdown(
+                    f'<div class="email-preview">{cleaned}</div>',
+                    unsafe_allow_html=True,
+                )
             if tid or has_pixel:
                 st.caption("🔒 Open tracking is embedded (hidden). Links shown as originals.")
             else:

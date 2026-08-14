@@ -1,6 +1,7 @@
 # NOTE: Convert markdown / plain text into email-safe HTML; strip residual ** markers.
 from __future__ import annotations
 
+import html as _html
 import re
 from typing import Optional
 
@@ -409,3 +410,137 @@ def strip_trailing_signature_block(html: str) -> str:
     if len(keep_text) < 40:
         return html
     return plain_or_markdown_to_html(keep_text)
+
+
+def clean_email_body(text: str) -> str:
+    """Unwrap hard-wrapped prose, collapse double spaces, keep paragraph breaks."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    # unwrap single line-breaks inside paragraphs (keep blank lines)
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip() + "\n"
+
+
+def html_from_cleaned_body(cleaned: str) -> str:
+    """Build simple HTML paragraphs from the same cleaned plain text Gmail stores."""
+    parts: list[str] = []
+    for p in (cleaned or "").split("\n\n"):
+        if not p.strip():
+            continue
+        inner = _html.escape(p.strip()).replace("\n", "<br>")
+        parts.append(f"<p>{inner}</p>")
+    return "".join(parts) or "<p></p>"
+
+
+def looks_like_html(body: str) -> bool:
+    return bool(
+        re.search(r"</?(?:p|div|br|ul|ol|li|table|strong|em|a|h\d)\b", body or "", re.I)
+    )
+
+
+def plain_from_html(html: str) -> str:
+    """Extract paragraph-preserving plain text from HTML for clean_email_body()."""
+    raw = html or ""
+    if not raw.strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup.find_all(["script", "style"]):
+            tag.decompose()
+        paras: list[str] = []
+        blocks = soup.find_all(["p", "div", "li", "h1", "h2", "h3", "h4", "blockquote"])
+        if blocks:
+            for el in blocks:
+                t = el.get_text(" ", strip=True)
+                if t:
+                    paras.append(t)
+            if paras:
+                return "\n\n".join(paras)
+        return soup.get_text("\n")
+    except Exception:
+        text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+        text = re.sub(r"</p\s*>", "\n\n", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", "", text)
+        return _html.unescape(text)
+
+
+def prepare_draft_bodies(body: str) -> tuple[str, str]:
+    """Return (body_cleaned, html) from LLM/plain/HTML input. Never textwrap.fill()."""
+    raw = body or ""
+    if looks_like_html(raw):
+        plain = plain_from_html(raw)
+    else:
+        plain = raw
+    cleaned = clean_email_body(plain)
+    return cleaned, html_from_cleaned_body(cleaned)
+
+
+_GREETING_LINE_RE = re.compile(
+    r"^(Dear|Hi|Hello|Hey|Good\s+(?:morning|afternoon|evening))([^,\n]{0,80})[,:]?",
+    re.I,
+)
+_SIGNOFF_LINE_RE = re.compile(
+    r"^(Thanks|Thank you|Best regards|Warm regards|Kind regards|Best|"
+    r"Sincerely|Regards|With thanks|Cheers)[,\s]*$",
+    re.I,
+)
+
+
+def extract_style_structure(body: str) -> dict[str, str | int]:
+    """Paragraph count, words/para, greeting, and sign-off from a sent email body."""
+    cleaned = clean_email_body(body or "")
+    paras = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    greeting = ""
+    signoff = ""
+    if paras:
+        first_line = paras[0].split("\n")[0].strip()
+        if _GREETING_LINE_RE.match(first_line):
+            greeting = first_line[:120]
+        else:
+            greeting = first_line[:80]
+        for i in range(len(paras) - 1, -1, -1):
+            head = paras[i].split("\n")[0].strip()
+            if _SIGNOFF_LINE_RE.match(head) or (
+                i == len(paras) - 1 and len(paras[i].split()) <= 12
+            ):
+                signoff = "\n".join(paras[i:]).strip()
+                if _SIGNOFF_LINE_RE.match(head):
+                    break
+    n = len(paras)
+    words = [len(p.split()) for p in paras] if paras else [0]
+    avg = int(round(sum(words) / max(n, 1))) if n else 0
+    return {
+        "n_paragraphs": n,
+        "wc_per_para": avg,
+        "greeting": greeting or "Hi,",
+        "signoff": signoff or "Best regards,",
+    }
+
+
+def render_draft_html(subject, to, cc, body_cleaned):
+    body_html = "".join(
+        f"<p style='margin:0 0 12px 0'>"
+        f"{_html.escape(p).replace(chr(10), '<br>')}</p>"
+        for p in (body_cleaned or "").split("\n\n")
+        if p.strip()
+    )
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;
+                line-height:1.5;color:#202124;background:#fff;
+                border:1px solid #e0e0e0;border-radius:8px;padding:16px;
+                max-width:720px;white-space:normal;">
+      <div style="font-size:12px;color:#5f6368;margin-bottom:8px">
+        <b>To:</b> {_html.escape(str(to or ""))}<br>
+        {f"<b>Cc:</b> {_html.escape(str(cc))}<br>" if cc else ""}
+        <b>Subject:</b> {_html.escape(str(subject or ""))}
+      </div>
+      <hr style="border:none;border-top:1px solid #eee;margin:8px 0 12px 0">
+      {body_html}
+    </div>
+    """

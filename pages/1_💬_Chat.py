@@ -159,6 +159,23 @@ if len(_all_msgs) > _DISPLAY_MSGS:
 for msg in _all_msgs[-_DISPLAY_MSGS:]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        previews = (msg.get("meta") or {}).get("draft_previews") or []
+        if previews:
+            try:
+                from gmail_client.html_format import render_draft_html
+
+                for pv in previews:
+                    st.markdown(
+                        render_draft_html(
+                            pv.get("subject") or "",
+                            pv.get("to") or "",
+                            pv.get("cc") or "",
+                            pv.get("body_cleaned") or "",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+            except Exception:
+                pass
         files = msg.get("files") or []
         if files:
             st.caption("Used files: " + ", ".join(files))
@@ -442,6 +459,23 @@ if prompt:
                     text += str(chunk)
                     placeholder.markdown(text + "▌")
             placeholder.markdown(text or "_(no response)_")
+            previews = meta.get("draft_previews") or []
+            if previews:
+                try:
+                    from gmail_client.html_format import render_draft_html
+
+                    for pv in previews:
+                        st.markdown(
+                            render_draft_html(
+                                pv.get("subject") or "",
+                                pv.get("to") or "",
+                                pv.get("cc") or "",
+                                pv.get("body_cleaned") or "",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                except Exception:
+                    pass
             if stopped or meta.get("cancelled"):
                 status.update(label="Stopped", state="error")
             else:

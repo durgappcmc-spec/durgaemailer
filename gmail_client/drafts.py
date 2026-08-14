@@ -110,6 +110,16 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         for h in (msg.get("payload") or {}).get("headers") or []
     }
     html, text = _extract_bodies(msg.get("payload") or {})
+    body_cleaned = ""
+    try:
+        from gmail_client.html_format import clean_email_body, prepare_draft_bodies
+
+        if (text or "").strip():
+            body_cleaned = clean_email_body(text)
+        elif html:
+            body_cleaned, _html_core = prepare_draft_bodies(html)
+    except Exception:
+        body_cleaned = (text or "").strip() + ("\n" if text else "")
     body_html = html or (f"<pre>{text}</pre>" if text else "")
     tracking_id = _extract_tracking_id(body_html)
     to = headers.get("to") or ""
@@ -123,6 +133,8 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         "cc": headers.get("cc") or "",
         "subject": headers.get("subject") or "(no subject)",
         "body_html": body_html,
+        "body_text": text or "",
+        "body_cleaned": body_cleaned,
         "snippet": msg.get("snippet") or "",
         "status": "draft",
         "source": "gmail",

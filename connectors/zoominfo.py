@@ -15,8 +15,13 @@ from config import _DATA, _ROOT, settings
 from connectors import ProspectConnector, normalize
 
 _JWT_CACHE = _DATA / "zoominfo_jwt.cache"
+# Canonical detector (protocol required) plus protocol-optional paste-safe variant.
+_LINKEDIN_CANON_RE = re.compile(
+    r"https?://(www\.)?linkedin\.com/(in|company)/[^\s\]\)]+",
+    re.I,
+)
 _LINKEDIN_RE = re.compile(
-    r"(?:https?://)?(?:[\w.-]+\.)?linkedin\.com/in/([\w\-%]+)",
+    r"(?:https?://)?(?:[\w.-]+\.)?linkedin\.com/(in|company)/([^\s\]\)]+)",
     re.I,
 )
 
@@ -25,6 +30,26 @@ class ZoomInfoConnector(ProspectConnector):
     name = "zoominfo"
     BASE = "https://api.zoominfo.com"
     OUTPUT_FIELDS = [
+        "id",
+        "firstName",
+        "lastName",
+        "email",
+        "jobTitle",
+        "companyName",
+        "phone",
+        "mobilePhone",
+        "externalUrls",
+        "city",
+        "state",
+        "country",
+        "street",
+        "zipCode",
+        "managementLevel",
+        "department",
+        "companyIndustry",
+        "bio",
+    ]
+    OUTPUT_FIELDS_MIN = [
         "id",
         "firstName",
         "lastName",
@@ -815,12 +840,19 @@ class ZoomInfoConnector(ProspectConnector):
                 break
         return out
 
-    def enrich(self, identifier: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def enrich(
+        self,
+        identifier: dict[str, Any],
+        *,
+        linkedin_url: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Enrich one person. `linkedin_url=` maps to personLinkedInUrl / companyLinkedInUrl."""
         if not self._configured():
             return None
 
         linkedin = (
-            identifier.get("linkedin_url")
+            linkedin_url
+            or identifier.get("linkedin_url")
             or identifier.get("linkedin")
             or _first_linkedin(str(identifier.get("url") or ""))
         )
@@ -832,43 +864,97 @@ class ZoomInfoConnector(ProspectConnector):
             or identifier.get("organization_name")
             or ""
         ).strip()
-        if linkedin and (not first or not last):
+        kind = linkedin_url_kind(linkedin) if linkedin else ""
+        if linkedin and kind == "in" and (not first or not last):
             parsed_first, parsed_last = names_from_linkedin_url(linkedin)
             first = first or parsed_first
             last = last or parsed_last
+        if linkedin and kind == "company" and not company:
+            company = company_name_from_linkedin_url(linkedin)
 
-        # Path A: LinkedIn → search by name(+company) → enrich by personId
-        # (Many ZoomInfo tenants reject linkedInUrl as an enrich input.)
+        # Primary: Enrich Contact by LinkedIn URL (personLinkedInUrl / company path)
+        if linkedin and kind == "in":
+            hit = self._enrich_by_person_linkedin(linkedin)
+            if hit and (hit.get("email") or "").strip():
+                return hit
+            if hit:
+                last_partial = hit
+            else:
+                last_partial = None
+        else:
+            last_partial = None
+
+        # Fallback 1: Person Search by (first, last, company); prefer LinkedIn URL match
         if linkedin and first and last:
-            try:
-                search_body: dict[str, Any] = {
-                    "firstName": first,
-                    "lastName": last,
-                    "rpp": 5,
-                    "page": 1,
-                }
-                if company:
-                    search_body["companyName"] = company
-                resp = requests.post(
-                    f"{self.BASE}/search/contact",
-                    headers=self._headers(),
-                    json=search_body,
-                    timeout=45,
-                )
-                resp.raise_for_status()
-                contacts = (resp.json() or {}).get("data") or []
-                if contacts:
-                    pid = contacts[0].get("personId") or contacts[0].get("id")
-                    if pid:
-                        rows = self._enrich_by_ids([pid])
-                        if rows:
-                            prospect = _row_to_prospect(rows[0])
-                            prospect["linkedin_url"] = linkedin
-                            if not prospect.get("company") and contacts[0].get("company"):
-                                prospect["company"] = _company_name(contacts[0])
-                            return prospect
-            except Exception as e:
-                print(f"[zoominfo] linkedin→search enrich error: {e}", file=sys.stderr)
+            hit = self._search_person_then_enrich(
+                first, last, company, linkedin_url=linkedin
+            )
+            if hit and (hit.get("email") or "").strip():
+                return hit
+            if hit and not last_partial:
+                last_partial = hit
+
+        # Fallback 2: Company Enrich by domain/slug → Person Search within company
+        if linkedin:
+            co = self._enrich_company_by_linkedin(linkedin) if kind == "company" else None
+            if not co and company:
+                co = self._search_company_by_name(company)
+            if co:
+                co_name = str(
+                    co.get("name") or co.get("companyName") or company or ""
+                ).strip()
+                domain = str(
+                    co.get("website")
+                    or co.get("companyWebsite")
+                    or co.get("domain")
+                    or ""
+                ).strip()
+                if first and last:
+                    hit = self._search_person_then_enrich(
+                        first,
+                        last,
+                        co_name,
+                        linkedin_url=linkedin if kind == "in" else "",
+                        domain=domain,
+                    )
+                    if hit and (hit.get("email") or "").strip():
+                        if not hit.get("industry"):
+                            hit["industry"] = (
+                                co.get("industry") or co.get("primaryIndustry") or ""
+                            )
+                        return hit
+                    if hit and not last_partial:
+                        last_partial = hit
+                elif kind == "company":
+                    # Company URL only — surface firmographics, no personal email
+                    return {
+                        **normalize(
+                            {
+                                "name": co_name,
+                                "company": co_name,
+                                "industry": co.get("industry")
+                                or co.get("primaryIndustry")
+                                or "",
+                                "location": ", ".join(
+                                    filter(
+                                        None,
+                                        [
+                                            co.get("city"),
+                                            co.get("state"),
+                                            co.get("country"),
+                                        ],
+                                    )
+                                ),
+                                "about": co.get("description")
+                                or co.get("companyDescription")
+                                or "",
+                                "linkedin_url": linkedin,
+                            },
+                            source=self.name,
+                            source_id=str(co.get("id") or ""),
+                        ),
+                        "email": "",
+                    }
 
         match_input: dict[str, Any] = {}
         if identifier.get("source_id") or identifier.get("personId"):
@@ -895,30 +981,56 @@ class ZoomInfoConnector(ProspectConnector):
             domain = str(domain or "").strip().lower().removeprefix("www.")
             if domain and "." in domain:
                 match_input["companyWebsite"] = domain
-            # Try LinkedIn field when account supports it (ignored/invalid on some plans)
-            if linkedin and not match_input.get("emailAddress") and not (
-                first and last and company
-            ):
-                match_input["linkedInUrl"] = linkedin
+            if linkedin and kind == "in":
+                match_input["personLinkedInUrl"] = linkedin
+            elif linkedin and kind == "company":
+                match_input["companyLinkedInUrl"] = linkedin
 
+        if match_input:
+            hit = self._post_enrich_contact(match_input, linkedin=linkedin)
+            if hit and (hit.get("email") or "").strip():
+                return hit
+            if hit and not last_partial:
+                last_partial = hit
+
+        return last_partial
+
+    def _output_fields(self) -> list[str]:
+        return list(self.OUTPUT_FIELDS)
+
+    def _post_enrich_contact(
+        self,
+        match_input: dict[str, Any],
+        *,
+        linkedin: str = "",
+    ) -> Optional[dict[str, Any]]:
         if not match_input:
             return None
-
+        fields = list(self.OUTPUT_FIELDS)
         try:
             resp = requests.post(
                 f"{self.BASE}/enrich/contact",
                 headers=self._headers(),
                 json={
                     "matchPersonInput": [match_input],
-                    "outputFields": list(self.OUTPUT_FIELDS),
+                    "outputFields": fields,
                 },
                 timeout=45,
             )
+            if resp.status_code == 400:
+                resp = requests.post(
+                    f"{self.BASE}/enrich/contact",
+                    headers=self._headers(),
+                    json={
+                        "matchPersonInput": [match_input],
+                        "outputFields": list(self.OUTPUT_FIELDS_MIN),
+                    },
+                    timeout=45,
+                )
             resp.raise_for_status()
             rows = _flatten_enrich_rows(resp.json())
             if not rows:
                 return None
-            # Skip invalid-input error stubs
             if rows[0].get("errorMessage") or rows[0].get("invalidInputFields"):
                 return None
             prospect = _row_to_prospect(rows[0])
@@ -928,6 +1040,124 @@ class ZoomInfoConnector(ProspectConnector):
         except Exception as e:
             print(f"[zoominfo] enrich error: {e}", file=sys.stderr)
             return None
+
+    def _enrich_by_person_linkedin(self, url: str) -> Optional[dict[str, Any]]:
+        """Primary: ZoomInfo Enrich Contact by personLinkedInUrl."""
+        hit = self._post_enrich_contact({"personLinkedInUrl": url}, linkedin=url)
+        if hit and (hit.get("email") or "").strip():
+            return hit
+        # Some tenants only accept linkedInUrl
+        alt = self._post_enrich_contact({"linkedInUrl": url}, linkedin=url)
+        return alt or hit
+
+    def _search_person_then_enrich(
+        self,
+        first: str,
+        last: str,
+        company: str = "",
+        *,
+        linkedin_url: str = "",
+        domain: str = "",
+    ) -> Optional[dict[str, Any]]:
+        try:
+            search_body: dict[str, Any] = {
+                "firstName": first,
+                "lastName": last,
+                "rpp": 10,
+                "page": 1,
+            }
+            if company:
+                search_body["companyName"] = company
+            if domain and "." in domain:
+                search_body["companyWebsite"] = (
+                    domain.lower().removeprefix("www.").split("/")[0]
+                )
+            resp = requests.post(
+                f"{self.BASE}/search/contact",
+                headers=self._headers(),
+                json=search_body,
+                timeout=45,
+            )
+            resp.raise_for_status()
+            contacts = (resp.json() or {}).get("data") or []
+            if not contacts:
+                return None
+            chosen = None
+            if linkedin_url:
+                for c in contacts:
+                    if not isinstance(c, dict):
+                        continue
+                    if _linkedin_urls_match(linkedin_url, _linkedin_from_row(c)):
+                        chosen = c
+                        break
+            if chosen is None:
+                ranked = sorted(
+                    [c for c in contacts if isinstance(c, dict)],
+                    key=lambda c: (
+                        0 if c.get("hasEmail") else 1,
+                        0 if c.get("hasSupplementalEmail") else 1,
+                    ),
+                )
+                chosen = ranked[0] if ranked else None
+            if not chosen:
+                return None
+            pid = chosen.get("personId") or chosen.get("id")
+            if not pid:
+                prospect = _row_to_prospect(chosen)
+                if linkedin_url:
+                    prospect["linkedin_url"] = linkedin_url
+                return prospect
+            rows = self._enrich_by_ids([pid])
+            if rows:
+                prospect = _row_to_prospect(rows[0])
+                if linkedin_url:
+                    prospect["linkedin_url"] = linkedin_url
+                if not prospect.get("company"):
+                    prospect["company"] = _company_name(chosen) or company
+                return prospect
+        except Exception as e:
+            print(f"[zoominfo] linkedin→search enrich error: {e}", file=sys.stderr)
+        return None
+
+    def _enrich_company_by_linkedin(self, url: str) -> Optional[dict[str, Any]]:
+        """Company Enrich by companyLinkedInUrl (or slug as companyName)."""
+        try:
+            resp = requests.post(
+                f"{self.BASE}/enrich/company",
+                headers=self._headers(),
+                json={
+                    "matchCompanyInput": [{"companyLinkedInUrl": url}],
+                    "outputFields": [
+                        "id",
+                        "name",
+                        "website",
+                        "companyWebsite",
+                        "industry",
+                        "city",
+                        "state",
+                        "country",
+                        "description",
+                        "employeeCount",
+                    ],
+                },
+                timeout=45,
+            )
+            if resp.status_code < 400:
+                rows = _flatten_enrich_rows(resp.json())
+                if rows and not (
+                    rows[0].get("errorMessage") or rows[0].get("invalidInputFields")
+                ):
+                    return rows[0]
+        except Exception as e:
+            print(f"[zoominfo] company linkedin enrich: {e}", file=sys.stderr)
+        slug_name = company_name_from_linkedin_url(url)
+        if slug_name:
+            return self._search_company_by_name(slug_name)
+        return None
+
+    def _search_company_by_name(self, name: str) -> Optional[dict[str, Any]]:
+        hits = self._search_companies({"company_names": [name]}, limit=3)
+        return hits[0] if hits else None
 
     def _enrich_by_ids(self, person_ids: list[Any]) -> list[dict[str, Any]]:
         enr = requests.post(
@@ -939,47 +1169,75 @@ class ZoomInfoConnector(ProspectConnector):
             },
             timeout=60,
         )
+        if enr.status_code == 400:
+            enr = requests.post(
+                f"{self.BASE}/enrich/contact",
+                headers=self._headers(),
+                json={
+                    "matchPersonInput": [{"personId": pid} for pid in person_ids],
+                    "outputFields": list(self.OUTPUT_FIELDS_MIN),
+                },
+                timeout=60,
+            )
         enr.raise_for_status()
         return _flatten_enrich_rows(enr.json())
 
 
 def extract_linkedin_urls(text: str, *, limit: int = 100) -> list[str]:
-    """Return unique LinkedIn /in/ profile URLs found in text (paste-safe)."""
+    """Return unique LinkedIn /in/ and /company/ URLs found in text (paste-safe)."""
     seen: set[str] = set()
     out: list[str] = []
-    for m in _LINKEDIN_RE.finditer(text or ""):
-        slug = (m.group(1) or "").strip().strip("/")
+    blob = text or ""
+    # Prefer the canonical https?://(www.)?linkedin.com/(in|company)/ regex first
+    matches = list(_LINKEDIN_CANON_RE.finditer(blob)) + list(_LINKEDIN_RE.finditer(blob))
+    for m in matches:
+        raw = m.group(0)
+        kind, slug = _linkedin_kind_slug(raw)
         if not slug:
             continue
-        key = slug.lower()
+        key = f"{kind}:{slug.lower()}"
         if key in seen:
             continue
         seen.add(key)
-        out.append(f"https://www.linkedin.com/in/{slug}")
+        out.append(f"https://www.linkedin.com/{kind}/{slug}")
         if len(out) >= max(1, int(limit)):
             break
     return out
 
 
 def extract_linkedin_url(text: str) -> str:
-    """Return the first LinkedIn profile URL found in text, or ''."""
+    """Return the first LinkedIn profile or company URL found in text, or ''."""
     urls = extract_linkedin_urls(text or "", limit=1)
     return urls[0] if urls else ""
 
 
-def names_from_linkedin_url(url: str) -> tuple[str, str]:
-    """Best-effort first/last from /in/slug (e.g. damian-lawlor → Damian, Lawlor)."""
+def linkedin_url_kind(url: str) -> str:
+    """Return 'in' or 'company' (empty if not a LinkedIn URL)."""
+    kind, _slug = _linkedin_kind_slug(url or "")
+    return kind
+
+
+def _linkedin_kind_slug(url: str) -> tuple[str, str]:
     m = _LINKEDIN_RE.search(url or "")
     if not m:
         return "", ""
-    slug = m.group(1)
+    kind = (m.group(1) or "in").lower()
+    slug = (m.group(2) or "").strip().strip("/")
+    slug = slug.split("?")[0].split("#")[0].rstrip("/")
     try:
         from urllib.parse import unquote
 
         slug = unquote(slug)
     except Exception:
         pass
-    slug = slug.strip().strip("/")
+    return kind, slug
+
+
+def names_from_linkedin_url(url: str) -> tuple[str, str]:
+    """Best-effort first/last from /in/slug (e.g. damian-lawlor → Damian, Lawlor)."""
+    kind, slug = _linkedin_kind_slug(url or "")
+    if kind != "in" or not slug:
+        return "", ""
     parts = [p for p in re.split(r"[-_]+", slug) if p]
     # Drop trailing LinkedIn id-looking segments (contain a digit), keep real name parts
     while len(parts) > 1 and re.search(r"\d", parts[-1]):
@@ -990,6 +1248,23 @@ def names_from_linkedin_url(url: str) -> tuple[str, str]:
     if len(parts) == 1:
         return parts[0].capitalize(), ""
     return parts[0].capitalize(), parts[-1].capitalize()
+
+
+def company_name_from_linkedin_url(url: str) -> str:
+    """Best-effort company label from /company/slug."""
+    kind, slug = _linkedin_kind_slug(url or "")
+    if kind != "company" or not slug:
+        return ""
+    parts = [p for p in re.split(r"[-_]+", slug) if p and not p.isdigit()]
+    return " ".join(p.capitalize() for p in parts)
+
+
+def _linkedin_urls_match(a: str, b: str) -> bool:
+    ka, sa = _linkedin_kind_slug(a)
+    kb, sb = _linkedin_kind_slug(b)
+    if not sa or not sb:
+        return False
+    return ka == kb and sa.lower().rstrip("/") == sb.lower().rstrip("/")
 
 
 def _first_linkedin(text: Any) -> str:
@@ -1094,6 +1369,14 @@ def _row_to_prospect(row: dict[str, Any]) -> dict[str, Any]:
         "location": location,
         "seniority": row.get("managementLevel"),
         "department": row.get("department"),
+        "industry": row.get("companyIndustry")
+        or row.get("industry")
+        or row.get("industryCodes")
+        or "",
+        "about": row.get("bio")
+        or row.get("personOverview")
+        or row.get("description")
+        or "",
         "external_urls": row.get("externalUrls") or [],
     }
     return normalize(raw, source="zoominfo", source_id=str(raw.get("id") or ""))

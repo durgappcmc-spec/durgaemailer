@@ -16,6 +16,17 @@ from connectors.zoominfo import (
     names_from_linkedin_url,
 )
 from core.auto_sync import auto_ingest_prospects, ingest_mailbox_messages
+from core.enrich_cache import (
+    email_not_found_prompt,
+    format_enrichment_panel,
+    get_cached_enrichment,
+    put_cached_enrichment,
+)
+from core.style_draft import (
+    compose_styled_email,
+    fetch_latest_sent_to,
+    parse_directives,
+)
 from core import memory as mem
 from core.llm import chat_fast, chat_grounded, extract_json, grounded_collect
 from agent.intent import (
@@ -433,6 +444,8 @@ Rules for html_body:
 - If uploaded document text is provided, write a clear professional email that uses
   the important facts/offers/details from that document (do not dump the raw PDF).
 - Keep HTML simple (<p>, <ul>/<li>, <strong>).
+- Write the email body as normal prose. Do NOT insert manual line breaks inside paragraphs. Separate paragraphs with exactly one blank line. Do not indent. Use single spaces between words and single spaces after punctuation. No trailing spaces.
+- Do not use markdown (no **bold**, no bullet dashes) unless a style template in the conversation uses them.
 - If the user already drafted body text in prior chat turns, prefer refining that.
 - Do not invent program details, amounts, or links that were not in the conversation
   or uploaded documents.
@@ -938,11 +951,104 @@ def _deliver_job(
         "source": job.get("source"),
         "from_email": job.get("from_email") or default_from_email(),
         "cc": job.get("cc") or [],
+        "bcc": job.get("bcc") or [],
         "include_signature": True,
     }
     if do_send:
         return send_email(**kwargs), True
     return create_draft(**kwargs, track=True), False
+
+
+def _record_draft_preview(out: dict[str, Any], previews: list[dict[str, Any]]) -> str:
+    """Store cleaned body for Chat/Drafts HTML preview; return a short status line."""
+    cleaned = str(out.get("body_cleaned") or "")
+    if not cleaned.strip() and out.get("body_html"):
+        try:
+            from gmail_client.html_format import prepare_draft_bodies
+
+            cleaned, _html = prepare_draft_bodies(out.get("body_html") or "")
+            out["body_cleaned"] = cleaned
+        except Exception:
+            cleaned = ""
+    previews.append(
+        {
+            "subject": out.get("subject") or "",
+            "to": out.get("to") or "",
+            "cc": out.get("cc") or "",
+            "body_cleaned": cleaned,
+            "draft_id": out.get("draft_id") or "",
+        }
+    )
+    did = out.get("draft_id") or "—"
+    return f"Draft saved · draft_id=`{did}` · to {out.get('to') or '—'}\n"
+
+
+def _run_styled_directive_draft(
+    *,
+    user_msg: str,
+    directives: dict[str, Any],
+    enrichment: Optional[dict[str, Any]],
+    plan: IntentPlan,
+    attachments: Optional[list[dict[str, Any]]],
+    draft_previews: list[dict[str, Any]],
+) -> Generator[str, None, None]:
+    """One Gmail draft to directives['to'], optionally styled after template_from."""
+    to = (directives.get("to") or "").strip()
+    if not to:
+        return
+    template_from = (directives.get("template_from") or "").strip()
+    if template_from and template_from.lower() == to.lower():
+        yield (
+            f"_Warning: `to` and style-template address are the same "
+            f"(`{to}`). Proceeding anyway._\n"
+        )
+    style_ref = None
+    if template_from:
+        yield f"Looking up the most recent sent email to **{template_from}**…\n"
+        style_ref = fetch_latest_sent_to(template_from)
+        if not style_ref:
+            yield (
+                f"No sent messages found to `{template_from}`. "
+                "Drafting without a style template.\n"
+            )
+        else:
+            yield (
+                f"_Loaded sent style · "
+                f"**{(style_ref.get('subject') or '(no subject)').strip()}**_\n"
+            )
+    composed = compose_styled_email(
+        to_email=to,
+        enrichment=enrichment,
+        style_template=style_ref,
+        user_msg=user_msg,
+    )
+    name = str((enrichment or {}).get("name") or "").strip()
+    title = str((enrichment or {}).get("title") or "").strip()
+    company = str((enrichment or {}).get("company") or "").strip()
+    job = {
+        "recipient_email": to,
+        "recipient_name": name,
+        "first_name": str((enrichment or {}).get("first_name") or "").strip()
+        or (name.split(None, 1)[0] if name else ""),
+        "title": title,
+        "company": company,
+        "subject": composed.get("subject") or "(no subject)",
+        "html_body": composed.get("body_cleaned") or composed.get("html_body") or "",
+        "from_email": plan.from_email or default_from_email(),
+        "cc": list(directives.get("cc") or plan.cc or []),
+        "bcc": list(directives.get("bcc") or []),
+        "attachments": attachments,
+        "source": "directive_draft",
+    }
+    ignore = {e.lower() for e in (directives.get("ignore") or [])}
+    job["cc"] = [c for c in job["cc"] if c.lower() not in ignore]
+    yield f"Creating draft to **{to}** from **{job['from_email']}**…\n"
+    out, _did_send = _deliver_job(job, want_send=False, user_msg=user_msg)
+    if out.get("error"):
+        yield f"- Failed for {to}: {out.get('error')}\n"
+        return
+    yield _record_draft_preview(out, draft_previews)
+
 
 
 def _collect_linkedin_profile_urls(
@@ -964,6 +1070,43 @@ def _collect_linkedin_profile_urls(
         if urls:
             return urls
     return []
+
+
+def _allow_multi_provider(user_msg: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:apollo|rocketreach|rocket\s*reach|other providers?|"
+            r"multi[- ]?provider|try\s+(?:apollo|rocketreach)|option\s*c)\b",
+            user_msg or "",
+            re.I,
+        )
+    )
+
+
+def _enrich_linkedin_cached(
+    url: str,
+    ident: Optional[dict[str, Any]] = None,
+    *,
+    allow_multi: bool = False,
+) -> dict[str, Any]:
+    """ZoomInfo enrich for a LinkedIn URL; skip ZI when session cache already has it."""
+    cached = get_cached_enrichment(url)
+    if cached:
+        return {**cached, "from_cache": True}
+    payload = dict(ident or {})
+    payload["linkedin_url"] = url
+    if not payload.get("first_name") or not payload.get("last_name"):
+        f, l = names_from_linkedin_url(url)
+        payload.setdefault("first_name", f)
+        payload.setdefault("last_name", l)
+    result = enrich_fallthrough(
+        payload,
+        linkedin_url=url,
+        allow_multi_provider=allow_multi,
+    )
+    if result and not result.get("error"):
+        put_cached_enrichment(url, result)
+    return result or {}
 
 
 def _should_draft_after_prospect_search(
@@ -1844,6 +1987,19 @@ def answer(
     mailbox_out: list[dict[str, Any]] = []
     prospect_out: list[dict[str, Any]] = []
     cancelled = False
+    draft_previews: list[dict[str, Any]] = []
+    directives = parse_directives(user_msg or "")
+    if directives.get("attachments") and chat_attachments:
+        wanted = {str(n).lower() for n in directives["attachments"]}
+        extra = [
+            a
+            for a in chat_attachments
+            if str(a.get("name") or "").lower() in wanted
+            or any(w in str(a.get("name") or "").lower() for w in wanted)
+        ]
+        if extra:
+            email_atts = extra
+            consumed_attachments = True
 
     def _stop_now() -> bool:
         nonlocal cancelled
@@ -2068,7 +2224,8 @@ def answer(
     wants_email_after_enrich = bool(
         (linkedin_url or linkedin_urls)
         and (
-            wants_search_then_draft(user_msg or "")
+            bool(directives.get("to"))
+            or wants_search_then_draft(user_msg or "")
             or re.search(
                 r"\b(send|draft|email|mail|outreach|write (to|them|him|her)|"
                 r"personaliz)\b",
@@ -2476,6 +2633,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             )
                             continue
                         ok_n += 1
+                        if not did_send:
+                            yield _record_draft_preview(out, draft_previews)
                         cc_note = f" cc {out.get('cc')}" if out.get("cc") else ""
                         did = f"draft_id={out.get('draft_id')}" if out.get("draft_id") else ""
                         yield (
@@ -2823,27 +2982,20 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     first, last = names_from_linkedin_url(url)
                     label = " ".join(x for x in (first, last) if x) or url
                     yield f"**{i}/{len(batch_urls)}** ZoomInfo · {label}…\n"
-                    one = enrich_fallthrough(
+                    one = _enrich_linkedin_cached(
+                        url,
                         {
                             "linkedin_url": url,
                             "first_name": first,
                             "last_name": last,
-                        }
+                        },
+                        allow_multi=_allow_multi_provider(user_msg or ""),
                     )
+                    if one.get("from_cache"):
+                        yield "_Cached (no ZoomInfo credit used)._\n"
                     if one and not one.get("error"):
                         results.append(one)
-                        email = (one.get("email") or "").strip()
-                        yield (
-                            f"- **{one.get('name') or label}**"
-                            + (f" · {one.get('title')}" if one.get("title") else "")
-                            + (
-                                f" @ **{one.get('company')}**"
-                                if one.get("company")
-                                else ""
-                            )
-                            + (f" · `{email}`" if email else " · _(no email)_")
-                            + "\n"
-                        )
+                        yield format_enrichment_panel(one) + "\n"
                     else:
                         err = (one or {}).get("error") or "no match"
                         yield f"- No ZoomInfo match for **{label}** ({err})\n"
@@ -2881,17 +3033,29 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     }
                 )
                 if (
-                    wants_email_after_enrich
+                    directives.get("to")
+                    or wants_email_after_enrich
                     or _should_draft_after_prospect_search(user_msg or "", plan)
                 ):
-                    for chunk in _iter_draft_after_search(
-                        user_msg=user_msg or "",
-                        history=history,
-                        context=context,
-                        plan=plan,
-                        prospects=results,
-                    ):
-                        yield chunk
+                    if directives.get("to"):
+                        for chunk in _run_styled_directive_draft(
+                            user_msg=user_msg or "",
+                            directives=directives,
+                            enrichment=results[0] if results else None,
+                            plan=plan,
+                            attachments=email_atts,
+                            draft_previews=draft_previews,
+                        ):
+                            yield chunk
+                    else:
+                        for chunk in _iter_draft_after_search(
+                            user_msg=user_msg or "",
+                            history=history,
+                            context=context,
+                            plan=plan,
+                            prospects=results,
+                        ):
+                            yield chunk
                 else:
                     yield (
                         "\nNext: `draft personalized emails to all these prospects` "
@@ -2957,7 +3121,22 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 company_hint = str(
                     ident.get("company") or ident.get("company_domain") or ""
                 )
-                if name_hint and not wants_force_refresh(user_msg or ""):
+                li_url = str(ident.get("linkedin_url") or "")
+                # LinkedIn URL → ZoomInfo (or session cache). Do not skip ZI
+                # just because a similar name is already on the saved list.
+                if li_url:
+                    cached_li = get_cached_enrichment(li_url)
+                    if cached_li:
+                        result = {**cached_li, "from_cache": True}
+                        yield "_Cached enrichment (no ZoomInfo credit used)._\n"
+                    else:
+                        yield "Enriching contact via ZoomInfo…\n"
+                        result = _enrich_linkedin_cached(
+                            li_url,
+                            ident,
+                            allow_multi=_allow_multi_provider(user_msg or ""),
+                        )
+                elif name_hint and not wants_force_refresh(user_msg or ""):
                     cached_people = find_by_person(
                         name_hint, company=company_hint, limit=5
                     )
@@ -2985,114 +3164,47 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 if result is None:
                     if not name_hint or wants_force_refresh(user_msg or ""):
                         yield "Enriching contact via ZoomInfo…\n"
-                    result = enrich_fallthrough(ident)
+                    result = enrich_fallthrough(
+                        ident,
+                        linkedin_url=li_url or None,
+                        allow_multi_provider=_allow_multi_provider(user_msg or ""),
+                    )
+                    if li_url and result and not result.get("error"):
+                        put_cached_enrichment(li_url, result)
                 if result and not result.get("error"):
                     prospect_out = [result]
                     try:
                         auto_ingest_prospects([result])
                     except Exception as e:
                         print(f"[router] enrich auto-ingest error: {e}", file=sys.stderr)
-                    yield (
-                        f"Matched **{result.get('name') or 'contact'}**"
-                        + (f" · {result.get('title')}" if result.get("title") else "")
-                        + (f" @ {result.get('company')}" if result.get("company") else "")
-                        + (
-                            f"\nEmail: `{result.get('email')}`"
-                            if result.get("email")
-                            else "\n_(no email found)_"
-                        )
-                        + "\n"
-                    )
+                    yield format_enrichment_panel(result) + "\n"
+                elif result and result.get("error"):
+                    yield f"ZoomInfo enrich failed: {result.get('error')}\n"
     
                 # Same-turn draft after LinkedIn enrich (review before send)
+                zi_email = str((result or {}).get("email") or "").strip()
+                draft_to = (directives.get("to") or "").strip() or zi_email
                 if (
                     wants_email_after_enrich
                     and result
-                    and (result.get("email") or "").strip()
+                    and not result.get("error")
+                    and draft_to
                 ):
-                    want_send = bool(
-                        re.search(
-                            r"\b(send now|email them now|fire off|actually send)\b",
-                            user_msg or "",
-                            re.I,
-                        )
-                    )
-                    seed = {
-                        "recipient_email": result.get("email"),
-                        "recipient_name": result.get("name") or "",
-                        "batch": False,
-                    }
-                    payload = _extract_email_job(
-                        user_msg,
-                        history=history,
-                        seed=seed,
-                        for_schedule=False,
-                        document_context=doc_context,
-                    )
-                    payload["recipient_email"] = result.get("email")
-                    payload.setdefault("recipient_name", result.get("name") or "")
-                    headers = _mail_headers(
-                        user_msg,
-                        seed=payload,
-                        to_emails=[result.get("email") or ""],
+                    dirs = dict(directives)
+                    dirs["to"] = draft_to
+                    if dirs.get("cc") is None:
+                        dirs["cc"] = list(plan.cc or [])
+                    for chunk in _run_styled_directive_draft(
+                        user_msg=user_msg or "",
+                        directives=dirs,
+                        enrichment=result,
                         plan=plan,
-                    )
-                    payload["from_email"] = headers["from_email"]
-                    payload["cc"] = headers["cc"]
-                    payload["ignore_emails"] = plan.ignore_emails
+                        attachments=email_atts,
+                        draft_previews=draft_previews,
+                    ):
+                        yield chunk
                     if email_atts:
-                        payload["attachments"] = email_atts
                         consumed_attachments = True
-                    jobs = _build_draft_jobs(
-                        payload,
-                        user_msg,
-                        history=history,
-                        prospects=[result],
-                        mailbox_messages=mailbox_messages,
-                        plan=plan,
-                    )
-                    if not jobs:
-                        jobs = [
-                            {
-                                "recipient_email": result.get("email"),
-                                "recipient_name": result.get("name") or "",
-                                "subject": payload.get("subject") or "(no subject)",
-                                "html_body": payload.get("html_body")
-                                or payload.get("body")
-                                or f"<p>{user_msg}</p>",
-                            }
-                        ]
-                    verb = "Sending" if want_send else "Creating draft"
-                    yield (
-                        f"\n{verb} to **{result.get('email')}** "
-                        f"from **{headers['from_email']}**…\n"
-                    )
-                    for job in jobs:
-                        if _stop_now():
-                            yield stopped_message()
-                            break
-                        job = _stamp_mail_fields(
-                            job,
-                            from_email=headers["from_email"],
-                            cc=headers["cc"],
-                            attachments=email_atts,
-                        )
-                        try:
-                            out, did_send = _deliver_job(
-                                job, want_send=want_send, user_msg=user_msg
-                            )
-                            if out.get("error"):
-                                yield (
-                                    f"- Failed for {job.get('recipient_email')}: "
-                                    f"{out.get('error')}\n"
-                                )
-                            else:
-                                yield (
-                                    f"- {'Sent' if did_send else 'Drafted'}: "
-                                    f"{json.dumps(out, default=str)}\n"
-                                )
-                        except Exception as e:
-                            yield f"- Failed for {job.get('recipient_email')}: {e}\n"
                     if chat_attachments and not email_atts:
                         yield (
                             _attach_note(
@@ -3102,22 +3214,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             )
                             + "\n"
                         )
+                elif result and not (zi_email or draft_to):
+                    yield "\n" + email_not_found_prompt() + "\n"
                 else:
-                    system = (
-                        "Present this enriched prospect clearly. "
-                        "If an email is present, remind the user they can say "
-                        "`draft email to them` or `send email to them`.\n\n"
-                        + json.dumps(result, default=str)[:6000]
+                    yield (
+                        "\nSay `draft to name@company.com` to create a Gmail draft, "
+                        "or paste another LinkedIn URL to enrich.\n"
                     )
-                    if used_docs:
-                        system += "\n\nUploaded file context:\n" + doc_context
-                    for chunk in chat_grounded(
-                        user_msg, history=history, system=system, use_search=False
-                    ):
-                        if isinstance(chunk, dict) and "__meta__" in chunk:
-                            sources = chunk["__meta__"].get("sources") or []
-                        else:
-                            yield chunk
 
         elif routing.startswith("GMAIL_EXTRACT"):
             raw_tail = ""
@@ -3220,6 +3323,30 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 like_mid = parse_gmail_message_id(user_msg or "")
             list_idx = parse_mailbox_list_index(user_msg or "")
 
+            if directives.get("to"):
+                enrichment = None
+                want = str(directives["to"]).lower()
+                for p in list(prospects or []) + list(prospect_out or []):
+                    if str(p.get("email") or "").strip().lower() == want:
+                        enrichment = p
+                        break
+                if enrichment is None and prospect_out:
+                    enrichment = prospect_out[0]
+                dirs = dict(directives)
+                if not dirs.get("cc"):
+                    dirs["cc"] = list(plan.cc or [])
+                for chunk in _run_styled_directive_draft(
+                    user_msg=user_msg or "",
+                    directives=dirs,
+                    enrichment=enrichment,
+                    plan=plan,
+                    attachments=email_atts,
+                    draft_previews=draft_previews,
+                ):
+                    yield chunk
+                if email_atts:
+                    consumed_attachments = True
+
             # Resolve reference from mailbox list index (#2 / email 3)
             if not like_mid and list_idx and mailbox_messages:
                 pool = [
@@ -3239,7 +3366,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         if dom:
                             like_ref = dom.group(1).split(".")[0]
 
-            if like_ref or like_mid:
+            if not directives.get("to") and (like_ref or like_mid):
                 # Clone angle from a prior sent email → draft to named company /
                 # last-search prospects — never the Sent template (Magic Bus / IndiaMART).
                 explicit_company = (
@@ -3509,8 +3636,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 if not em or em.lower() in block:
                                     continue
                                 if like_ref and "@" in like_ref:
-                                    dom = like_ref.split("@", 1)[1].lower()
-                                    if em.lower().endswith("@" + dom):
+                                    if em.lower() == like_ref.lower():
                                         continue
                                 # Never draft back to common template orgs from prior runs
                                 em_l = em.lower()
@@ -3723,8 +3849,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 if not em or em.lower() in block:
                                     continue
                                 if like_ref and "@" in like_ref:
-                                    dom = like_ref.split("@", 1)[1].lower()
-                                    if em.lower().endswith("@" + dom):
+                                    if em.lower() == like_ref.lower():
                                         continue
                                 filtered_m.append(p)
                             matched = filtered_m
@@ -3792,8 +3917,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             if not em or em in block:
                                 continue
                             if like_ref and "@" in like_ref:
-                                dom = like_ref.split("@", 1)[1].lower()
-                                if em.endswith("@" + dom):
+                                if em == like_ref.lower():
                                     continue
                             safe_jobs.append(job)
                         if jobs and not safe_jobs:
@@ -3988,6 +4112,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 out, did_send = _deliver_job(
                                     job, want_send=want_send, user_msg=user_msg
                                 )
+                                if not out.get("error") and not did_send:
+                                    yield _record_draft_preview(out, draft_previews)
                                 results.append({**out, "_did_send": did_send})
                             ok = [r for r in results if not r.get("error")]
                             fail = [r for r in results if r.get("error")]
@@ -4031,7 +4157,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             except Exception:
                                 pass
 
-            else:
+            elif not directives.get("to"):
                 # Prefer mailbox follow-ups when user asks and we have a prior pull
                 if mailbox_messages and re.search(
                     r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
@@ -4163,6 +4289,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         out, did_send = _deliver_job(
                             job, want_send=want_send, user_msg=user_msg
                         )
+                        if not out.get("error") and not did_send:
+                            yield _record_draft_preview(out, draft_previews)
                         results.append({**out, "_did_send": did_send})
                     ok = [r for r in results if not r.get("error")]
                     fail = [r for r in results if r.get("error")]
@@ -4305,6 +4433,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
             "need_file": need_file,
             "mailbox_messages": mailbox_out or None,
             "prospects": prospect_out or None,
+            "draft_previews": draft_previews or None,
             "cancelled": cancelled,
             "pending_user_msg": user_msg if need_file else None,
         }

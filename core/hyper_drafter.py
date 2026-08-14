@@ -18,6 +18,9 @@ Follow this grounding contract:
 10. personalization_ledger is a list of {claim, evidence_ref, source_tool} — evidence_ref must point into org_brief or source_email.
 11. Greet the approved contact by first name only (e.g. Hi Sushmita,). Never put job title in parentheses. Never greet a name from source_email.
 12. Never include tracking, Netlify, or click-redirect URLs in the body text or link labels.
+13. Write the email body as normal prose. Do NOT insert manual line breaks inside paragraphs. Separate paragraphs with exactly one blank line. Do not indent. Use single spaces between words and single spaces after punctuation. No trailing spaces.
+14. Do not use markdown (no **bold**, no bullet dashes) unless the style template uses them.
+15. When contact context is provided as labeled fields, use those fields (never invent a work email).
 """
 
 
@@ -38,9 +41,14 @@ def compose_email(
 
         gemini = get_gemini_client()
 
+    from core.enrich_cache import format_enrichment_fields
+
+    contact_block = format_enrichment_fields(contact or {}) or json.dumps(
+        contact, default=str
+    )
     prompt = (
         f"intent={intent}\n"
-        f"contact={json.dumps(contact, default=str)}\n"
+        f"PROSPECT CONTEXT (labeled fields):\n{contact_block}\n"
         f"org_brief={json.dumps(org_brief, default=str)[:30000]}\n"
         f"source_email={json.dumps(source_email or {}, default=str)[:8000]}\n"
         f"style_profile={json.dumps(style_profile or {}, default=str)[:4000]}\n"
@@ -69,22 +77,23 @@ def compose_email(
         name.split(None, 1)[0] if name else ""
     )
     title = str(contact.get("title") or contact.get("designation") or "").strip()
-    if draft.get("body_html"):
+    if draft.get("body_html") or draft.get("body"):
         try:
             from gmail_client.html_format import (
                 ensure_designation_in_greeting,
-                normalize_email_html,
+                prepare_draft_bodies,
             )
             from core.tracking import strip_visible_tracking_urls
 
-            html = draft["body_html"]
-            if first:
+            html = draft.get("body_html") or draft.get("body") or ""
+            if first and html:
                 html = ensure_designation_in_greeting(
                     html, first_name=first, title=title
                 )
-            draft["body_html"] = normalize_email_html(
-                strip_visible_tracking_urls(html)
-            )
+            html = strip_visible_tracking_urls(html)
+            cleaned, html = prepare_draft_bodies(html)
+            draft["body_cleaned"] = cleaned
+            draft["body_html"] = html
         except Exception:
             pass
     cost = {
