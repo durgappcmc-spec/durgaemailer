@@ -20,7 +20,7 @@ class InjectTrackingOutput(BaseModel):
 
 class InjectTrackingTool:
     name = "inject_tracking"
-    description = "Strip then inject hidden open pixel (no click-URL rewrite in drafts)"
+    description = "Assign a tracking id for drafts without a live open pixel"
     input_schema = InjectTrackingInput
     output_schema = InjectTrackingOutput
     cost_hint = {}
@@ -28,16 +28,11 @@ class InjectTrackingTool:
     phase_scope = {"phase2"}
 
     def run(self, inputs: InjectTrackingInput, ctx: ToolContext) -> ToolResult:
-        from core.tracking import inject_tracking
+        from core.tracking import prepare_draft_tracking
 
-        html, tid = inject_tracking(
+        html, tid = prepare_draft_tracking(
             inputs.body_html,
-            tracking_id=inputs.tracking_id,
-            recipient_email=inputs.recipient_email or "unknown@example.com",
-            subject=inputs.subject or "",
-            register=False,
-            track_clicks=False,
-            track_opens=True,
+            inputs.tracking_id,
         )
         return ToolResult(
             ok=True,

@@ -578,25 +578,40 @@ if c1.button("📨 Send selected", type="primary") and action_ids:
         results.append(_send_one(draft))
     st.json(results)
 if c2.button("🔒 Ensure tracking on selected") and action_ids:
+    from core.tracking import prepare_draft_tracking
+
     for did in action_ids:
         draft = _load_full_draft(did, by_id.get(did) or {})
-        html, tid = inject_tracking(
+        html, tid = prepare_draft_tracking(
             draft.get("body_html") or "",
-            tracking_id=draft.get("tracking_id") or None,
-            recipient_email=draft.get("to") or draft.get("recipient") or "",
-            subject=draft.get("subject") or "",
-            register=True,
-            track_clicks=False,
-            track_opens=True,
+            draft.get("tracking_id") or None,
         )
         draft["body_html"] = html
         draft["tracking_id"] = tid
-        draft["has_open_pixel"] = True
+        draft["has_open_pixel"] = False
         try:
             drive_db.save_draft(did, draft)
         except Exception:
             pass
-    st.success(f"Tracking injected on {len(action_ids)} draft(s)")
+        gid = draft.get("gmail_draft_id") or (
+            str(did).removeprefix("gmail:") if str(did).startswith("gmail:") else ""
+        )
+        if gid:
+            try:
+                from gmail_client.drafts import save_gmail_draft
+
+                save_gmail_draft(
+                    gid,
+                    draft.get("to") or "",
+                    draft.get("cc") or "",
+                    draft.get("bcc") or "",
+                    draft.get("subject") or "",
+                    html,
+                    from_email=draft.get("from") or None,
+                )
+            except Exception:
+                pass
+    st.success(f"Tracking id saved on {len(action_ids)} draft(s) — pixel is added at send.")
     st.rerun()
 if c3.button("🗑 Remove selected") and action_ids:
     results = _remove_drafts(action_ids)

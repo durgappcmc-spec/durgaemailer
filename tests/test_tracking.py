@@ -40,21 +40,59 @@ def test_strip_removes_pixel():
     assert "/.netlify/functions/open" not in cleaned
 
 
-def test_draft_mode_hides_netlify_click_urls():
-    """Drafts keep original hrefs; only a hidden open pixel is added."""
-    from core.tracking import inject_tracking, html_for_preview
+def test_draft_has_no_live_open_pixel():
+    """Drafts store a tracking id only; the live pixel is injected at send."""
+    from core.tracking import (
+        extract_tracking_id,
+        html_for_preview,
+        inject_tracking,
+        prepare_draft_tracking,
+    )
 
     html = '<p>Hi <a href="https://karuna.org/program">our program</a></p>'
-    drafted, tid = inject_tracking(
-        html, register=False, track_clicks=False, track_opens=True
-    )
+    drafted, tid = prepare_draft_tracking(html)
     assert tid
-    assert "/.netlify/functions/open?id=" in drafted
+    assert extract_tracking_id(drafted) == tid
+    assert "relay-tid:" in drafted
+    assert "/.netlify/functions/open" not in drafted
+    assert "/t/o/" not in drafted
+    assert "karuna.org/program" in drafted
+    assert "/.netlify/functions/click" not in drafted
+    preview = html_for_preview(drafted)
+    assert "netlify" not in preview.lower()
+    assert "/.netlify/functions/open" not in preview
+    assert "karuna.org/program" in preview
+
+    sent, tid2 = inject_tracking(
+        drafted, tracking_id=tid, register=False, track_clicks=True, track_opens=True
+    )
+    assert tid2 == tid
+    assert "/.netlify/functions/open?id=" in sent
+
+
+def test_draft_mode_hides_netlify_click_urls():
+    """Drafts keep original hrefs and never embed a live open pixel."""
+    from core.tracking import html_for_preview, prepare_draft_tracking
+
+    html = '<p>Hi <a href="https://karuna.org/program">our program</a></p>'
+    drafted, tid = prepare_draft_tracking(html)
+    assert tid
+    assert "/.netlify/functions/open" not in drafted
     assert "karuna.org/program" in drafted
     assert "/.netlify/functions/click" not in drafted
     preview = html_for_preview(drafted)
     assert "netlify" not in preview.lower()
     assert "karuna.org/program" in preview
+
+
+def test_preview_strips_leftover_live_pixel():
+    from core.tracking import html_for_preview, inject_tracking
+
+    html, _tid = inject_tracking("<p>x</p>", register=False)
+    assert "/.netlify/functions/open" in html
+    preview = html_for_preview(html)
+    assert "/.netlify/functions/open" not in preview
+    assert "/t/o/" not in preview
 
 
 def test_visible_click_autolink_is_stripped():
@@ -82,13 +120,13 @@ def test_visible_click_autolink_is_stripped():
 
 @pytest.mark.parametrize("surface", ["bulk_grid", "chat_inspector", "drafts_inspector"])
 def test_save_path_reinjects(surface, monkeypatch, tmp_path):
-    """Every save surface must strip→inject with same tracking_id."""
-    from core.tracking import inject_tracking, extract_tracking_id
+    """Every draft save keeps the same tracking_id without a live open pixel."""
+    from core.tracking import extract_tracking_id, prepare_draft_tracking
 
-    body, tid = inject_tracking("<p>Hello <a href='https://x.org'>x</a></p>", register=False)
-    # simulate edit that drops pixel accidentally
+    body, tid = prepare_draft_tracking("<p>Hello <a href='https://x.org'>x</a></p>")
     edited = "<p>Hello edited <a href='https://x.org'>x</a></p>"
-    saved, tid2 = inject_tracking(edited, tracking_id=tid, register=False)
+    saved, tid2 = prepare_draft_tracking(edited, tid)
     assert tid2 == tid
     assert extract_tracking_id(saved) == tid
+    assert "/.netlify/functions/open" not in saved
     assert surface  # parametrize identity

@@ -20,6 +20,19 @@ _CLICK_MARKERS = (
 )
 
 
+_TID_COMMENT_RE = re.compile(
+    r"<!--\s*relay-tid:([0-9a-fA-F\-]{8,})\s*-->",
+    re.I,
+)
+_VISIBLE_TRACKING_URL_RE = re.compile(
+    r"(?:&lt;|<)?https?://[^\s<>\"']*?"
+    r"(?:durgaemailer-tracking\.netlify\.app|"
+    r"/\.netlify/functions/(?:click|open)|/t/[co]/)"
+    r"[^\s<>\"']*(?:&gt;|>)?",
+    re.I,
+)
+
+
 def _tracking_base() -> str:
     return (settings.TRACKING_BASE_URL or "").rstrip("/")
 
@@ -47,16 +60,10 @@ def extract_tracking_id(html: str) -> Optional[str]:
     )
     if m:
         return m.group(1)
+    cm = _TID_COMMENT_RE.search(html or "")
+    if cm:
+        return cm.group(1)
     return None
-
-
-_VISIBLE_TRACKING_URL_RE = re.compile(
-    r"(?:&lt;|<)?https?://[^\s<>\"']*?"
-    r"(?:durgaemailer-tracking\.netlify\.app|"
-    r"/\.netlify/functions/(?:click|open)|/t/[co]/)"
-    r"[^\s<>\"']*(?:&gt;|>)?",
-    re.I,
-)
 
 
 def is_tracking_url(url: str) -> bool:
@@ -109,6 +116,15 @@ def strip_tracking(html: str) -> str:
         src = img.get("src") or ""
         if any(m in src for m in _OPEN_MARKERS) or img.get("data-tracking") == "open":
             img.decompose()
+
+    # Autolink text `<https://…netlify…>` is parsed as a bogus tag by html.parser
+    for tag in list(soup.find_all(True)):
+        name = (tag.name or "").lower()
+        if name.startswith("http") and (
+            "netlify" in str(tag).lower()
+            or any(m in str(tag) for m in _OPEN_MARKERS + _CLICK_MARKERS)
+        ):
+            tag.decompose()
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
@@ -166,21 +182,14 @@ def inject_tracking(
 ) -> tuple[str, str]:
     """Idempotent strip → inject. Preserves tracking_id when provided.
 
-    For drafts, pass track_clicks=False so Netlify click URLs are not shown
-    in Gmail/Drafts preview (open pixel stays hidden as a 1×1 image).
+    For drafts, pass track_clicks=False and track_opens=False so Gmail/Relay
+    preview cannot fire a live open pixel. Call prepare_draft_tracking() for
+    drafts; inject the pixel only at send time.
     """
     cleaned = strip_tracking(body_html or "")
     existing = tracking_id or extract_tracking_id(body_html or "")
 
     if not register:
-        return _inject_local(
-            cleaned,
-            existing,
-            track_clicks=track_clicks,
-            track_opens=track_opens,
-        )
-
-    if existing:
         return _inject_local(
             cleaned,
             existing,
@@ -197,6 +206,7 @@ def inject_tracking(
         recipient_name=recipient_name,
         track_clicks=track_clicks,
         track_opens=track_opens,
+        email_id=existing or None,
     )
 
 
@@ -248,6 +258,29 @@ def _inject_local(
     return instrumented, email_id
 
 
+def stamp_draft_tracking_id(html: str, tid: str) -> str:
+    """Store tracking id in an HTML comment — Gmail will not fetch it as an open."""
+    body = _TID_COMMENT_RE.sub("", html or "")
+    tid = (tid or "").strip()
+    if not tid:
+        return body
+    return f"{body.rstrip()}<!-- relay-tid:{tid} -->"
+
+
+def prepare_draft_tracking(
+    body_html: str,
+    tracking_id: Optional[str] = None,
+) -> tuple[str, str]:
+    """Draft-safe: keep a tracking id, never a live open pixel or click wrapper."""
+    import uuid
+
+    existing = tracking_id or extract_tracking_id(body_html or "")
+    cleaned = strip_tracking(body_html or "")
+    tid = (existing or "").strip() or str(uuid.uuid4())
+    return stamp_draft_tracking_id(cleaned, tid), tid
+
+
 def html_for_preview(html: str) -> str:
-    """Draft/UI preview without Netlify tracking URLs visible."""
-    return strip_visible_tracking_urls(strip_tracking(html or ""))
+    """Draft/UI preview without Netlify tracking URLs visible or fetchable."""
+    raw = strip_visible_tracking_urls(html or "")
+    return strip_visible_tracking_urls(strip_tracking(raw))

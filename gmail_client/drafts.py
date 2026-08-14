@@ -234,6 +234,46 @@ def _html_from_plain(plain: str) -> str:
     )
 
 
+def _defer_open_pixel(
+    body_html: str,
+    *,
+    draft_id: str = "",
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    subject: str = "",
+    from_email: str = "",
+) -> str:
+    """Strip live open pixels from draft HTML; persist to Gmail when we have a draft id."""
+    html = body_html or ""
+    if "/.netlify/functions/open" not in html and "/t/o/" not in html:
+        return html
+    try:
+        from core.tracking import prepare_draft_tracking
+
+        clean, _tid = prepare_draft_tracking(html)
+    except Exception:
+        try:
+            from core.tracking import strip_tracking
+
+            clean = strip_tracking(html)
+        except Exception:
+            return html
+    did = (draft_id or "").removeprefix("gmail:")
+    if did:
+        try:
+            saved = save_gmail_draft(
+                did, to, cc, bcc, subject, clean, from_email=from_email or None
+            )
+            if saved.get("error"):
+                print(f"[gmail] strip draft pixel failed: {saved.get('error')}", file=sys.stderr)
+            else:
+                print(f"[gmail] removed live open pixel from draft {did}", file=sys.stderr)
+        except Exception as e:
+            print(f"[gmail] strip draft pixel skipped: {e}", file=sys.stderr)
+    return clean
+
+
 def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
     """Gmail is the source of truth. HTML is primary; plain is derived."""
     did = (draft_id or "").removeprefix("gmail:")
@@ -316,6 +356,15 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         elif snip:
             body_html = f"<p>{_html.escape(snip)}</p>"
             body_text = snip
+    body_html = _defer_open_pixel(
+        body_html,
+        draft_id=did,
+        to=headers.get("to", ""),
+        cc=headers.get("cc", ""),
+        bcc=headers.get("bcc", ""),
+        subject=headers.get("subject", ""),
+        from_email=headers.get("from", ""),
+    )
     return {
         "id": did,
         "to": headers.get("to", ""),
@@ -389,6 +438,12 @@ def fetch_gmail_message(message_id: str) -> dict[str, Any]:
         if snip:
             body_text = snip
             body_html = _html_from_plain(snip)
+    try:
+        from core.tracking import html_for_preview
+
+        body_html = html_for_preview(body_html)
+    except Exception:
+        pass
     return {
         "id": "",
         "to": headers.get("to", ""),
@@ -443,6 +498,12 @@ def save_gmail_draft(
     cc_n = _drop_addrs_already_in_to(normalize_addr_list(cc), to_n)
     bcc_n = _drop_addrs_already_in_to(normalize_addr_list(bcc), to_n)
     try:
+        from core.tracking import prepare_draft_tracking
+
+        html, _tid = prepare_draft_tracking(html)
+    except Exception:
+        pass
+    try:
         raw, _tid = _build_raw_message(
             to=to_n,
             subject=subject or "",
@@ -479,22 +540,8 @@ def save_gmail_draft(
 
 
 def send_draft(draft_id: str) -> dict[str, Any]:
-    """Send the existing Gmail draft as stored (do not rebuild MIME)."""
-    did = (draft_id or "").removeprefix("gmail:")
-    if not did:
-        return {"error": "missing gmail draft id"}
-    try:
-        svc = gmail_service()
-        sent = svc.users().drafts().send(userId="me", body={"id": did}).execute()
-        return {
-            "ok": True,
-            "message_id": sent.get("id"),
-            "thread_id": sent.get("threadId"),
-            "gmail_draft_id": did,
-        }
-    except Exception as e:
-        print(f"[gmail] drafts.send failed: {e}", file=sys.stderr)
-        return {"error": str(e), "gmail_draft_id": did}
+    """Send a Gmail draft, injecting the open pixel only at send time."""
+    return send_gmail_draft(draft_id)
 
 
 def _collect_draft_refs(list_page, *, limit: int = 200) -> list[tuple[str, str]]:
@@ -726,7 +773,7 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
 
 
 def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
-    """Send an existing Gmail draft (injects click tracking, preserves open pixel)."""
+    """Send an existing Gmail draft (injects click + open tracking at send time)."""
     did = (gmail_draft_id or "").removeprefix("gmail:")
     draft = get_gmail_draft(did)
     if draft.get("error"):

@@ -442,6 +442,12 @@ def html_for_editor(html: str) -> str:
     if not raw:
         return ""
     try:
+        from core.tracking import html_for_preview
+
+        raw = (html_for_preview(raw) or "").strip()
+    except Exception:
+        pass
+    try:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(raw, "html.parser")

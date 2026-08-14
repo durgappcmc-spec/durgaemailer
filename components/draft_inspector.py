@@ -167,12 +167,12 @@ def render_draft_inspector(
             ]
             st.caption("📎 " + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
     with cols[1]:
-        if tid or has_pixel:
-            st.markdown("🔒 **tracked** (open pixel)")
+        if tid:
+            st.markdown("🔒 **tracked** (pixel added at send)")
             if tid:
                 st.code(tid[:18] + "…", language=None)
         else:
-            st.warning("untracked — open pixel missing")
+            st.caption("Open tracking is added when you send.")
 
     section = st.radio(
         "Draft view",
@@ -207,12 +207,14 @@ def render_draft_inspector(
             try:
                 import streamlit.components.v1 as components
                 from gmail_client.html_format import render_gmail_preview
+                from core.tracking import html_for_preview
 
+                preview_html = html_for_preview(body_html)
                 preview = render_gmail_preview(
                     draft.get("subject") or "",
                     draft.get("to") or draft.get("recipient") or "",
                     draft.get("cc") or "",
-                    body_html,
+                    preview_html,
                     bcc=draft.get("shown_bcc") or draft.get("bcc") or "",
                     bcc_local=bool(draft.get("bcc_local")),
                 )
@@ -232,14 +234,20 @@ def render_draft_inspector(
                 components.html(doc, height=height, scrolling=True)
                 enable_editor_mouse_scroll()
             except Exception:
+                try:
+                    from core.tracking import html_for_preview as _preview_html
+
+                    safe = _preview_html(body_html)
+                except Exception:
+                    safe = body_html
                 st.markdown(
-                    f'<div class="gm-preview">{body_html}</div>',
+                    f'<div class="gm-preview">{safe}</div>',
                     unsafe_allow_html=True,
                 )
-            if tid or has_pixel:
-                st.caption("🔒 Open tracking is embedded (hidden). Links shown as originals.")
+            if tid:
+                st.caption("Open tracking is added when you send — viewing a draft does not count.")
             else:
-                st.error("No open-tracking pixel detected.")
+                st.caption("Open tracking will be attached at send.")
 
         s1, s2, s3 = st.columns(3)
         with s1:
@@ -679,7 +687,7 @@ def _render_edit_tab(
 
     st.caption(
         "Edit like a normal email — bold, font, bullets, links. "
-        "Tracking pixel is re-added automatically on save."
+        "Tracking is added when you send — saving a draft does not count as an open."
     )
     draft_key = str(draft.get("draft_id") or "local").replace(":", "_")
     k = f"{key_prefix}_{draft_key}"
@@ -776,12 +784,18 @@ def _render_edit_tab(
         subject=subject,
         register=False,
         track_clicks=False,
-        track_opens=True,
+        track_opens=False,
     )
+    try:
+        from core.tracking import prepare_draft_tracking
+
+        html, new_tid = prepare_draft_tracking(html, new_tid)
+    except Exception:
+        pass
     draft["subject"] = subject
     draft["body_html"] = html
     draft["tracking_id"] = new_tid
-    draft["has_open_pixel"] = True
+    draft["has_open_pixel"] = False
     draft["attachments"] = _attachments_for_storage(merged)
 
     did = draft.get("draft_id")
@@ -936,21 +950,16 @@ def _attachments_for_send(atts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
-    from core.tracking import inject_tracking
+    from core.tracking import prepare_draft_tracking
     from core import drive_db
 
-    html, tid = inject_tracking(
+    html, tid = prepare_draft_tracking(
         draft.get("body_html") or "",
-        tracking_id=draft.get("tracking_id") or None,
-        recipient_email=draft.get("to") or draft.get("recipient") or "",
-        subject=draft.get("subject") or "",
-        register=True,
-        track_clicks=False,
-        track_opens=True,
+        draft.get("tracking_id") or None,
     )
     draft["body_html"] = html
     draft["tracking_id"] = tid
-    draft["has_open_pixel"] = True
+    draft["has_open_pixel"] = False
     did = draft.get("draft_id")
     if did:
         try:
@@ -973,7 +982,7 @@ def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
             )
         except Exception:
             pass
-    return {"body_html": html, "tracking_id": tid, "has_open_pixel": True}
+    return {"body_html": html, "tracking_id": tid, "has_open_pixel": False}
 
 
 def _send_draft_now(draft: dict[str, Any], *, rebuild: bool = True) -> dict[str, Any]:

@@ -33,7 +33,7 @@ class SaveDraftTool:
 
     def run(self, inputs: SaveDraftInput, ctx: ToolContext) -> ToolResult:
         from core import drive_db
-        from core.tracking import extract_tracking_id, inject_tracking
+        from core.tracking import extract_tracking_id, prepare_draft_tracking
 
         if not inputs.tracking_id:
             return ToolResult(
@@ -43,24 +43,9 @@ class SaveDraftTool:
             )
         draft = dict(inputs.draft or {})
         body = draft.get("body_html") or draft.get("html") or draft.get("body") or ""
-        # Enforce strip→inject on every save
-        html, tid = inject_tracking(
-            body,
-            tracking_id=inputs.tracking_id,
-            recipient_email=(draft.get("to") or draft.get("recipient") or ""),
-            subject=draft.get("subject") or "",
-            register=False,
-            track_clicks=False,
-            track_opens=True,
-        )
+        html, tid = prepare_draft_tracking(body, inputs.tracking_id)
         if extract_tracking_id(html) != tid and tid:
-            html, tid = inject_tracking(
-                html,
-                tracking_id=tid,
-                register=False,
-                track_clicks=False,
-                track_opens=True,
-            )
+            html, tid = prepare_draft_tracking(html, tid)
         draft_id = draft.get("draft_id") or f"draft_{uuid.uuid4().hex[:12]}"
         payload = {
             **draft,

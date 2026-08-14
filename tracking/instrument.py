@@ -21,9 +21,10 @@ def instrument_html(
     recipient_name: Optional[str] = None,
     track_clicks: bool = True,
     track_opens: bool = True,
+    email_id: Optional[str] = None,
 ) -> tuple[str, str]:
     """Rewrite links + append open pixel. Returns (html, email_id)."""
-    email_id = str(uuid.uuid4())
+    email_id = (email_id or "").strip() or str(uuid.uuid4())
     base = (settings.TRACKING_BASE_URL or "").rstrip("/")
     soup = BeautifulSoup(html or "", "html.parser")
     links: list[dict[str, str]] = []

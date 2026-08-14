@@ -252,9 +252,8 @@ def create_draft(
 ) -> dict[str, Any]:
     """Create a new Gmail draft for review.
 
-    Open-pixel tracking is embedded (hidden). Click links stay as original
-    URLs in the draft so Netlify tracking URLs are not visible while reviewing;
-    clicks are wrapped at send time.
+    Tracking id is stored, but no live open pixel is embedded — Gmail/Relay
+    draft views must not count as opens. The pixel is added at send time.
     """
     from gmail_client.html_format import (
         clean_email_body,
@@ -278,18 +277,24 @@ def create_draft(
         pass
     if include_signature:
         body = append_signature(body, from_email=from_addr)
+    try:
+        from core.tracking import prepare_draft_tracking
+
+        body, tracking_id = prepare_draft_tracking(body)
+    except Exception:
+        tracking_id = ""
     body_cleaned = clean_email_body(plain_from_html(body)) or ""
 
-    # Drafts: open pixel only — never rewrite hrefs to Netlify click URLs
-    raw, tracking_id = _build_raw_message(
+    # No live open pixel in Gmail drafts — viewing a draft must not count as an open.
+    raw, _built_tid = _build_raw_message(
         to,
         subject,
         body,
         recipient_name=recipient_name,
         attachments=attachments,
-        instrument=track,
+        instrument=False,
         track_clicks=False,
-        track_opens=True,
+        track_opens=False,
         campaign=campaign,
         source=src,
         from_email=from_addr,
@@ -298,23 +303,7 @@ def create_draft(
         plain_body=body_cleaned,
         bcc=bcc,
     )
-    # Drive mirror uses the same signed body (no second append_signature)
     instrumented_html = body
-    if track:
-        try:
-            from core.tracking import inject_tracking
-
-            instrumented_html, tracking_id = inject_tracking(
-                body,
-                tracking_id=tracking_id or None,
-                recipient_email=to,
-                subject=subject,
-                register=False,
-                track_clicks=False,
-                track_opens=True,
-            )
-        except Exception:
-            pass
     try:
         svc = gmail_service()
         draft = (
