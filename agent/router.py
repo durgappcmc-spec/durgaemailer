@@ -1054,6 +1054,8 @@ def _run_styled_directive_draft(
         style_template=style_ref,
         user_msg=user_msg,
     )
+    model = composed.get("provider") or "gemini"
+    yield f"_Chat model: **{model}**_\n"
     name = str((enrichment or {}).get("name") or "").strip()
     title = str((enrichment or {}).get("title") or "").strip()
     company = str((enrichment or {}).get("company") or "").strip()
@@ -2060,6 +2062,20 @@ def answer(
       attachments: staged uploads (always available; user need not mention them)
       mailbox_messages: last inbox/sent pull from chat (for filters + follow-ups)
     """
+    from core.chat_llm import preferred_provider, reset_provider, use_provider
+
+    token = use_provider(preferred_provider())
+    try:
+        yield from _answer_impl(user_msg, history=history, context=context)
+    finally:
+        reset_provider(token)
+
+
+def _answer_impl(
+    user_msg: str,
+    history: Optional[list[dict[str, str]]] = None,
+    context: Optional[dict[str, Any]] = None,
+) -> Generator[str | dict[str, Any], None, None]:
     prospects = (context or {}).get("prospects") or []
     chat_attachments = (context or {}).get("attachments") or []
     mailbox_messages = list((context or {}).get("mailbox_messages") or [])

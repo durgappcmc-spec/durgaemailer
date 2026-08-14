@@ -678,6 +678,8 @@ def hydrate_session_fast(session_state: Any) -> None:
             session_state["last_prospects"] = extras["last_prospects"]
         if extras.get("last_mailbox") and not session_state.get("last_mailbox"):
             session_state["last_mailbox"] = extras["last_mailbox"]
+        if extras.get("chat_llm_provider") and not session_state.get("chat_llm_provider"):
+            session_state["chat_llm_provider"] = extras["chat_llm_provider"]
     except Exception as e:
         print(f"[durable] fast hydrate failed: {e}", file=sys.stderr)
 

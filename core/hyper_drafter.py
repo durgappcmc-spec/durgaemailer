@@ -38,9 +38,20 @@ def compose_email(
     row_id: str | None = None,
 ) -> tuple[dict, dict]:
     if gemini is None:
-        from core.agent.gemini_client import get_gemini_client
+        try:
+            from core.chat_llm import resolve_chat_provider
+            from core.genspark_client import as_task_client
 
-        gemini = get_gemini_client()
+            if resolve_chat_provider() == "genspark":
+                gemini = as_task_client()
+            else:
+                from core.agent.gemini_client import get_gemini_client
+
+                gemini = get_gemini_client()
+        except Exception:
+            from core.agent.gemini_client import get_gemini_client
+
+            gemini = get_gemini_client()
 
     from core.enrich_cache import format_enrichment_fields
 

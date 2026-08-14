@@ -15,6 +15,48 @@ from config import settings
 _client: Optional[genai.Client] = None
 
 
+def _use_genspark() -> bool:
+    try:
+        from core.chat_llm import active_provider
+        from core.genspark_client import available
+
+        return active_provider() == "genspark" and bool(available())
+    except Exception:
+        return False
+
+
+def _genspark_chat(
+    user_msg: str,
+    history: Optional[list[dict[str, str]]] = None,
+    system: Optional[str] = None,
+) -> Generator[str | dict[str, Any], None, None]:
+    from core.genspark_client import chat_completions
+
+    bits: list[str] = []
+    if system:
+        bits.append(str(system))
+    for msg in (history or [])[-12:]:
+        role = msg.get("role") or "user"
+        text = (msg.get("content") or msg.get("text") or "").strip()
+        if text:
+            bits.append(f"{role}: {text}")
+    bits.append(user_msg or "")
+    try:
+        raw = chat_completions(
+            "\n\n".join(bits),
+            system=system,
+            max_tokens=2500,
+            temperature=0.4,
+        )
+        text = str(raw.get("text") or "").strip()
+        if text:
+            yield text
+    except Exception as e:
+        print(f"[genspark] chat error: {e}", file=sys.stderr)
+        yield f"[genspark error] {e}"
+    yield {"__meta__": {"sources": [], "llm_provider": "genspark"}}
+
+
 def _get_client() -> genai.Client:
     global _client
     if _client is None:
@@ -107,6 +149,9 @@ def chat_grounded(
     """Main chat with optional Google Search grounding. Yields text chunks,
     then a final {"__meta__": {"sources": [...]}} dict.
     """
+    if _use_genspark():
+        yield from _genspark_chat(user_msg, history=history, system=system)
+        return
     client = _get_client()
     contents = _history_to_contents(history)
     contents.append(
@@ -182,6 +227,29 @@ def chat_fast(
     system: Optional[str] = None,
 ) -> str:
     """Non-grounded fast completion for the router. Returns text directly."""
+    if _use_genspark():
+        try:
+            from core.genspark_client import chat_completions
+
+            sys_txt = system
+            user_bits: list[str] = []
+            for msg in messages:
+                role = msg.get("role") or "user"
+                content = msg.get("content") or ""
+                if role == "system" and sys_txt is None:
+                    sys_txt = content
+                    continue
+                if content:
+                    user_bits.append(content)
+            raw = chat_completions(
+                "\n".join(user_bits),
+                system=sys_txt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return str(raw.get("text") or "").strip() or "CHAT"
+        except Exception as e:
+            print(f"[genspark] chat_fast error: {e}", file=sys.stderr)
     client = _get_client()
     system_instruction = system
     if system_instruction is None:
@@ -219,6 +287,16 @@ def extract_json(
     max_tokens: int = 1000,
 ) -> str:
     """Structured JSON extraction. Returns raw JSON string."""
+    if _use_genspark():
+        try:
+            from core.genspark_client import compose_json
+
+            data = compose_json(prompt, system=system, max_tokens=max_tokens)
+            if isinstance(data, dict):
+                data.pop("_genspark", None)
+            return json.dumps(data)
+        except Exception as e:
+            print(f"[genspark] extract_json error: {e}", file=sys.stderr)
     client = _get_client()
     config = types.GenerateContentConfig(
         temperature=0.1,

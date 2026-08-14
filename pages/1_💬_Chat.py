@@ -27,6 +27,31 @@ except Exception:
 
 with st.sidebar:
     st.markdown('<div class="genspark-rail">', unsafe_allow_html=True)
+    try:
+        from core.chat_llm import (
+            genspark_ready,
+            hydrate_into,
+            load_provider,
+            save_provider,
+        )
+
+        hydrate_into(st.session_state)
+        picked = st.radio(
+            "Chat model",
+            ["gemini", "genspark"],
+            format_func=lambda k: "Gemini" if k == "gemini" else "Genspark",
+            key="chat_llm_provider",
+            horizontal=True,
+            help="Saved as your default. Chat keeps using this until you change it.",
+        )
+        if picked != load_provider():
+            save_provider(picked)
+        if picked == "genspark" and not genspark_ready():
+            st.caption("Genspark key missing — Chat will use Gemini until GSK_API_KEY is set.")
+        else:
+            st.caption("Saved. Chat will keep using this model.")
+    except Exception:
+        st.caption("Chat model: Gemini")
     st.subheader("Bulk jobs")
     try:
         from core import drive_db
