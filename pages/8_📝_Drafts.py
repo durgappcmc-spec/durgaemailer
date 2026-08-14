@@ -11,7 +11,7 @@ import streamlit as st
 
 from config import APP_NAME
 from core.auth_ui import logout_button, require_login
-from components.draft_inspector import render_draft_inspector
+from components.draft_inspector import enable_editor_mouse_scroll, render_draft_inspector
 
 st.set_page_config(page_title=f"Drafts · {APP_NAME}", page_icon="📝", layout="wide")
 if not require_login():
@@ -317,8 +317,13 @@ st.markdown(
 <style>
 iframe[title*="quill" i],
 iframe[title*="streamlit_quill" i] {
-  min-height: 400px !important;
-  height: 400px !important;
+  min-height: 480px !important;
+  height: 480px !important;
+  max-height: 480px !important;
+  overflow: auto !important;
+}
+div[data-testid="stHtml"] iframe {
+  overflow: auto !important;
 }
 div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) button {
   background: transparent !important;

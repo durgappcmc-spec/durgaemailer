@@ -20,6 +20,82 @@ _QUILL_TOOLBAR = [
     ["clean"],
 ]
 
+_EDITOR_SCROLL_CSS = """
+<style>
+iframe[title*="quill" i],
+iframe[title*="streamlit_quill" i] {
+  min-height: 480px !important;
+  height: 480px !important;
+  max-height: 480px !important;
+  overflow: auto !important;
+}
+div[data-testid="stHtml"] iframe {
+  overflow: auto !important;
+}
+</style>
+"""
+
+_EDITOR_SCROLL_JS = """
+<!doctype html>
+<html><head><meta charset="utf-8"></head><body>
+<script>
+(function () {
+  var parentDoc = window.parent && window.parent.document;
+  if (!parentDoc) return;
+  function patch() {
+    parentDoc.querySelectorAll("iframe").forEach(function (f) {
+      var doc;
+      try { doc = f.contentDocument || (f.contentWindow && f.contentWindow.document); }
+      catch (e) { return; }
+      if (!doc) return;
+      var editor = doc.querySelector(".ql-editor");
+      var preview = doc.querySelector(".gm-preview");
+      if (!editor && !preview) return;
+      f.setAttribute("scrolling", "yes");
+      f.style.overflow = "auto";
+      if (editor && !doc.getElementById("relay-quill-scroll")) {
+        var s = doc.createElement("style");
+        s.id = "relay-quill-scroll";
+        s.textContent = [
+          "html, body { height: 100% !important; margin: 0 !important; overflow: hidden !important; }",
+          "#root, #root > div { height: 100% !important; display: flex !important; flex-direction: column !important; }",
+          ".ql-toolbar.ql-snow { flex: 0 0 auto !important; }",
+          ".ql-container.ql-snow { flex: 1 1 auto !important; height: auto !important; overflow: hidden !important; display: flex !important; flex-direction: column !important; }",
+          ".ql-editor { overflow-y: auto !important; overflow-x: hidden !important; height: 100% !important; min-height: 0 !important; max-height: none !important; overscroll-behavior: contain !important; }"
+        ].join("\\n");
+        (doc.head || doc.documentElement).appendChild(s);
+      }
+      if (preview) {
+        if (doc.documentElement) doc.documentElement.style.overflowY = "auto";
+        if (doc.body) {
+          doc.body.style.overflowY = "auto";
+          doc.body.style.overscrollBehavior = "contain";
+        }
+      }
+    });
+  }
+  patch();
+  setTimeout(patch, 200);
+  setTimeout(patch, 700);
+  setTimeout(patch, 1500);
+})();
+</script>
+</body></html>
+"""
+
+
+def enable_editor_mouse_scroll(*, inject_js: bool = True) -> None:
+    """Let the mouse wheel scroll Quill / preview iframes under a draft."""
+    st.markdown(_EDITOR_SCROLL_CSS, unsafe_allow_html=True)
+    if not inject_js:
+        return
+    try:
+        import streamlit.components.v1 as components
+
+        components.html(_EDITOR_SCROLL_JS, height=0, scrolling=False)
+    except Exception:
+        pass
+
 
 def render_draft_inspector(
     draft: dict[str, Any] | None,
@@ -127,6 +203,7 @@ def render_draft_inspector(
         if not body_html:
             st.info("No body stored for this draft.")
         else:
+            enable_editor_mouse_scroll(inject_js=False)
             try:
                 import streamlit.components.v1 as components
                 from gmail_client.html_format import render_gmail_preview
@@ -141,7 +218,8 @@ def render_draft_inspector(
                 )
                 doc = (
                     "<!doctype html><html><head><meta charset='utf-8'></head>"
-                    "<body style='margin:0;padding:8px;background:#fff'>"
+                    "<body style='margin:0;padding:8px;background:#fff;"
+                    "overflow-y:auto;overscroll-behavior:contain'>"
                     f"{preview}</body></html>"
                 )
                 blocks = (
@@ -150,8 +228,9 @@ def render_draft_inspector(
                     + body_html.count("<br")
                     + body_html.count("\n")
                 )
-                height = min(1100, max(380, 180 + blocks * 18))
+                height = min(720, max(380, 180 + blocks * 18))
                 components.html(doc, height=height, scrolling=True)
+                enable_editor_mouse_scroll()
             except Exception:
                 st.markdown(
                     f'<div class="gm-preview">{body_html}</div>',
@@ -739,6 +818,7 @@ def _rich_text_editor(
     keep_seed_if_empty: bool = True,
 ) -> str:
     """WYSIWYG editor; falls back to text_area if Quill is unavailable."""
+    enable_editor_mouse_scroll(inject_js=False)
     try:
         from streamlit_quill import st_quill
 
@@ -749,6 +829,7 @@ def _rich_text_editor(
             key=key,
             placeholder="Write your email…",
         )
+        enable_editor_mouse_scroll()
         # First paint / hidden iframe often returns "" — do not wipe Gmail HTML.
         if result is None or _quill_result_empty(str(result)):
             if keep_seed_if_empty and (html or "").strip() and not _quill_result_empty(html):
