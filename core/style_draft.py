@@ -13,9 +13,35 @@ _DRAFT_TO_RE = re.compile(
     r"\bdraft\s+to\s+(" + _EMAIL_RE.pattern + r")",
     re.I,
 )
+_SEND_TO_RE = re.compile(
+    r"\bsend\s+to\s+(" + _EMAIL_RE.pattern + r")",
+    re.I,
+)
+_EMAIL_ADDR_RE = re.compile(
+    r"\bemail\s+(" + _EMAIL_RE.pattern + r")",
+    re.I,
+)
+_DRAFT_FOR_RE = re.compile(
+    r"\bdraft\s+for\s+(" + _EMAIL_RE.pattern + r")",
+    re.I,
+)
 _TO_EMAIL_RE = re.compile(
     r"\bto\s+(" + _EMAIL_RE.pattern + r")",
     re.I,
+)
+_BULK_KEYWORDS = (
+    "draft to all",
+    "draft for all",
+    "draft to everyone",
+    "bulk draft",
+    "draft to the list",
+    "draft to prospects",
+    "draft to all prospects",
+    "send to all",
+    "email all",
+    "email everyone",
+    "draft to each",
+    "draft to every prospect",
 )
 _CC_RE = re.compile(
     r"\bcc\s+(.+?)(?=\b(?:bcc|draft\s+to|ignore|attach|like\s+the|same\s+(?:style\s+)?as|modeled)\b|$)",
@@ -64,10 +90,55 @@ _MD_RULE = (
 )
 
 
+def looks_like_bulk_request(text: str) -> bool:
+    """True only when the user explicitly asks to fan out (all / everyone / list)."""
+    t = (text or "").lower()
+    if any(k in t for k in _BULK_KEYWORDS):
+        return True
+    return bool(
+        re.search(
+            r"\b("
+            r"to\s+(?:the\s+)?(?:above|above\s+(?:contacts?|list|prospects?|people|results?))|"
+            r"(?:above|previous|prior|earlier|last)\s+"
+            r"(?:contacts?|prospects?|people|results?|search|list)|"
+            r"these\s+(?:contacts?|prospects?|people|results?)|"
+            r"this\s+(?:list|search|result)|"
+            r"all\s+(?:these\s+|the\s+)?(?:contacts?|prospects?)|"
+            r"everyone\s+(?:we\s+|you\s+)?found|"
+            r"zoominfo\s+list|"
+            r"all\s+of\s+them"
+            r")\b",
+            t,
+            re.I,
+        )
+    )
+
+
+def directive_to_list(directives: dict[str, Any]) -> list[str]:
+    """Explicit To addresses from parse_directives (string or list)."""
+    raw = directives.get("to_list")
+    if isinstance(raw, list) and raw:
+        items = raw
+    else:
+        to = directives.get("to") or ""
+        items = to if isinstance(to, list) else ([to] if to else [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for e in items:
+        k = str(e or "").strip()
+        if not k or k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        out.append(k)
+    return out
+
+
 def parse_directives(text: str) -> dict[str, Any]:
     """Parse inline draft/enrich directives from one chat message.
 
-    Returns {to, cc, bcc, ignore, template_from, attachments, linkedin_urls}.
+    Returns {to, to_list, cc, bcc, ignore, template_from, attachments,
+    linkedin_urls, explicit_recipient_lock, bulk_flag}.
+    `to` stays a string (first address) for existing call sites.
     """
     msg = text or ""
     linkedin_urls: list[str] = []
@@ -85,35 +156,24 @@ def parse_directives(text: str) -> dict[str, Any]:
             template_from = (m.group(1) or "").strip()
             break
 
-    to = ""
-    m = _DRAFT_TO_RE.search(msg)
-    if m:
-        to = (m.group(1) or "").strip()
-    else:
-        # "to <email>" only if a single non-template "to" is present
-        cands: list[str] = []
-        for m in _TO_EMAIL_RE.finditer(msg):
-            start = m.start()
-            prefix = msg[max(0, start - 16) : start].lower()
-            if re.search(r"sent\s+$", prefix):
-                continue
-            if re.search(r"email\s+$", prefix) and "draft" not in prefix:
-                continue
-            cands.append((m.group(1) or "").strip())
-        # Drop template_from if it snuck in
-        if template_from:
-            cands = [c for c in cands if c.lower() != template_from.lower()]
-        if len(cands) == 1:
-            to = cands[0]
-
-    cc: list[str] = []
-    for m in _CC_RE.finditer(msg):
-        cc.extend(_EMAIL_RE.findall(m.group(1) or ""))
-    bcc: list[str] = []
-    for m in _BCC_RE.finditer(msg):
-        bcc.extend(_EMAIL_RE.findall(m.group(1) or ""))
-    ignore = [m.group(1) for m in _IGNORE_RE.finditer(msg)]
-    attachments = [m.group(1).strip() for m in _ATTACH_RE.finditer(msg)]
+    to_specific: list[str] = []
+    for pat in (_DRAFT_TO_RE, _SEND_TO_RE, _EMAIL_ADDR_RE, _DRAFT_FOR_RE):
+        for m in pat.finditer(msg):
+            addr = (m.group(1) or "").strip()
+            if addr:
+                to_specific.append(addr)
+    to_generic: list[str] = []
+    for m in _TO_EMAIL_RE.finditer(msg):
+        start = m.start()
+        prefix = msg[max(0, start - 16) : start].lower()
+        if re.search(r"sent\s+$", prefix):
+            continue
+        addr = (m.group(1) or "").strip()
+        if addr:
+            to_generic.append(addr)
+    if template_from:
+        to_generic = [c for c in to_generic if c.lower() != template_from.lower()]
+    to_list = to_specific + to_generic
 
     def _uniq(items: list[str]) -> list[str]:
         out: list[str] = []
@@ -126,14 +186,29 @@ def parse_directives(text: str) -> dict[str, Any]:
             out.append(e.strip())
         return out
 
+    to_final = _uniq(to_list)
+    to = to_final[0] if to_final else ""
+
+    cc: list[str] = []
+    for m in _CC_RE.finditer(msg):
+        cc.extend(_EMAIL_RE.findall(m.group(1) or ""))
+    bcc: list[str] = []
+    for m in _BCC_RE.finditer(msg):
+        bcc.extend(_EMAIL_RE.findall(m.group(1) or ""))
+    ignore = [m.group(1) for m in _IGNORE_RE.finditer(msg)]
+    attachments = [m.group(1).strip() for m in _ATTACH_RE.finditer(msg)]
+
     result = {
         "to": to,
+        "to_list": to_final,
         "cc": _uniq(cc),
         "bcc": _uniq(bcc),
         "ignore": _uniq(ignore),
         "template_from": template_from,
         "attachments": attachments,
         "linkedin_urls": linkedin_urls,
+        "explicit_recipient_lock": bool(to_final),
+        "bulk_flag": looks_like_bulk_request(msg),
     }
     to_l = (to or "").lower()
     tf_l = (template_from or "").lower()

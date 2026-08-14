@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import html as _html_esc
 import io
 from typing import Any
 
@@ -20,46 +22,71 @@ from core import drive_db
 from core.tracking import extract_tracking_id, inject_tracking
 from gmail_client.drafts import (
     delete_gmail_draft,
-    get_gmail_draft,
+    fetch_gmail_draft,
+    gmail_profile_email,
     list_gmail_drafts,
-    send_gmail_draft,
+    send_draft,
 )
 from gmail_client.send import send_email
 
 
+@st.cache_data(ttl=15)
+def _cached_fetch_gmail_draft(draft_id: str) -> dict:
+    return fetch_gmail_draft(draft_id)
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+
+
 def _load_full_draft(draft_id: str, fallback: dict) -> dict:
-    """Fetch each draft fresh from Gmail when possible (Gmail is source of truth)."""
+    """Gmail is the source of truth for preview/edit when a Gmail id exists."""
     gid = ""
     if str(draft_id).startswith("gmail:") or fallback.get("gmail_draft_id"):
         gid = fallback.get("gmail_draft_id") or str(draft_id).removeprefix("gmail:")
     if gid:
-        full = get_gmail_draft(gid)
-        if not full.get("error"):
-            try:
-                drive_db.save_draft(full["draft_id"], full)
-            except Exception:
-                pass
-            return full
+        fetched = _cached_fetch_gmail_draft(gid)
+        if "bcc_cache" not in st.session_state:
+            st.session_state.bcc_cache = {}
+        gmail_bcc = fetched.get("bcc") or ""
+        shown_bcc = gmail_bcc or st.session_state.bcc_cache.get(gid, "")
+        body = fetched.get("body") or ""
+        to = fetched.get("to") or ""
+        out = {
+            **fallback,
+            "draft_id": f"gmail:{gid}",
+            "gmail_draft_id": gid,
+            "to": to,
+            "recipient": to,
+            "cc": fetched.get("cc") or "",
+            "bcc": gmail_bcc,
+            "shown_bcc": shown_bcc,
+            "bcc_local": bool(shown_bcc) and not gmail_bcc,
+            "subject": fetched.get("subject") or fallback.get("subject") or "",
+            "body": body,
+            "body_text": body,
+            "body_cleaned": body,
+            "source": "gmail_fetch",
+            "gmail_api_status": fetched.get("gmail_api_status"),
+            "error": fetched.get("error"),
+        }
+        return out
     try:
         d = drive_db.load_draft(draft_id)
-        if d.get("body_html") or d.get("body_cleaned"):
+        if d.get("body_html") or d.get("body_cleaned") or d.get("body"):
             if not d.get("tracking_id"):
                 d["tracking_id"] = extract_tracking_id(d.get("body_html") or "") or ""
             d["has_open_pixel"] = bool(
                 d.get("tracking_id")
                 or "/.netlify/functions/open" in (d.get("body_html") or "")
             )
-            if not d.get("body_cleaned") and d.get("body_html"):
-                try:
-                    from gmail_client.html_format import prepare_draft_bodies
-
-                    d["body_cleaned"], _h = prepare_draft_bodies(d.get("body_html") or "")
-                except Exception:
-                    pass
+            d["source"] = d.get("source") or "session"
             return d
     except Exception:
         pass
-    return dict(fallback)
+    fb = dict(fallback)
+    fb["source"] = fb.get("source") or "session"
+    return fb
 
 
 def _send_one(draft: dict) -> dict:
@@ -68,7 +95,7 @@ def _send_one(draft: dict) -> dict:
     if not gmail_id and did.startswith("gmail:"):
         gmail_id = did.removeprefix("gmail:")
     if gmail_id:
-        return send_gmail_draft(gmail_id)
+        return send_draft(gmail_id)
     to = draft.get("to") or draft.get("recipient") or ""
     if not to:
         return {"error": "missing recipient", "draft_id": did}
@@ -144,10 +171,30 @@ def _recipient_company(row: dict) -> str:
 
 
 st.title("📝 Drafts")
+_profile = ""
+try:
+    _profile = gmail_profile_email()
+except Exception:
+    _profile = ""
+if _profile:
+    chat_acct = st.session_state.get("gmail_profile_email") or ""
+    st.session_state["gmail_profile_email_drafts"] = _profile
+    if chat_acct and chat_acct.lower() != _profile.lower():
+        st.error(
+            f"Chat Gmail ({chat_acct}) ≠ Drafts Gmail ({_profile}). "
+            "Re-auth so both pages use the same account."
+        )
+    else:
+        st.session_state["gmail_profile_email"] = _profile
+    st.caption(f"Gmail account: {_profile}")
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
     "select with checkboxes to send or remove · designation shown per recipient."
 )
+top_a, top_b = st.columns([1, 4])
+if top_a.button("🔄 Refresh from Gmail"):
+    st.cache_data.clear()
+    st.rerun()
 st.markdown(
     """
 <style>
@@ -170,14 +217,7 @@ div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) butt
     unsafe_allow_html=True,
 )
 
-# Drive first so the page is not blank while Gmail metadata loads
-try:
-    with st.spinner("Loading Drive drafts…"):
-        drive_rows = drive_db.list_drafts(limit=5000, offset=0)
-except Exception as e:
-    st.error(f"Could not load Drive drafts index: {e}")
-    drive_rows = []
-
+# Gmail first (source of truth); Drive only adds designation / tracking metadata
 with st.spinner("Loading Gmail drafts…"):
     gmail_rows = list_gmail_drafts(limit=50)
 gmail_err = next((r for r in gmail_rows if r.get("error")), None)
@@ -185,12 +225,19 @@ if gmail_err:
     st.warning(f"Gmail drafts unavailable: {gmail_err.get('error')}")
     gmail_rows = []
 
+try:
+    with st.spinner("Loading Drive draft metadata…"):
+        drive_rows = drive_db.list_drafts(limit=5000, offset=0)
+except Exception as e:
+    st.error(f"Could not load Drive drafts index: {e}")
+    drive_rows = []
+
 by_id: dict[str, Any] = {}
-for r in drive_rows:
+for r in gmail_rows:
     did = r.get("draft_id")
     if did:
-        by_id[did] = {**r, "origin": r.get("source") or "drive"}
-for r in gmail_rows:
+        by_id[did] = {**r, "origin": "gmail"}
+for r in drive_rows:
     did = r.get("draft_id")
     if not did:
         continue
@@ -199,10 +246,12 @@ for r in gmail_rows:
         if not cur.get("tracking_id") and r.get("tracking_id"):
             cur["tracking_id"] = r["tracking_id"]
         cur["has_open_pixel"] = cur.get("has_open_pixel") or r.get("has_open_pixel")
-        cur["gmail_draft_id"] = r.get("gmail_draft_id") or cur.get("gmail_draft_id")
+        for extra in ("title", "designation", "company", "recipient_name", "bulk_job_id"):
+            if not cur.get(extra) and r.get(extra):
+                cur[extra] = r[extra]
         cur["origin"] = "drive+gmail"
     else:
-        by_id[did] = {**r, "origin": "gmail"}
+        by_id[did] = {**r, "origin": r.get("source") or "drive"}
 
 rows = list(by_id.values())
 # Backfill designation/company from Saved prospects when Gmail metadata lacks them
@@ -230,6 +279,7 @@ if q:
         for r in rows
         if ql in str(r.get("subject") or "").lower()
         or ql in str(r.get("recipient") or r.get("to") or "").lower()
+        or ql in str(r.get("cc") or "").lower()
         or ql in str(r.get("recipient_name") or "").lower()
         or ql in str(r.get("title") or r.get("designation") or "").lower()
         or ql in str(r.get("company") or "").lower()
@@ -273,19 +323,20 @@ if sel_c2.button("☐ Clear selection"):
     st.rerun()
 sel_c3.caption(f"{len(st.session_state.draft_selected_ids)} selected")
 
-h = st.columns([0.45, 2.2, 1.8, 2.6, 1.2, 0.9, 1.0])
+h = st.columns([0.45, 1.8, 1.4, 2.2, 1.6, 1.1, 0.8, 0.9])
 h[0].markdown("**☐**")
 h[1].markdown("**Recipient**")
 h[2].markdown("**Designation**")
 h[3].markdown("**Subject**")
-h[4].markdown("**Updated**")
-h[5].markdown("**Status**")
-h[6].markdown("**Source**")
+h[4].markdown("**Cc**")
+h[5].markdown("**Updated**")
+h[6].markdown("**Status**")
+h[7].markdown("**Source**")
 
 selected: list[str] = []
 for r in page_rows:
     did = str(r.get("draft_id") or "")
-    cols = st.columns([0.45, 2.2, 1.8, 2.6, 1.2, 0.9, 1.0])
+    cols = st.columns([0.45, 1.8, 1.4, 2.2, 1.6, 1.1, 0.8, 0.9])
     with cols[0]:
         checked = st.checkbox(
             "select",
@@ -327,9 +378,19 @@ for r in page_rows:
         ):
             st.session_state.opened_draft_id = did
             st.rerun()
-    cols[4].write((r.get("updated_at") or "")[:16] or "—")
-    cols[5].write(r.get("status") or "draft")
-    cols[6].write(r.get("origin") or r.get("source") or "—")
+    with cols[4]:
+        cc_full = str(r.get("cc") or "").strip()
+        if not cc_full:
+            st.caption("—")
+        else:
+            shown = cc_full if len(cc_full) <= 40 else cc_full[:37] + "…"
+            st.markdown(
+                f'<span title="{_html_esc.escape(cc_full)}">{_html_esc.escape(shown)}</span>',
+                unsafe_allow_html=True,
+            )
+    cols[5].write((r.get("updated_at") or "")[:16] or "—")
+    cols[6].write(r.get("status") or "draft")
+    cols[7].write(r.get("origin") or r.get("source") or "—")
 
 # Prefer explicit checkboxes on this page; fall back to session selection
 selected = selected or [
@@ -409,6 +470,7 @@ if c4.button("Export CSV"):
         fieldnames=[
             "draft_id",
             "recipient",
+            "cc",
             "recipient_name",
             "title",
             "designation",
@@ -474,4 +536,28 @@ if opened:
         st.session_state.opened_draft_id = ""
         st.rerun()
     draft = _load_full_draft(opened, by_id.get(opened) or {})
+    gid = draft.get("gmail_draft_id") or ""
+    preview_body = draft.get("body") or draft.get("body_cleaned") or ""
+    edit_body = st.session_state.get(f"body_{gid}", preview_body) if gid else preview_body
+    with st.expander("Debug · Preview / Edit / Gmail hashes", expanded=False):
+        st.write(f"draft_id: `{draft.get('draft_id') or opened}`")
+        st.write(f"source: `{draft.get('source') or 'session'}`")
+        st.write(f"Gmail API status: `{draft.get('gmail_api_status') or draft.get('error') or '—'}`")
+        if draft.get("error"):
+            st.error(draft["error"])
+        st.write(f"md5(body_shown_in_preview): `{_md5(preview_body)}`")
+        st.write(f"md5(body_in_edit_textarea): `{_md5(edit_body)}`")
+        st.write(f"md5(body_returned_by_gmail): `{_md5(preview_body if gid else '')}`")
+        st.write(f"Cc header: `{draft.get('cc') or ''}`")
+        st.write(f"Bcc header: `{draft.get('bcc') or ''}`")
+        if draft.get("bcc_local"):
+            st.caption(f"Bcc (local cache): {draft.get('shown_bcc') or ''}")
+        gmail_hash = _md5(preview_body) if gid else ""
+        if gid and _md5(preview_body) == _md5(edit_body) == gmail_hash:
+            st.success("Preview / Edit / Gmail body hashes match")
+        elif gid:
+            st.warning(
+                "Body hashes differ — Edit may have unsaved changes, "
+                "or the textarea has not mounted yet."
+            )
     render_draft_inspector(draft, key_prefix="drafts_page")

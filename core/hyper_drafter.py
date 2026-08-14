@@ -21,6 +21,7 @@ Follow this grounding contract:
 13. Write the email body as normal prose. Do NOT insert manual line breaks inside paragraphs. Separate paragraphs with exactly one blank line. Do not indent. Use single spaces between words and single spaces after punctuation. No trailing spaces.
 14. Do not use markdown (no **bold**, no bullet dashes) unless the style template uses them.
 15. When contact context is provided as labeled fields, use those fields (never invent a work email).
+16. Recipient rule: If the user's current message names one or more specific email addresses via 'draft to', 'send to', 'email <addr>', or 'to <addr>', those addresses are the ONLY recipients. Do not add any recipient from prior conversation turns, enrichment history, prospect lists, or memory. Do not fan out. Never draft more than one email per explicitly named address. If no address is explicitly named in the current message and multiple prospects exist in context, ask the user who to draft to instead of guessing.
 """
 
 

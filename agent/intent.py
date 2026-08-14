@@ -15,7 +15,7 @@ from agent.limits import (
     parse_research_limits,
 )
 from core.llm import extract_json
-from core.style_draft import parse_directives
+from core.style_draft import looks_like_bulk_request, parse_directives
 from gmail_client.send import default_cc_emails, default_from_email
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -253,9 +253,12 @@ def classify_email_roles(user_msg: str) -> EmailRoles:
     if dirs.get("template_from"):
         to = [e for e in to if e.lower() != dirs["template_from"].lower()]
         cc = [e for e in cc if e.lower() != dirs["template_from"].lower()]
-    if dirs.get("to"):
+    if dirs.get("to") or dirs.get("to_list"):
+        locked = list(dirs.get("to_list") or []) or (
+            [dirs["to"]] if dirs.get("to") else []
+        )
         to = _uniq(
-            [dirs["to"]],
+            locked,
             exclude=ignore_set
             | {from_email.lower()}
             | {e.lower() for e in cc}
@@ -640,6 +643,11 @@ def wants_previous_chat_recipient(user_msg: str) -> bool:
 def wants_prospect_list_recipients(user_msg: str) -> bool:
     """True when To should be the last ZoomInfo / prospect search (e.g. 'to above')."""
     msg = user_msg or ""
+    dirs = parse_directives(msg)
+    if dirs.get("explicit_recipient_lock"):
+        return False
+    if looks_like_bulk_request(msg):
+        return True
     company = parse_explicit_draft_company(msg)
     if company:
         like_sent = parse_like_sent_request(msg)
@@ -647,23 +655,7 @@ def wants_prospect_list_recipients(user_msg: str) -> bool:
         # "draft like alice@x.com for Flipkart" names a clone target, not the last search.
         if not (like_sent and not to_company):
             return True
-    return bool(
-        re.search(
-            r"\b("
-            r"to\s+(?:the\s+)?(?:above|above\s+(?:contacts?|list|prospects?|people|results?))|"
-            r"(?:above|previous|prior|earlier|last)\s+"
-            r"(?:contacts?|prospects?|people|results?|search|list)|"
-            r"these\s+(?:contacts?|prospects?|people|results?)|"
-            r"this\s+(?:list|search|result)|"
-            r"all\s+(?:these\s+|the\s+)?(?:contacts?|prospects?)|"
-            r"everyone\s+(?:we\s+|you\s+)?found|"
-            r"zoominfo\s+list|"
-            r"all\s+of\s+them"
-            r")\b",
-            msg,
-            re.I,
-        )
-    )
+    return False
 
 
 def resolve_to_emails_from_history(
@@ -1059,8 +1051,10 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
 
     # Never treat the like-sent reference address as the new draft's To
     to_emails = list(roles.to)
-    if dirs.get("to"):
-        to_emails = [dirs["to"]]
+    if dirs.get("explicit_recipient_lock") or dirs.get("to"):
+        to_emails = list(dirs.get("to_list") or []) or (
+            [dirs["to"]] if dirs.get("to") else []
+        )
     if like_sent_to and "@" in like_sent_to:
         to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
 
@@ -1302,6 +1296,14 @@ Return JSON:
     if base.like_sent_to and "@" in base.like_sent_to:
         exclude.add(base.like_sent_to.lower())
     to_emails = _uniq(llm_to + roles.to + base.to_emails, exclude=exclude)
+    dirs_lock = parse_directives(user_msg)
+    if dirs_lock.get("explicit_recipient_lock"):
+        to_emails = [
+            e
+            for e in (dirs_lock.get("to_list") or [dirs_lock.get("to") or ""])
+            if e
+            and e.lower() not in exclude
+        ]
 
     action = str(data.get("action") or base.action).strip().lower()
     named = parse_named_person_contact(user_msg)
@@ -1416,7 +1418,9 @@ Return JSON:
     explicit_company = parse_explicit_draft_company(user_msg) or (
         like_sent_for if not pure_contact_search else ""
     )
-    if explicit_company or wants_prospect_list_recipients(user_msg):
+    if dirs_lock.get("explicit_recipient_lock"):
+        pass
+    elif explicit_company or wants_prospect_list_recipients(user_msg):
         to_emails = []
     # For like-sent / "previous recipient as per chat", take To from recent history
     elif (

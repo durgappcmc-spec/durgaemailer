@@ -102,18 +102,21 @@ def render_draft_inspector(
     )
 
     with tab_preview:
-        cleaned = draft.get("body_cleaned") or ""
-        if not cleaned:
-            raw = draft.get("body_html") or draft.get("html") or draft.get("body") or ""
+        # Gmail drafts: verbatim body from fetch. Drive-only: existing HTML path.
+        body = draft.get("body")
+        if body is None or body == "":
+            body = draft.get("body_cleaned") or ""
+        if not body and draft.get("source") != "gmail_fetch":
+            raw = draft.get("body_html") or draft.get("html") or ""
             if raw:
                 try:
                     from gmail_client.html_format import prepare_draft_bodies
 
-                    cleaned, _h = prepare_draft_bodies(raw)
-                    draft["body_cleaned"] = cleaned
+                    body, _h = prepare_draft_bodies(raw)
                 except Exception:
-                    cleaned = ""
-        if not cleaned:
+                    body = ""
+        draft["_preview_body"] = body or ""
+        if not body:
             st.info("No body stored for this draft.")
         else:
             try:
@@ -124,13 +127,15 @@ def render_draft_inspector(
                         draft.get("subject") or "",
                         draft.get("to") or draft.get("recipient") or "",
                         draft.get("cc") or "",
-                        cleaned,
+                        body,
+                        bcc=draft.get("shown_bcc") or draft.get("bcc") or "",
+                        bcc_local=bool(draft.get("bcc_local")),
                     ),
                     unsafe_allow_html=True,
                 )
             except Exception:
                 st.markdown(
-                    f'<div class="email-preview">{cleaned}</div>',
+                    f'<div class="email-preview">{body}</div>',
                     unsafe_allow_html=True,
                 )
             if tid or has_pixel:
@@ -141,7 +146,7 @@ def render_draft_inspector(
         s1, s2, s3 = st.columns(3)
         with s1:
             if st.button("📨 Send now", type="primary", key=f"{key_prefix}_send"):
-                result = _send_draft_now(draft)
+                result = _send_draft_now(draft, rebuild=False)
                 if result.get("error"):
                     st.error(result["error"])
                 else:
@@ -261,7 +266,164 @@ def render_draft_inspector(
                     st.json(ev)
 
     with tab_edit:
-        _render_edit_tab(draft, tid=tid, key_prefix=key_prefix)
+        gid = draft.get("gmail_draft_id") or ""
+        did = str(draft.get("draft_id") or "")
+        if not gid and did.startswith("gmail:"):
+            gid = did.removeprefix("gmail:")
+        if gid and draft.get("source") == "gmail_fetch":
+            _render_gmail_edit_tab(draft, gid=gid, key_prefix=key_prefix)
+        else:
+            _render_edit_tab(draft, tid=tid, key_prefix=key_prefix)
+
+
+def _render_gmail_edit_tab(
+    draft: dict[str, Any], *, gid: str, key_prefix: str
+) -> None:
+    """Edit To/Cc/Bcc/subject/body from the same Gmail fetch as Preview."""
+    from gmail_client.drafts import (
+        delete_gmail_draft,
+        fetch_gmail_draft,
+        save_gmail_draft,
+        send_draft,
+    )
+    from gmail_client.html_format import clean_email_body
+
+    if "bcc_cache" not in st.session_state:
+        st.session_state.bcc_cache = {}
+
+    shown_bcc = draft.get("shown_bcc")
+    if shown_bcc is None:
+        shown_bcc = draft.get("bcc") or st.session_state.bcc_cache.get(gid, "")
+
+    new_to = st.text_input(
+        "To",
+        value=draft.get("to") or "",
+        key=f"to_{gid}",
+        help="Comma-separated for multiple recipients",
+    )
+    new_cc = st.text_input(
+        "Cc",
+        value=draft.get("cc") or "",
+        key=f"cc_{gid}",
+        help="Comma-separated. Leave blank for none.",
+    )
+    new_bcc = st.text_input(
+        "Bcc",
+        value=shown_bcc,
+        key=f"bcc_{gid}",
+        help="Comma-separated. Blind recipients.",
+    )
+    new_subject = st.text_input(
+        "Subject",
+        value=draft.get("subject") or "",
+        key=f"sub_{gid}",
+    )
+    new_body = st.text_area(
+        "Body",
+        value=draft.get("body") or "",
+        height=400,
+        key=f"body_{gid}",
+    )
+    draft["_edit_body"] = new_body or ""
+
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    save_clicked = col_a.button("💾 Save to Gmail", key=f"save_{gid}")
+    send_clicked = col_b.button("📤 Send now", key=f"send_{gid}")
+    disc_clicked = col_c.button("🗑️ Discard draft", key=f"disc_{gid}")
+
+    if disc_clicked:
+        res = delete_gmail_draft(gid)
+        if res.get("error"):
+            st.error(res["error"])
+            return
+        try:
+            from core import drive_db
+
+            drive_db.delete_draft(draft.get("draft_id") or f"gmail:{gid}", purge=True)
+        except Exception:
+            pass
+        st.session_state.bcc_cache.pop(gid, None)
+        _clear_gmail_edit_keys(gid)
+        if st.session_state.get("opened_draft_id") in (
+            draft.get("draft_id"),
+            f"gmail:{gid}",
+        ):
+            st.session_state.opened_draft_id = ""
+        st.success("Draft discarded")
+        st.cache_data.clear()
+        st.rerun()
+
+    if not save_clicked and not send_clicked:
+        return
+
+    atts = _attachments_for_send(draft.get("attachments") or []) or None
+    saved = save_gmail_draft(
+        gid,
+        new_to,
+        new_cc,
+        new_bcc,
+        new_subject,
+        new_body,
+        attachments=atts,
+        from_email=draft.get("from") or None,
+    )
+    if saved.get("error"):
+        st.error(saved["error"])
+        return
+
+    st.session_state.bcc_cache[gid] = saved.get("bcc") or new_bcc or ""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    fetched = fetch_gmail_draft(gid)
+    cleaned = saved.get("body_cleaned") or clean_email_body(new_body)
+    to_n = saved.get("to") or ""
+    cc_n = saved.get("cc") or ""
+    issues: list[str] = []
+    if (fetched.get("body") or "").strip() != cleaned.strip():
+        issues.append(
+            "body mismatch\n--- written ---\n"
+            f"{cleaned}\n--- gmail ---\n{fetched.get('body')}"
+        )
+    if (fetched.get("to") or "").lower() != to_n.lower():
+        issues.append(f"To mismatch: written={to_n!r} gmail={fetched.get('to')!r}")
+    if (fetched.get("cc") or "").lower() != cc_n.lower():
+        issues.append(f"Cc mismatch: written={cc_n!r} gmail={fetched.get('cc')!r}")
+    gmail_bcc = fetched.get("bcc") or ""
+    want_bcc = saved.get("bcc") or ""
+    if want_bcc and gmail_bcc and gmail_bcc.lower() != want_bcc.lower():
+        print(f"[gmail] Bcc not echoed (written={want_bcc!r} gmail={gmail_bcc!r})")
+    elif want_bcc and not gmail_bcc:
+        print(f"[gmail] Bcc omitted by API (cached locally): {want_bcc!r}")
+
+    if issues:
+        st.error("Gmail save did not round-trip:\n\n" + "\n\n".join(issues))
+        return
+
+    _clear_gmail_edit_keys(gid)
+    if send_clicked:
+        result = send_draft(gid)
+        if result.get("error"):
+            st.error(result["error"])
+            return
+        st.success(f"Sent · message_id={result.get('message_id')}")
+        st.session_state.bcc_cache.pop(gid, None)
+        if st.session_state.get("opened_draft_id") in (
+            draft.get("draft_id"),
+            f"gmail:{gid}",
+        ):
+            st.session_state.opened_draft_id = ""
+        st.rerun()
+
+    st.success("Saved to Gmail")
+    st.rerun()
+
+
+def _clear_gmail_edit_keys(gid: str) -> None:
+    for suffix in ("to", "cc", "bcc", "sub", "body"):
+        st.session_state.pop(f"{suffix}_{gid}", None)
 
 
 def _render_edit_tab(
@@ -554,8 +716,8 @@ def _ensure_tracking(draft: dict[str, Any]) -> dict[str, Any]:
     return {"body_html": html, "tracking_id": tid, "has_open_pixel": True}
 
 
-def _send_draft_now(draft: dict[str, Any]) -> dict[str, Any]:
-    """Send Drive or Gmail draft, always ensuring open-tracking pixel."""
+def _send_draft_now(draft: dict[str, Any], *, rebuild: bool = True) -> dict[str, Any]:
+    """Send Drive or Gmail draft. Gmail send uses stored MIME (Cc/Bcc intact)."""
     gmail_id = draft.get("gmail_draft_id") or ""
     did = str(draft.get("draft_id") or "")
     if not gmail_id and did.startswith("gmail:"):
@@ -563,11 +725,10 @@ def _send_draft_now(draft: dict[str, Any]) -> dict[str, Any]:
 
     send_atts = _attachments_for_send(draft.get("attachments") or [])
 
-    # Prefer Gmail drafts.send when no extra local-only attachments
-    if gmail_id and not send_atts:
-        from gmail_client.drafts import send_gmail_draft
+    if gmail_id and (not rebuild or not send_atts):
+        from gmail_client.drafts import send_draft
 
-        return send_gmail_draft(gmail_id)
+        return send_draft(gmail_id)
 
     # If we have attachments to add, refresh Gmail MIME first then send
     if gmail_id and send_atts:

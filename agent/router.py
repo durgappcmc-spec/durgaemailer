@@ -24,7 +24,9 @@ from core.enrich_cache import (
 )
 from core.style_draft import (
     compose_styled_email,
+    directive_to_list,
     fetch_latest_sent_to,
+    looks_like_bulk_request,
     parse_directives,
 )
 from core import memory as mem
@@ -121,8 +123,17 @@ Rules:
   Do NOT choose DRAFT_EMAIL for search-for-contact requests.
   Default limit 50; allow up to 100 when the user asks for a large list.
   Never ask the user for ZoomInfo credentials.
-- After a prospect / research search, if the user asks to email/draft/send to that list,
-  use DRAFT_EMAIL or SEND_EMAIL with {"batch":true,"from_prospects":true,"subject":"..."}.
+  After a prospect / research search, if the user asks to email/draft/send to that list
+  (e.g. "draft to all", "these prospects", "to above") AND did not name a specific
+  address via "draft to <email>", use DRAFT_EMAIL or SEND_EMAIL with
+  {"batch":true,"from_prospects":true,"subject":"..."}.
+  Recipient rule: If the user's current message names one or more specific email
+  addresses via 'draft to', 'send to', 'email <addr>', or 'to <addr>', those
+  addresses are the ONLY recipients. Do not add any recipient from prior
+  conversation turns, enrichment history, prospect lists, or memory. Do not fan
+  out. Never draft more than one email per explicitly named address. If no
+  address is explicitly named in the current message and multiple prospects exist
+  in context, ask the user who to draft to instead of guessing.
 - PROSPECT_ENRICH: enrich people. JSON keys: first_name, last_name, email, company,
   linkedin_url, linkedin_urls (array). When the user pastes LinkedIn profile URL(s)
   or says "get contacts for these linkedin profiles", ALWAYS use PROSPECT_ENRICH
@@ -554,6 +565,27 @@ def _build_draft_jobs(
             )
         )
     )
+    dirs = parse_directives(user_msg or "")
+    if dirs.get("explicit_recipient_lock"):
+        from_mailbox = False
+        from_prospects = False
+        locked = [
+            a
+            for a in directive_to_list(dirs)
+            if a.lower() not in {e.lower() for e in (dirs.get("ignore") or [])}
+        ]
+        payload = dict(payload)
+        payload.pop("from_prospects", None)
+        payload.pop("use_prospects", None)
+        payload.pop("from_mailbox", None)
+        if len(locked) == 1:
+            payload["recipient_email"] = locked[0]
+            payload.pop("recipient_emails", None)
+            payload["batch"] = False
+        elif locked:
+            payload["recipient_emails"] = locked
+            payload.pop("recipient_email", None)
+            payload["batch"] = True
 
     if from_mailbox and mailbox_messages:
         msgs = list(mailbox_messages or [])
@@ -636,7 +668,7 @@ def _build_draft_jobs(
         )
     if payload.get("recipient_email"):
         emails.append(str(payload["recipient_email"]).strip())
-    if plan.to_emails:
+    if plan.to_emails and not dirs.get("explicit_recipient_lock"):
         emails.extend(plan.to_emails)
 
     # Never treat From / CC / ignored addresses as To (old bug: scraped all emails).
@@ -1050,6 +1082,50 @@ def _run_styled_directive_draft(
     yield _record_draft_preview(out, draft_previews)
 
 
+def _lookup_enrichment_for(
+    addr: str,
+    prospects: Optional[list[dict[str, Any]]] = None,
+    extra: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Enrichment for THIS address only — never fall back to another prospect."""
+    addr_l = (addr or "").strip().lower()
+    if not addr_l:
+        return {}
+    for p in list(extra or []) + list(prospects or []):
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("email") or "").strip().lower() == addr_l:
+            return p
+    try:
+        from core.enrich_cache import _session_map
+
+        sess = _session_map() or {}
+        for data in sess.values():
+            if (
+                isinstance(data, dict)
+                and str(data.get("email") or "").strip().lower() == addr_l
+            ):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _ask_who_to_draft(prospects: list[dict[str, Any]]) -> str:
+    rows = _prospects_with_email(prospects)
+    lines = [f"I found **{len(rows)}** prospects in this conversation:\n"]
+    for i, p in enumerate(rows[:20], 1):
+        name = (p.get("name") or "").strip() or "—"
+        email = (p.get("email") or "").strip()
+        lines.append(f"  {i}. {name} `<{email}>`\n")
+    if len(rows) > 20:
+        lines.append(f"  …and {len(rows) - 20} more.\n")
+    lines.append(
+        "\nWho should I draft to? Reply with the email address, "
+        'or say **"draft to all"** to fan out.\n'
+    )
+    return "".join(lines)
+
 
 def _collect_linkedin_profile_urls(
     user_msg: str,
@@ -1183,11 +1259,20 @@ def _iter_draft_after_search(
             "Try enriching, or ask again after ZoomInfo returns emails.\n"
         )
         return
-    draft_msg = _draft_followup_message(user_msg, plan)
-    yield (
-        f"\n**Next — drafting** for **{len(with_email)}** contacts "
-        f"(ZoomInfo search done)…\n"
-    )
+    dirs = parse_directives(user_msg or "")
+    if dirs.get("explicit_recipient_lock"):
+        draft_msg = user_msg or ""
+        yield (
+            f"\n**Next — drafting** to "
+            f"**{', '.join(directive_to_list(dirs))}** "
+            "(explicit address; not the full prospect list)…\n"
+        )
+    else:
+        draft_msg = _draft_followup_message(user_msg, plan)
+        yield (
+            f"\n**Next — drafting** for **{len(with_email)}** contacts "
+            f"(ZoomInfo search done)…\n"
+        )
     draft_ctx = {
         **(context or {}),
         "prospects": with_email,
@@ -1989,6 +2074,26 @@ def answer(
     cancelled = False
     draft_previews: list[dict[str, Any]] = []
     directives = parse_directives(user_msg or "")
+    draft_debug: dict[str, Any] = {
+        "user_message": user_msg or "",
+        "parsed_directives": {
+            "to": directives.get("to"),
+            "to_list": directive_to_list(directives),
+            "cc": directives.get("cc") or [],
+            "bcc": directives.get("bcc") or [],
+            "template_from": directives.get("template_from") or "",
+            "linkedin_urls": directives.get("linkedin_urls") or [],
+            "bulk_flag": bool(directives.get("bulk_flag")),
+            "explicit_recipient_lock": bool(
+                directives.get("explicit_recipient_lock")
+            ),
+        },
+        "recipients_final": [],
+        "draft_path": "",
+        "ignored_count": len(
+            [p for p in prospects if (p.get("email") or "").strip()]
+        ),
+    }
     if directives.get("attachments") and chat_attachments:
         wanted = {str(n).lower() for n in directives["attachments"]}
         extra = [
@@ -2146,7 +2251,9 @@ def answer(
             seed_json["like_sent_for"] = plan.like_sent_for
         if plan.like_sent_message_id:
             seed_json["like_sent_message_id"] = plan.like_sent_message_id
-        if wants_prospect_list_recipients(user_msg or ""):
+        if wants_prospect_list_recipients(user_msg or "") and not directives.get(
+            "explicit_recipient_lock"
+        ):
             seed_json["batch"] = True
             seed_json["from_prospects"] = True
         routing = "DRAFT_EMAIL:" + json.dumps(seed_json, ensure_ascii=False)
@@ -2164,7 +2271,9 @@ def answer(
             seed_json["like_sent_for"] = plan.like_sent_for
         if plan.like_sent_message_id:
             seed_json["like_sent_message_id"] = plan.like_sent_message_id
-        if wants_prospect_list_recipients(user_msg or ""):
+        if wants_prospect_list_recipients(user_msg or "") and not directives.get(
+            "explicit_recipient_lock"
+        ):
             seed_json["batch"] = True
             seed_json["from_prospects"] = True
         if len(plan.to_emails) == 1:
@@ -2308,9 +2417,19 @@ def answer(
                     seed_json["batch"] = True
             if plan.cc:
                 seed_json["cc"] = plan.cc
+            fallback: dict[str, Any] = {}
+            if directives.get("explicit_recipient_lock"):
+                locked = directive_to_list(directives)
+                if len(locked) == 1:
+                    fallback["recipient_email"] = locked[0]
+                elif locked:
+                    fallback["recipient_emails"] = locked
+                    fallback["batch"] = True
+            else:
+                fallback = {"batch": True, "from_prospects": True}
             routing = (
                 ("SEND_EMAIL:" if plan.send and not plan.draft else "DRAFT_EMAIL:")
-                + json.dumps(seed_json or {"batch": True, "from_prospects": True}, ensure_ascii=False)
+                + json.dumps(seed_json or fallback, ensure_ascii=False)
             )
             meta_routing = routing
     try:
@@ -2530,6 +2649,18 @@ def answer(
 
             # Step 3: personalized drafts for contacts with email (review before send)
             if (do_draft or do_send) and with_email:
+                if directives.get("explicit_recipient_lock"):
+                    locked = {a.lower() for a in directive_to_list(directives)}
+                    with_email = [
+                        c
+                        for c in with_email
+                        if str(c.get("email") or "").strip().lower() in locked
+                    ]
+                    if not with_email:
+                        # Still draft the named address(es) without search-row context
+                        with_email = [
+                            {"email": a} for a in directive_to_list(directives)
+                        ]
                 # Always draft unless user clearly says send now
                 want_send = bool(do_send) and not _prefer_draft_over_send(
                     user_msg, True
@@ -3037,16 +3168,23 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     or wants_email_after_enrich
                     or _should_draft_after_prospect_search(user_msg or "", plan)
                 ):
-                    if directives.get("to"):
-                        for chunk in _run_styled_directive_draft(
-                            user_msg=user_msg or "",
-                            directives=directives,
-                            enrichment=results[0] if results else None,
-                            plan=plan,
-                            attachments=email_atts,
-                            draft_previews=draft_previews,
-                        ):
-                            yield chunk
+                    if directives.get("to") or directives.get("explicit_recipient_lock"):
+                        for addr in directive_to_list(directives) or [directives.get("to")]:
+                            if not addr:
+                                continue
+                            one = dict(directives)
+                            one["to"] = addr
+                            for chunk in _run_styled_directive_draft(
+                                user_msg=user_msg or "",
+                                directives=one,
+                                enrichment=_lookup_enrichment_for(
+                                    addr, results, prospect_out
+                                ),
+                                plan=plan,
+                                attachments=email_atts,
+                                draft_previews=draft_previews,
+                            ):
+                                yield chunk
                     else:
                         for chunk in _iter_draft_after_search(
                             user_msg=user_msg or "",
@@ -3323,27 +3461,36 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 like_mid = parse_gmail_message_id(user_msg or "")
             list_idx = parse_mailbox_list_index(user_msg or "")
 
-            if directives.get("to"):
-                enrichment = None
-                want = str(directives["to"]).lower()
-                for p in list(prospects or []) + list(prospect_out or []):
-                    if str(p.get("email") or "").strip().lower() == want:
-                        enrichment = p
-                        break
-                if enrichment is None and prospect_out:
-                    enrichment = prospect_out[0]
+            recipient_lock = bool(
+                directives.get("explicit_recipient_lock")
+                or directive_to_list(directives)
+            )
+            if recipient_lock:
+                ignore_set = {e.lower() for e in (directives.get("ignore") or [])}
+                locked = [
+                    a for a in directive_to_list(directives) if a.lower() not in ignore_set
+                ]
+                n_session = len(_prospects_with_email(prospects))
+                draft_debug["recipients_final"] = locked
+                draft_debug["draft_path"] = "single"
+                draft_debug["ignored_count"] = max(0, n_session - len(locked))
                 dirs = dict(directives)
                 if not dirs.get("cc"):
                     dirs["cc"] = list(plan.cc or [])
-                for chunk in _run_styled_directive_draft(
-                    user_msg=user_msg or "",
-                    directives=dirs,
-                    enrichment=enrichment,
-                    plan=plan,
-                    attachments=email_atts,
-                    draft_previews=draft_previews,
-                ):
-                    yield chunk
+                for addr in locked:
+                    one = dict(dirs)
+                    one["to"] = addr
+                    for chunk in _run_styled_directive_draft(
+                        user_msg=user_msg or "",
+                        directives=one,
+                        enrichment=_lookup_enrichment_for(
+                            addr, prospects, prospect_out
+                        ),
+                        plan=plan,
+                        attachments=email_atts,
+                        draft_previews=draft_previews,
+                    ):
+                        yield chunk
                 if email_atts:
                     consumed_attachments = True
 
@@ -3366,7 +3513,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         if dom:
                             like_ref = dom.group(1).split(".")[0]
 
-            if not directives.get("to") and (like_ref or like_mid):
+            if not recipient_lock and not directives.get("to") and (like_ref or like_mid):
                 # Clone angle from a prior sent email → draft to named company /
                 # last-search prospects — never the Sent template (Magic Bus / IndiaMART).
                 explicit_company = (
@@ -4157,179 +4304,208 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             except Exception:
                                 pass
 
-            elif not directives.get("to"):
-                # Prefer mailbox follow-ups when user asks and we have a prior pull
-                if mailbox_messages and re.search(
-                    r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
-                    user_msg or "",
-                    re.I,
-                ):
-                    seed = {**seed, "batch": True, "from_mailbox": True}
-                # Bulk to last ZoomInfo / prospect search ("to above", etc.)
-                if prospects and wants_prospect_list_recipients(user_msg or ""):
-                    seed = {**seed, "batch": True, "from_prospects": True}
-                payload = _extract_email_job(
-                    user_msg,
-                    history=history,
-                    seed=seed,
-                    for_schedule=False,
-                    document_context=doc_context,
-                )
-                for flag in (
-                    "batch",
-                    "from_prospects",
-                    "use_prospects",
-                    "from_mailbox",
-                    "use_mailbox",
-                    "follow_up",
-                    "mailbox_filter",
-                    "recipient_emails",
-                ):
-                    if flag in seed and flag not in payload:
-                        payload[flag] = seed[flag]
-                # Attach binary files only when explicitly requested
-                if email_atts:
-                    payload["attachments"] = email_atts
-                elif "attachments" in payload:
-                    payload.pop("attachments", None)
-                # Default personalized follow-up templates when missing
-                if payload.get("from_mailbox") or payload.get("use_mailbox"):
-                    if not payload.get("subject") or payload.get("subject") in (
-                        "(no subject)",
-                        user_msg,
-                    ):
-                        payload["subject"] = "Following up: {prior_subject}"
-                    body = payload.get("html_body") or ""
-                    if (
-                        not body
-                        or body.strip() == f"<p>{user_msg}</p>"
-                        or "{first_name}" not in body
-                    ):
-                        payload["html_body"] = (
-                            "<p>Hi {first_name},</p>"
-                            "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
-                            "<p>{prior_summary}</p>"
-                            "<p>Would you have time this week for a quick chat?</p>"
-                            "<p>Best regards</p>"
-                        )
-
-                if plan.cc and not payload.get("cc"):
-                    payload["cc"] = plan.cc
-                if plan.ignore_emails:
-                    payload["ignore_emails"] = plan.ignore_emails
-                if plan.to_emails and not payload.get("recipient_email") and not payload.get(
-                    "recipient_emails"
-                ):
-                    if len(plan.to_emails) == 1:
-                        payload["recipient_email"] = plan.to_emails[0]
-                    else:
-                        payload["recipient_emails"] = plan.to_emails
-                        payload["batch"] = True
-
-                jobs = _build_draft_jobs(
-                    payload,
-                    user_msg,
-                    history=history,
-                    prospects=prospects,
-                    mailbox_messages=mailbox_messages,
-                    plan=plan,
-                )
-                email_cap = min(max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS)
-                if len(jobs) > email_cap:
-                    yield (
-                        f"_Capping at **{email_cap}** emails "
-                        f"(found {len(jobs)}; ask for up to 100 if you need more)._\n"
+            elif not recipient_lock and not directives.get("to"):
+                session_n = len(_prospects_with_email(prospects))
+                _ask = (
+                    not looks_like_bulk_request(user_msg or "")
+                    and not wants_prospect_list_recipients(user_msg or "")
+                    and not re.search(
+                        r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|"
+                        r"everyone (here|in (the|this) list))\b",
+                        user_msg or "",
+                        re.I,
                     )
-                    jobs = apply_email_cap(jobs, email_limit=email_cap)
-                headers = _mail_headers(
-                    user_msg,
-                    seed=payload,
-                    to_emails=[j.get("recipient_email") or "" for j in jobs],
-                    plan=plan,
+                    and session_n > 1
+                    and not (plan.to_emails or [])
                 )
-                payload["from_email"] = headers["from_email"]
-                payload["cc"] = headers["cc"]
-                want_send = is_send and not _prefer_draft_over_send(user_msg, True)
-                action = "send" if want_send else "draft"
-                if not jobs and (
-                    payload.get("from_mailbox") or payload.get("use_mailbox")
-                ):
-                    yield (
-                        f"I couldn't {action} follow-ups — no mailbox contacts loaded yet. "
-                        "First say `show my inbox` or `show sent last 30 days`, "
-                        "optionally filter, then ask for personalized follow-ups."
-                    )
-                elif not jobs:
-                    yield (
-                        f"I couldn't {action} — no recipient emails found. "
-                        "List addresses, search prospects, or pull inbox/sent first."
-                    )
+                if _ask:
+                    draft_debug["draft_path"] = "ask"
+                    draft_debug["recipients_final"] = []
+                    draft_debug["ignored_count"] = session_n
+                    yield _ask_who_to_draft(prospects)
                 else:
-                    yield (
-                        f"{'Sending' if want_send else 'Creating new Gmail draft(s)'} "
-                        f"from **{headers['from_email']}**"
-                        + (
-                            f" (cc: {', '.join(headers['cc'])})"
-                            if headers["cc"]
-                            else ""
-                        )
-                        + " with your signature…\n"
+                    # Prefer mailbox follow-ups when user asks and we have a prior pull
+                    if mailbox_messages and re.search(
+                        r"\b(follow[- ]?up|from (this|the|my) (list|inbox|sent|mailbox)|everyone (here|in (the|this) list))\b",
+                        user_msg or "",
+                        re.I,
+                    ):
+                        seed = {**seed, "batch": True, "from_mailbox": True}
+                    # Bulk to last ZoomInfo / prospect search ("to above", etc.)
+                    if prospects and wants_prospect_list_recipients(user_msg or ""):
+                        seed = {**seed, "batch": True, "from_prospects": True}
+                    payload = _extract_email_job(
+                        user_msg,
+                        history=history,
+                        seed=seed,
+                        for_schedule=False,
+                        document_context=doc_context,
                     )
-                    results = []
-                    for job in jobs:
-                        if _stop_now():
-                            yield stopped_message()
-                            break
-                        job = _stamp_mail_fields(
-                            job,
-                            from_email=headers["from_email"],
-                            cc=headers["cc"],
-                            attachments=email_atts,
-                        )
-                        out, did_send = _deliver_job(
-                            job, want_send=want_send, user_msg=user_msg
-                        )
-                        if not out.get("error") and not did_send:
-                            yield _record_draft_preview(out, draft_previews)
-                        results.append({**out, "_did_send": did_send})
-                    ok = [r for r in results if not r.get("error")]
-                    fail = [r for r in results if r.get("error")]
-                    if ok and email_atts:
-                        consumed_attachments = True
-                    yield f"Done: **{len(ok)}** ok"
-                    if fail:
-                        yield f", **{len(fail)}** failed"
-                    yield (
-                        _attach_note(
-                            chat_attachments if chat_attachments else email_atts,
-                            used_document_context=used_docs,
-                            attached_to_email=bool(email_atts),
-                        )
-                        + "\n"
+                    for flag in (
+                        "batch",
+                        "from_prospects",
+                        "use_prospects",
+                        "from_mailbox",
+                        "use_mailbox",
+                        "follow_up",
+                        "mailbox_filter",
+                        "recipient_emails",
+                    ):
+                        if flag in seed and flag not in payload:
+                            payload[flag] = seed[flag]
+                    # Attach binary files only when explicitly requested
+                    if email_atts:
+                        payload["attachments"] = email_atts
+                    elif "attachments" in payload:
+                        payload.pop("attachments", None)
+                    # Default personalized follow-up templates when missing
+                    if payload.get("from_mailbox") or payload.get("use_mailbox"):
+                        if not payload.get("subject") or payload.get("subject") in (
+                            "(no subject)",
+                            user_msg,
+                        ):
+                            payload["subject"] = "Following up: {prior_subject}"
+                        body = payload.get("html_body") or ""
+                        if (
+                            not body
+                            or body.strip() == f"<p>{user_msg}</p>"
+                            or "{first_name}" not in body
+                        ):
+                            payload["html_body"] = (
+                                "<p>Hi {first_name},</p>"
+                                "<p>I wanted to follow up on <strong>{prior_subject}</strong>.</p>"
+                                "<p>{prior_summary}</p>"
+                                "<p>Would you have time this week for a quick chat?</p>"
+                                "<p>Best regards</p>"
+                            )
+
+                    if plan.cc and not payload.get("cc"):
+                        payload["cc"] = plan.cc
+                    if plan.ignore_emails:
+                        payload["ignore_emails"] = plan.ignore_emails
+                    if plan.to_emails and not payload.get("recipient_email") and not payload.get(
+                        "recipient_emails"
+                    ):
+                        if len(plan.to_emails) == 1:
+                            payload["recipient_email"] = plan.to_emails[0]
+                        else:
+                            payload["recipient_emails"] = plan.to_emails
+                            payload["batch"] = True
+
+                    jobs = _build_draft_jobs(
+                        payload,
+                        user_msg,
+                        history=history,
+                        prospects=prospects,
+                        mailbox_messages=mailbox_messages,
+                        plan=plan,
                     )
-                    for r in ok[:100]:
-                        target = r.get("to") or r.get("recipient_email")
-                        did = r.get("_did_send")
+                    draft_debug["draft_path"] = (
+                        "bulk" if len(jobs) > 1 else "single"
+                    )
+                    draft_debug["recipients_final"] = [
+                        j.get("recipient_email") or "" for j in jobs
+                    ]
+                    draft_debug["ignored_count"] = max(
+                        0,
+                        session_n - len(draft_debug["recipients_final"]),
+                    )
+                    email_cap = min(max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS)
+                    if len(jobs) > email_cap:
                         yield (
-                            f"- {'Sent' if did else 'Draft'} → {target}"
-                            + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                            f"_Capping at **{email_cap}** emails "
+                            f"(found {len(jobs)}; ask for up to 100 if you need more)._\n"
+                        )
+                        jobs = apply_email_cap(jobs, email_limit=email_cap)
+                    headers = _mail_headers(
+                        user_msg,
+                        seed=payload,
+                        to_emails=[j.get("recipient_email") or "" for j in jobs],
+                        plan=plan,
+                    )
+                    payload["from_email"] = headers["from_email"]
+                    payload["cc"] = headers["cc"]
+                    want_send = is_send and not _prefer_draft_over_send(user_msg, True)
+                    action = "send" if want_send else "draft"
+                    if not jobs and (
+                        payload.get("from_mailbox") or payload.get("use_mailbox")
+                    ):
+                        yield (
+                            f"I couldn't {action} follow-ups — no mailbox contacts loaded yet. "
+                            "First say `show my inbox` or `show sent last 30 days`, "
+                            "optionally filter, then ask for personalized follow-ups."
+                        )
+                    elif not jobs:
+                        yield (
+                            f"I couldn't {action} — no recipient emails found. "
+                            "List addresses, search prospects, or pull inbox/sent first."
+                        )
+                    else:
+                        yield (
+                            f"{'Sending' if want_send else 'Creating new Gmail draft(s)'} "
+                            f"from **{headers['from_email']}**"
                             + (
-                                f" (draft_id={r.get('draft_id')})"
-                                if r.get("draft_id")
+                                f" (cc: {', '.join(headers['cc'])})"
+                                if headers["cc"]
                                 else ""
+                            )
+                            + " with your signature…\n"
+                        )
+                        results = []
+                        for job in jobs:
+                            if _stop_now():
+                                yield stopped_message()
+                                break
+                            job = _stamp_mail_fields(
+                                job,
+                                from_email=headers["from_email"],
+                                cc=headers["cc"],
+                                attachments=email_atts,
+                            )
+                            out, did_send = _deliver_job(
+                                job, want_send=want_send, user_msg=user_msg
+                            )
+                            if not out.get("error") and not did_send:
+                                yield _record_draft_preview(out, draft_previews)
+                            results.append({**out, "_did_send": did_send})
+                        ok = [r for r in results if not r.get("error")]
+                        fail = [r for r in results if r.get("error")]
+                        if ok and email_atts:
+                            consumed_attachments = True
+                        yield f"Done: **{len(ok)}** ok"
+                        if fail:
+                            yield f", **{len(fail)}** failed"
+                        yield (
+                            _attach_note(
+                                chat_attachments if chat_attachments else email_atts,
+                                used_document_context=used_docs,
+                                attached_to_email=bool(email_atts),
                             )
                             + "\n"
                         )
-                    if len(ok) > 100:
-                        yield f"_…and {len(ok) - 100} more._\n"
-                    if not want_send:
-                        yield (
-                            "\nOpen **Drafts** (or Gmail → Drafts) to review, then send. "
-                            "Open/click tracking is already embedded "
-                            "(visible in 📬 Tracking after send).\n"
-                        )
-                    for r in fail[:10]:
-                        yield f"- Failed: {r.get('error')}\n"
+                        for r in ok[:100]:
+                            target = r.get("to") or r.get("recipient_email")
+                            did = r.get("_did_send")
+                            yield (
+                                f"- {'Sent' if did else 'Draft'} → {target}"
+                                + (f" cc {r.get('cc')}" if r.get("cc") else "")
+                                + (
+                                    f" (draft_id={r.get('draft_id')})"
+                                    if r.get("draft_id")
+                                    else ""
+                                )
+                                + "\n"
+                            )
+                        if len(ok) > 100:
+                            yield f"_…and {len(ok) - 100} more._\n"
+                        if not want_send:
+                            yield (
+                                "\nOpen **Drafts** (or Gmail → Drafts) to review, then send. "
+                                "Open/click tracking is already embedded "
+                                "(visible in 📬 Tracking after send).\n"
+                            )
+                        for r in fail[:10]:
+                            yield f"- Failed: {r.get('error')}\n"
 
         elif routing.startswith("SCHEDULE_EMAIL"):
             # Accept truncated "SCHEDULE_EMAIL:{"recipient_email" lines.
@@ -4434,6 +4610,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
             "mailbox_messages": mailbox_out or None,
             "prospects": prospect_out or None,
             "draft_previews": draft_previews or None,
+            "draft_debug": draft_debug,
             "cancelled": cancelled,
             "pending_user_msg": user_msg if need_file else None,
         }

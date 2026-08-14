@@ -175,3 +175,61 @@ def test_enrichment_panel_and_labeled_fields():
     fields = format_enrichment_fields(p)
     assert "Verified work email: jane@acme.com" in fields
     assert "{" not in fields.split("Verified")[0]
+
+
+def test_explicit_recipient_lock_ignores_session_prospects():
+    from agent.intent import looks_like_bulk_request, wants_prospect_list_recipients
+    from agent.router import _build_draft_jobs
+
+    msg = "draft to jane@acme.com about the CSR proposal"
+    d = parse_directives(msg)
+    assert d["explicit_recipient_lock"] is True
+    assert d["to"].lower() == "jane@acme.com"
+    assert d["to_list"] == ["jane@acme.com"]
+    assert not wants_prospect_list_recipients(msg)
+    assert not looks_like_bulk_request(msg)
+
+    prospects = [
+        {"email": f"{n}@acme.com", "name": n.title()}
+        for n in ("jane", "bob", "carol", "dan", "eve")
+    ]
+    jobs = _build_draft_jobs(
+        {"from_prospects": True, "batch": True, "subject": "Hi"},
+        msg,
+        prospects=prospects,
+    )
+    assert [j["recipient_email"].lower() for j in jobs] == ["jane@acme.com"]
+
+
+def test_draft_to_with_cc_still_singular():
+    d = parse_directives("draft to jane@acme.com cc bob@acme.com")
+    assert d["to"].lower() == "jane@acme.com"
+    assert "bob@acme.com" in [e.lower() for e in d["cc"]]
+    assert d["explicit_recipient_lock"] is True
+
+
+def test_like_sent_does_not_add_template_as_to():
+    d = parse_directives(
+        "draft to jane@acme.com like the one sent to alice@acme.com"
+    )
+    assert d["to"].lower() == "jane@acme.com"
+    assert d["template_from"].lower() == "alice@acme.com"
+    assert d["explicit_recipient_lock"] is True
+
+
+def test_bulk_keywords_and_ask_ambiguity():
+    from agent.intent import looks_like_bulk_request, wants_prospect_list_recipients
+
+    assert looks_like_bulk_request("draft to all prospects")
+    assert wants_prospect_list_recipients("draft to all prospects")
+    assert not parse_directives("let's draft the outreach email")[
+        "explicit_recipient_lock"
+    ]
+    assert not looks_like_bulk_request("let's draft the outreach email")
+
+
+def test_draft_an_email_to_locks_recipient():
+    d = parse_directives("draft an email to jane@acme.com")
+    assert d["explicit_recipient_lock"] is True
+    assert d["to"].lower() == "jane@acme.com"
+

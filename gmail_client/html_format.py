@@ -523,13 +523,17 @@ def extract_style_structure(body: str) -> dict[str, str | int]:
     }
 
 
-def render_draft_html(subject, to, cc, body_cleaned):
+def render_draft_html(subject, to, cc, body_cleaned, bcc="", bcc_local=False):
     body_html = "".join(
         f"<p style='margin:0 0 12px 0'>"
         f"{_html.escape(p).replace(chr(10), '<br>')}</p>"
         for p in (body_cleaned or "").split("\n\n")
         if p.strip()
     )
+    bcc_line = ""
+    if bcc:
+        tag = " (local)" if bcc_local else ""
+        bcc_line = f"<b>Bcc:</b> {_html.escape(str(bcc))}{tag}<br>"
     return f"""
     <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;
                 line-height:1.5;color:#202124;background:#fff;
@@ -538,6 +542,7 @@ def render_draft_html(subject, to, cc, body_cleaned):
       <div style="font-size:12px;color:#5f6368;margin-bottom:8px">
         <b>To:</b> {_html.escape(str(to or ""))}<br>
         {f"<b>Cc:</b> {_html.escape(str(cc))}<br>" if cc else ""}
+        {bcc_line}
         <b>Subject:</b> {_html.escape(str(subject or ""))}
       </div>
       <hr style="border:none;border-top:1px solid #eee;margin:8px 0 12px 0">

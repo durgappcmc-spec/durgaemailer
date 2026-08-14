@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import html as _html
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,221 @@ from typing import Any, Optional
 from gmail_client.auth import gmail_service
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def normalize_addr_list(s: str) -> str:
+    """Split on comma/semicolon, trim, de-dupe case-insensitively, preserve order."""
+    if not s:
+        return ""
+    parts = [a.strip() for a in re.split(r"[,;]", s) if a.strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in parts:
+        k = a.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(a)
+    return ", ".join(out)
+
+
+def _drop_addrs_already_in_to(field: str, to: str) -> str:
+    to_keys = {e.lower() for e in _EMAIL_RE.findall(to or "")}
+    if (to or "").strip() and "@" not in (to or ""):
+        to_keys.add(to.strip().lower())
+    parts = [a.strip() for a in re.split(r"[,;]", field or "") if a.strip()]
+    kept: list[str] = []
+    for a in parts:
+        emails = [e.lower() for e in _EMAIL_RE.findall(a)]
+        if emails and all(e in to_keys for e in emails):
+            continue
+        if a.lower() in to_keys:
+            continue
+        kept.append(a)
+    return normalize_addr_list(", ".join(kept))
+
+
+def gmail_profile_email() -> str:
+    """OAuth account used by this process (`users.getProfile`)."""
+    try:
+        svc = gmail_service()
+        return str(
+            (svc.users().getProfile(userId="me").execute() or {}).get(
+                "emailAddress"
+            )
+            or ""
+        )
+    except Exception as e:
+        print(f"[gmail] getProfile failed: {e}", file=sys.stderr)
+        return ""
+
+
+def _decode_b64url(data: str) -> str:
+    raw = base64.urlsafe_b64decode((data or "") + "==")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _extract_plain_body(payload: dict) -> str:
+    """Prefer text/plain; fall back to stripped text/html. No clean_email_body()."""
+    html = ""
+    text = ""
+
+    def walk(part: dict) -> None:
+        nonlocal html, text
+        mime = (part.get("mimeType") or "").lower()
+        data = (part.get("body") or {}).get("data")
+        if data and mime in ("text/html", "text/plain"):
+            decoded = _decode_b64url(data)
+            if mime == "text/plain" and not text:
+                text = decoded
+            elif mime == "text/html" and not html:
+                html = decoded
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload or {})
+    if (text or "").strip():
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+    if html:
+        s = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+        s = re.sub(r"</p\s*>", "\n\n", s, flags=re.I)
+        s = re.sub(r"<[^>]+>", "", s)
+        return _html.unescape(s).replace("\r\n", "\n").replace("\r", "\n")
+    return ""
+
+
+def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
+    """Gmail is the source of truth. Does not re-clean the body on read."""
+    did = (draft_id or "").removeprefix("gmail:")
+    if not did:
+        return {
+            "id": "",
+            "to": "",
+            "cc": "",
+            "bcc": "",
+            "subject": "",
+            "body": "",
+            "raw_msg": {},
+            "error": "missing gmail draft id",
+            "gmail_api_status": "error",
+            "source": "gmail_fetch",
+        }
+    try:
+        svc = gmail_service()
+        d = svc.users().drafts().get(userId="me", id=did, format="full").execute()
+        status: Any = 200
+    except Exception as e:
+        code = getattr(getattr(e, "resp", None), "status", None) or "error"
+        print(f"[gmail] drafts.get failed: {e}", file=sys.stderr)
+        return {
+            "id": did,
+            "to": "",
+            "cc": "",
+            "bcc": "",
+            "subject": "",
+            "body": "",
+            "raw_msg": {},
+            "error": str(e),
+            "gmail_api_status": code,
+            "source": "gmail_fetch",
+            "gmail_draft_id": did,
+            "draft_id": f"gmail:{did}",
+        }
+    msg = d.get("message") or {}
+    headers = {
+        h["name"].lower(): h["value"]
+        for h in (msg.get("payload") or {}).get("headers") or []
+    }
+    body = _extract_plain_body(msg.get("payload") or {})
+    return {
+        "id": did,
+        "to": headers.get("to", ""),
+        "cc": headers.get("cc", ""),
+        "bcc": headers.get("bcc", ""),
+        "subject": headers.get("subject", ""),
+        "body": body,
+        "raw_msg": msg,
+        "gmail_api_status": status,
+        "source": "gmail_fetch",
+        "gmail_draft_id": did,
+        "draft_id": f"gmail:{did}",
+    }
+
+
+def save_gmail_draft(
+    draft_id: str,
+    to: str,
+    cc: str,
+    bcc: str,
+    subject: str,
+    body: str,
+    *,
+    attachments: Optional[list[dict[str, Any]]] = None,
+    from_email: Optional[str] = None,
+) -> dict[str, Any]:
+    """Write cleaned body + To/Cc/Bcc back to Gmail. Cleaning runs only here."""
+    from gmail_client.html_format import clean_email_body, html_from_cleaned_body
+    from gmail_client.send import _build_raw_message, default_from_email
+
+    did = (draft_id or "").removeprefix("gmail:")
+    if not did:
+        return {"error": "missing gmail draft id"}
+    cleaned = clean_email_body(body)
+    to_n = normalize_addr_list(to)
+    cc_n = _drop_addrs_already_in_to(normalize_addr_list(cc), to_n)
+    bcc_n = _drop_addrs_already_in_to(normalize_addr_list(bcc), to_n)
+    html = html_from_cleaned_body(cleaned)
+    try:
+        raw, _tid = _build_raw_message(
+            to=to_n,
+            subject=subject or "",
+            html_body=html,
+            plain_body=cleaned,
+            attachments=attachments or None,
+            instrument=False,
+            include_signature=False,
+            from_email=from_email or default_from_email(),
+            cc=cc_n or None,
+            bcc=bcc_n or None,
+        )
+        svc = gmail_service()
+        updated = (
+            svc.users()
+            .drafts()
+            .update(userId="me", id=did, body={"message": {"raw": raw}})
+            .execute()
+        )
+        return {
+            "ok": True,
+            "gmail_draft_id": did,
+            "to": to_n,
+            "cc": cc_n,
+            "bcc": bcc_n,
+            "subject": subject or "",
+            "body_cleaned": cleaned,
+            "updated": updated,
+        }
+    except Exception as e:
+        print(f"[gmail] drafts.update failed: {e}", file=sys.stderr)
+        return {"error": str(e), "gmail_draft_id": did}
+
+
+def send_draft(draft_id: str) -> dict[str, Any]:
+    """Send the existing Gmail draft as stored (do not rebuild MIME)."""
+    did = (draft_id or "").removeprefix("gmail:")
+    if not did:
+        return {"error": "missing gmail draft id"}
+    try:
+        svc = gmail_service()
+        sent = svc.users().drafts().send(userId="me", body={"id": did}).execute()
+        return {
+            "ok": True,
+            "message_id": sent.get("id"),
+            "thread_id": sent.get("threadId"),
+            "gmail_draft_id": did,
+        }
+    except Exception as e:
+        print(f"[gmail] drafts.send failed: {e}", file=sys.stderr)
+        return {"error": str(e), "gmail_draft_id": did}
 
 
 def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
@@ -50,6 +266,7 @@ def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
             "recipient": meta.get("to") or "",
             "to": meta.get("to") or "",
             "cc": meta.get("cc") or "",
+            "bcc": meta.get("bcc") or "",
             "subject": meta.get("subject") or "(no subject)",
             "snippet": meta.get("snippet") or "",
             "updated_at": meta.get("internal_date") or "",
@@ -86,58 +303,50 @@ def list_gmail_drafts(limit: int = 50) -> list[dict[str, Any]]:
                     "source": "gmail",
                 }
 
-    # Preserve Gmail list order
-    return [out_by_id[did] for did in draft_ids if did in out_by_id]
+    rows = [out_by_id[did] for did in draft_ids if did in out_by_id]
+    rows.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+    return rows
 
 
 def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
-    """Full draft with decoded HTML body."""
-    did = (gmail_draft_id or "").removeprefix("gmail:")
-    try:
-        svc = gmail_service()
-        full = (
-            svc.users()
-            .drafts()
-            .get(userId="me", id=did, format="full")
-            .execute()
-        )
-    except Exception as e:
-        return {"error": str(e), "gmail_draft_id": did}
-
-    msg = full.get("message") or {}
+    """Full draft. Body is Gmail text/plain verbatim — never re-cleaned on read."""
+    fetched = fetch_gmail_draft(gmail_draft_id)
+    did = fetched.get("id") or (gmail_draft_id or "").removeprefix("gmail:")
+    if fetched.get("error"):
+        return {
+            "error": fetched["error"],
+            "gmail_draft_id": did,
+            "gmail_api_status": fetched.get("gmail_api_status"),
+            "source": "gmail_fetch",
+        }
+    msg = fetched.get("raw_msg") or {}
+    html, text = _extract_bodies(msg.get("payload") or {})
+    body = fetched.get("body") or text or ""
+    body_html = html or (f"<pre>{text}</pre>" if text else "")
+    tracking_id = _extract_tracking_id(body_html)
+    to = fetched.get("to") or ""
+    to_email = (_EMAIL_RE.findall(to) or [to])[0] if to else ""
     headers = {
         h["name"].lower(): h["value"]
         for h in (msg.get("payload") or {}).get("headers") or []
     }
-    html, text = _extract_bodies(msg.get("payload") or {})
-    body_cleaned = ""
-    try:
-        from gmail_client.html_format import clean_email_body, prepare_draft_bodies
-
-        if (text or "").strip():
-            body_cleaned = clean_email_body(text)
-        elif html:
-            body_cleaned, _html_core = prepare_draft_bodies(html)
-    except Exception:
-        body_cleaned = (text or "").strip() + ("\n" if text else "")
-    body_html = html or (f"<pre>{text}</pre>" if text else "")
-    tracking_id = _extract_tracking_id(body_html)
-    to = headers.get("to") or ""
-    to_email = (_EMAIL_RE.findall(to) or [to])[0] if to else ""
     return {
         "draft_id": f"gmail:{did}",
         "gmail_draft_id": did,
         "gmail_message_id": msg.get("id") or "",
-        "to": to_email,
+        "to": to,
         "recipient": to_email or to,
-        "cc": headers.get("cc") or "",
-        "subject": headers.get("subject") or "(no subject)",
+        "cc": fetched.get("cc") or "",
+        "bcc": fetched.get("bcc") or "",
+        "subject": fetched.get("subject") or "(no subject)",
+        "body": body,
         "body_html": body_html,
-        "body_text": text or "",
-        "body_cleaned": body_cleaned,
+        "body_text": body,
+        "body_cleaned": body,
         "snippet": msg.get("snippet") or "",
         "status": "draft",
-        "source": "gmail",
+        "source": fetched.get("source") or "gmail_fetch",
+        "gmail_api_status": fetched.get("gmail_api_status") or 200,
         "tracking_id": tracking_id or "",
         "has_open_pixel": bool(tracking_id)
         or "/.netlify/functions/open" in (body_html or "")
@@ -222,7 +431,7 @@ def _draft_headers(
             "format": format_,
         }
         if format_ == "metadata":
-            kwargs["metadataHeaders"] = ["To", "Cc", "Subject", "From"]
+            kwargs["metadataHeaders"] = ["To", "Cc", "Bcc", "Subject", "From"]
         full = svc.users().drafts().get(**kwargs).execute()
     except Exception:
         return {}
@@ -251,6 +460,7 @@ def _draft_headers(
     return {
         "to": to_email,
         "cc": headers.get("cc") or "",
+        "bcc": headers.get("bcc") or "",
         "subject": headers.get("subject") or "",
         "snippet": msg.get("snippet") or "",
         "message_id": msg.get("id") or "",
@@ -323,6 +533,7 @@ def _update_draft_html(
         include_signature=False,
         from_email=(draft.get("from") or None),
         cc=draft.get("cc") or None,
+        bcc=draft.get("bcc") or None,
         recipient_name=draft.get("recipient_name") or None,
     )
     svc = gmail_service()

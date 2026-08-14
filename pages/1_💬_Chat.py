@@ -46,6 +46,16 @@ with st.sidebar:
         st.caption(f"ZI credits MTD: {zi.get('credits', 0)}")
     except Exception:
         st.caption("Drive usage unavailable")
+    try:
+        if "gmail_profile_email" not in st.session_state:
+            from gmail_client.drafts import gmail_profile_email
+
+            st.session_state["gmail_profile_email"] = gmail_profile_email()
+        acct = st.session_state.get("gmail_profile_email") or ""
+        if acct:
+            st.caption(f"Gmail: {acct}")
+    except Exception:
+        pass
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.title("💬 Chat")
@@ -54,6 +64,19 @@ st.caption(
     "Stop / Edit / Clear sit under the chat, next to where you type. "
     "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it."
 )
+
+_dbg = st.session_state.get("draft_debug")
+if _dbg:
+    with st.expander("Debug · draft recipients", expanded=False):
+        st.write(f"user_message: `{_dbg.get('user_message') or ''}`")
+        st.write("parsed_directives:")
+        st.json(_dbg.get("parsed_directives") or {})
+        st.write(f"recipients_final: `{_dbg.get('recipients_final')}`")
+        st.write(f"draft_path: `{_dbg.get('draft_path') or '—'}`")
+        st.write(
+            f"ignored_count (session prospects not drafted): "
+            f"`{_dbg.get('ignored_count')}`"
+        )
 
 # ---- session defaults ----
 for key, default in (
@@ -459,6 +482,19 @@ if prompt:
                     text += str(chunk)
                     placeholder.markdown(text + "▌")
             placeholder.markdown(text or "_(no response)_")
+            if meta.get("draft_debug"):
+                st.session_state["draft_debug"] = meta["draft_debug"]
+                with st.expander("Debug · draft recipients", expanded=False):
+                    _d = meta["draft_debug"]
+                    st.write(f"user_message: `{_d.get('user_message') or ''}`")
+                    st.write("parsed_directives:")
+                    st.json(_d.get("parsed_directives") or {})
+                    st.write(f"recipients_final: `{_d.get('recipients_final')}`")
+                    st.write(f"draft_path: `{_d.get('draft_path') or '—'}`")
+                    st.write(
+                        f"ignored_count (session prospects not drafted): "
+                        f"`{_d.get('ignored_count')}`"
+                    )
             previews = meta.get("draft_previews") or []
             if previews:
                 try:
