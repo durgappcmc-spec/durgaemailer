@@ -128,19 +128,30 @@ def render_draft_inspector(
             st.info("No body stored for this draft.")
         else:
             try:
+                import streamlit.components.v1 as components
                 from gmail_client.html_format import render_gmail_preview
 
-                st.markdown(
-                    render_gmail_preview(
-                        draft.get("subject") or "",
-                        draft.get("to") or draft.get("recipient") or "",
-                        draft.get("cc") or "",
-                        body_html,
-                        bcc=draft.get("shown_bcc") or draft.get("bcc") or "",
-                        bcc_local=bool(draft.get("bcc_local")),
-                    ),
-                    unsafe_allow_html=True,
+                preview = render_gmail_preview(
+                    draft.get("subject") or "",
+                    draft.get("to") or draft.get("recipient") or "",
+                    draft.get("cc") or "",
+                    body_html,
+                    bcc=draft.get("shown_bcc") or draft.get("bcc") or "",
+                    bcc_local=bool(draft.get("bcc_local")),
                 )
+                doc = (
+                    "<!doctype html><html><head><meta charset='utf-8'></head>"
+                    "<body style='margin:0;padding:8px;background:#fff'>"
+                    f"{preview}</body></html>"
+                )
+                blocks = (
+                    body_html.count("<p")
+                    + body_html.count("<div")
+                    + body_html.count("<br")
+                    + body_html.count("\n")
+                )
+                height = min(1100, max(380, 180 + blocks * 18))
+                components.html(doc, height=height, scrolling=True)
             except Exception:
                 st.markdown(
                     f'<div class="gm-preview">{body_html}</div>',
@@ -360,8 +371,10 @@ def _render_gmail_edit_tab(
     nonce_key = f"quill_nonce_{gid}"
     prev_sig_key = f"sig_prev_{gid}"
     if seed_key not in st.session_state:
+        from gmail_client.drafts import _bodies_are_blank
+
         html0 = html_for_editor(draft.get("body_html") or "")
-        if not (html0 or "").strip():
+        if _bodies_are_blank(html0, ""):
             plain = draft.get("body") or draft.get("body_text") or ""
             if looks_like_html(plain):
                 html0 = html_for_editor(plain)

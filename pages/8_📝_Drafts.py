@@ -23,9 +23,11 @@ from core.tracking import extract_tracking_id, inject_tracking
 from gmail_client.drafts import (
     delete_gmail_draft,
     fetch_gmail_draft,
+    fetch_gmail_message,
     gmail_profile_email,
     list_gmail_drafts,
     send_draft,
+    _bodies_are_blank,
 )
 from gmail_client.send import send_email
 
@@ -35,6 +37,11 @@ def _cached_fetch_gmail_draft(draft_id: str) -> dict:
     return fetch_gmail_draft(draft_id)
 
 
+@st.cache_data(ttl=15)
+def _cached_fetch_gmail_message(message_id: str) -> dict:
+    return fetch_gmail_message(message_id)
+
+
 def _md5(text: str) -> str:
     return hashlib.md5((text or "").encode("utf-8")).hexdigest()
 
@@ -42,6 +49,11 @@ def _md5(text: str) -> str:
 def _load_full_draft(draft_id: str, fallback: dict) -> dict:
     """Gmail is the source of truth for preview/edit when a Gmail id exists."""
     gid = ""
+    mid = ""
+    if str(draft_id).startswith("gmail-msg:") or (
+        fallback.get("source") == "gmail_folder" and fallback.get("gmail_message_id")
+    ):
+        mid = fallback.get("gmail_message_id") or str(draft_id).removeprefix("gmail-msg:")
     if str(draft_id).startswith("gmail:") or fallback.get("gmail_draft_id"):
         gid = fallback.get("gmail_draft_id") or str(draft_id).removeprefix("gmail:")
     if gid:
@@ -53,6 +65,31 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
         body = fetched.get("body") or fetched.get("body_text") or ""
         body_html = fetched.get("body_html") or ""
         to = fetched.get("to") or ""
+        if _bodies_are_blank(body_html, body):
+            mid_try = (
+                fallback.get("gmail_message_id")
+                or mid
+                or fetched.get("gmail_message_id")
+                or ""
+            )
+            if mid_try:
+                fetched_m = _cached_fetch_gmail_message(mid_try)
+                m_body = fetched_m.get("body") or fetched_m.get("body_text") or ""
+                m_html = fetched_m.get("body_html") or ""
+                if not _bodies_are_blank(m_html, m_body):
+                    body, body_html = m_body, m_html
+                    to = fetched_m.get("to") or to
+                    fetched = {**fetched, **fetched_m}
+        if _bodies_are_blank(body_html, body):
+            snip = (
+                fetched.get("snippet")
+                or fallback.get("snippet")
+                or fallback.get("body")
+                or ""
+            ).strip()
+            if snip:
+                body = snip
+                body_html = f"<p>{_html_esc.escape(snip)}</p>"
         out = {
             **fallback,
             "draft_id": f"gmail:{gid}",
@@ -73,6 +110,39 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             "error": fetched.get("error"),
         }
         return out
+    if mid:
+        fetched = _cached_fetch_gmail_message(mid)
+        body = fetched.get("body") or fetched.get("body_text") or ""
+        body_html = fetched.get("body_html") or ""
+        to = fetched.get("to") or fallback.get("to") or ""
+        if _bodies_are_blank(body_html, body):
+            snip = (
+                fetched.get("snippet")
+                or fallback.get("snippet")
+                or fallback.get("body")
+                or ""
+            ).strip()
+            if snip:
+                body = snip
+                body_html = f"<p>{_html_esc.escape(snip)}</p>"
+        return {
+            **fallback,
+            "draft_id": f"gmail-msg:{mid}",
+            "gmail_draft_id": "",
+            "gmail_message_id": mid,
+            "to": to,
+            "recipient": to,
+            "cc": fetched.get("cc") or "",
+            "bcc": fetched.get("bcc") or "",
+            "subject": fetched.get("subject") or fallback.get("subject") or "",
+            "body": body,
+            "body_text": body,
+            "body_cleaned": body,
+            "body_html": body_html,
+            "source": "gmail_fetch",
+            "gmail_api_status": fetched.get("gmail_api_status"),
+            "error": fetched.get("error"),
+        }
     try:
         d = drive_db.load_draft(draft_id)
         if d.get("body_html") or d.get("body_cleaned") or d.get("body"):
@@ -271,11 +341,16 @@ div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) butt
 
 # Gmail first (source of truth); Drive only adds designation / tracking metadata
 with st.spinner("Loading Gmail drafts…"):
-    gmail_rows = list_gmail_drafts(limit=50)
+    gmail_rows = list_gmail_drafts(limit=200)
 gmail_err = next((r for r in gmail_rows if r.get("error")), None)
 if gmail_err:
     st.warning(f"Gmail drafts unavailable: {gmail_err.get('error')}")
     gmail_rows = []
+else:
+    st.caption(
+        f"Synced **{len(gmail_rows)}** Gmail Drafts-folder item(s) for this account. "
+        "Click **Refresh from Gmail** if a new draft is missing."
+    )
 
 try:
     with st.spinner("Loading Drive draft metadata…"):
@@ -322,7 +397,7 @@ q = st.text_input("Search subject/recipient/designation")
 status_f = st.selectbox("Status", ["active", "all", "draft", "ready", "sent", "deleted"])
 source_f = st.selectbox("Source", ["all", "gmail", "drive", "bulk"])
 page = st.number_input("Page", min_value=1, value=1, step=1)
-page_size = 10
+page_size = 20
 
 if q:
     ql = q.lower()
@@ -331,7 +406,7 @@ if q:
         for r in rows
         if ql in str(r.get("subject") or "").lower()
         or ql in str(r.get("recipient") or r.get("to") or "").lower()
-        or ql in str(r.get("cc") or "").lower()
+        or ql in str(r.get("snippet") or "").lower()
         or ql in str(r.get("recipient_name") or "").lower()
         or ql in str(r.get("title") or r.get("designation") or "").lower()
         or ql in str(r.get("company") or "").lower()

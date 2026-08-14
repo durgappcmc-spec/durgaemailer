@@ -253,7 +253,7 @@ if st.session_state.get("show_edit"):
         st.rerun()
 
 has_user = any(m.get("role") == "user" for m in st.session_state.messages)
-tb1, tb2, tb3, tb4 = st.columns([1, 1, 1, 1])
+tb1, tb2, tb3 = st.columns([1, 1, 1])
 with tb1:
     stop_clicked = st.button(
         "⏹ Stop",
@@ -271,16 +271,6 @@ with tb2:
         disabled=not has_user,
     )
 with tb3:
-    from core.draft_rollback import can_rollback
-
-    rollback_clicked = st.button(
-        "↩ Rollback",
-        use_container_width=True,
-        key="composer_rollback",
-        help="Delete the last Gmail draft(s) created in this chat if they are poor.",
-        disabled=not can_rollback(st.session_state),
-    )
-with tb4:
     clear_clicked = st.button(
         "🗑️ Clear",
         use_container_width=True,
@@ -310,25 +300,6 @@ if stop_clicked:
             meta["cancelled"] = True
             msgs[-1]["meta"] = meta
     st.toast("Stopped")
-    st.rerun()
-
-if rollback_clicked:
-    from core.draft_rollback import rollback_last
-
-    result = rollback_last(st.session_state)
-    if result.get("error") and not result.get("deleted"):
-        st.error(result["error"])
-    else:
-        n = len(result.get("deleted") or [])
-        errs = result.get("errors") or []
-        if n:
-            st.success(f"Rolled back {n} Gmail draft(s).")
-        if errs:
-            st.warning("; ".join(errs))
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
     st.rerun()
 
 if clear_clicked:
@@ -525,18 +496,6 @@ if prompt:
                         f"`{_d.get('ignored_count')}`"
                     )
             previews = meta.get("draft_previews") or []
-            if previews:
-                from core.draft_rollback import remember_created
-
-                remember_created(
-                    st.session_state,
-                    [
-                        str(pv.get("draft_id") or "")
-                        for pv in previews
-                        if pv.get("draft_id")
-                    ],
-                    note="chat_draft",
-                )
             if previews:
                 try:
                     from gmail_client.html_format import render_draft_html

@@ -27,8 +27,6 @@ def _apply_streamlit_secrets() -> None:
     keys = (
         "GEMINI_API_KEY",
         "GEMINI_MODEL",
-        "GSK_API_KEY",
-        "GSK_MODEL",
         "APOLLO_API_KEY",
         "ZOOMINFO_USERNAME",
         "ZOOMINFO_PASSWORD",
@@ -77,8 +75,6 @@ class Settings:
     def __init__(self) -> None:
         self.GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
         self.GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-        self.GSK_API_KEY: str = os.getenv("GSK_API_KEY", "")
-        self.GSK_MODEL: str = os.getenv("GSK_MODEL", "claude-sonnet-4-6")
         self.APOLLO_API_KEY: str = os.getenv("APOLLO_API_KEY", "")
         self.ZOOMINFO_USERNAME: str = os.getenv("ZOOMINFO_USERNAME", "")
         self.ZOOMINFO_PASSWORD: str = os.getenv("ZOOMINFO_PASSWORD", "")

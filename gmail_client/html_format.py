@@ -445,8 +445,14 @@ def html_for_editor(html: str) -> str:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup.find_all(["script", "style", "head"]):
+            tag.decompose()
         if soup.body:
             inner = soup.body.decode_contents().strip()
+            if inner:
+                return inner
+        if soup.html:
+            inner = soup.html.decode_contents().strip()
             if inner:
                 return inner
     except Exception:
