@@ -18,6 +18,15 @@ if not require_login():
     st.stop()
 logout_button()
 
+with st.sidebar:
+    try:
+        from core.mail_prefs import render_sidebar_signature_pref
+
+        st.subheader("Signature")
+        render_sidebar_signature_pref()
+    except Exception:
+        st.caption("Signature: Gmail account")
+
 from core import drive_db
 from core.tracking import extract_tracking_id, inject_tracking
 from gmail_client.drafts import (

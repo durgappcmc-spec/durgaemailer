@@ -486,7 +486,19 @@ def _render_gmail_edit_tab(
 
     sig_col, edit_col = st.columns([4, 1])
     with sig_col:
-        default_idx = sig_ids.index("default") if "default" in sig_ids else 0
+        default_idx = 0
+        try:
+            from core.mail_prefs import signature_mode
+
+            mode = signature_mode()
+        except Exception:
+            mode = "gmail"
+        if "gmail" in sig_ids and mode == "gmail":
+            default_idx = sig_ids.index("gmail")
+        elif "none" in sig_ids and mode == "none":
+            default_idx = sig_ids.index("none")
+        elif "default" in sig_ids:
+            default_idx = sig_ids.index("default")
         sig_choice = st.selectbox(
             "Signature",
             sig_ids,
@@ -496,7 +508,7 @@ def _render_gmail_edit_tab(
         )
     with edit_col:
         st.write("")
-        edit_sig = st.button("✏️ Edit", key=f"sig_edit_btn_{gid}", disabled=sig_choice == "none")
+        edit_sig = st.button("✏️ Edit", key=f"sig_edit_btn_{gid}", disabled=sig_choice in ("none", "gmail"))
 
     if st.session_state.get(prev_sig_key) is None:
         st.session_state[prev_sig_key] = sig_choice

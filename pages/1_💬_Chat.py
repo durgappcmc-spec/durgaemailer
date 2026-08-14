@@ -52,6 +52,13 @@ with st.sidebar:
             st.caption("Saved. Chat will keep using this model.")
     except Exception:
         st.caption("Chat model: Gemini")
+    try:
+        from core.mail_prefs import render_sidebar_signature_pref
+
+        st.subheader("Signature")
+        render_sidebar_signature_pref()
+    except Exception:
+        st.caption("Signature: Gmail account")
     st.subheader("Bulk jobs")
     try:
         from core import drive_db

@@ -76,21 +76,28 @@ def get_signature(send_as_email: Optional[str] = None) -> str:
 
 
 def append_signature(html_body: str, *, from_email: Optional[str] = None) -> str:
-    """Append the Gmail send-as / default signature once — never duplicate."""
-    from core.signatures import get_default_signature_html, with_signature
-    from gmail_client.html_format import body_looks_signed, normalize_email_html
+    """Append the Gmail send-as signature once — never the app Default, never stacked."""
+    from core.signatures import replace_signature
+    from gmail_client.html_format import normalize_email_html
 
     body = normalize_email_html(html_body or "<p></p>")
-    sig = get_signature(from_email) or get_default_signature_html(from_email or "")
+    try:
+        from core.mail_prefs import include_gmail_signature
+
+        if not include_gmail_signature():
+            return replace_signature(body, "")
+    except Exception:
+        pass
+    sig = (get_signature(from_email) or "").strip()
     if not sig:
         return body
-    if body_looks_signed(body, sig):
-        return body
-    needle = re.sub(r"\s+", "", sig[:80]).lower()
-    compact_body = re.sub(r"\s+", "", body).lower()
-    if needle and needle in compact_body:
-        return body
-    return with_signature(body, sig)
+    try:
+        from gmail_client.html_format import strip_trailing_signature_block
+
+        body = strip_trailing_signature_block(body)
+    except Exception:
+        pass
+    return replace_signature(body, sig)
 
 
 def _normalize_cc(cc: Optional[str | list[str]]) -> str:

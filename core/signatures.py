@@ -56,10 +56,23 @@ def load_signatures(user_email: str) -> dict[str, dict[str, str]]:
     store = _read_store()
     raw = store.get(email) if isinstance(store.get(email), dict) else {}
     out = {k: dict(v) for k, v in _BUILTIN.items()}
+    try:
+        from gmail_client.send import get_signature
+
+        ghtml = (get_signature(email) or "").strip()
+        if ghtml:
+            out = {
+                "gmail": {"name": "Gmail account", "html": ghtml},
+                **out,
+            }
+    except Exception:
+        pass
     for sid, row in raw.items():
         if not isinstance(row, dict):
             continue
         key = str(sid or "").strip() or "custom"
+        if key == "gmail":
+            continue
         out[key] = {
             "name": str(row.get("name") or key.title()),
             "html": str(row.get("html") or ""),

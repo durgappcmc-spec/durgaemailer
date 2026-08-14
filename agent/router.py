@@ -942,6 +942,15 @@ def _stamp_mail_fields(
     return job
 
 
+def _want_gmail_signature() -> bool:
+    try:
+        from core.mail_prefs import include_gmail_signature
+
+        return bool(include_gmail_signature())
+    except Exception:
+        return True
+
+
 def _deliver_job(
     job: dict[str, Any],
     *,
@@ -984,7 +993,11 @@ def _deliver_job(
         "from_email": job.get("from_email") or default_from_email(),
         "cc": job.get("cc") or [],
         "bcc": job.get("bcc") or [],
-        "include_signature": True,
+        "include_signature": bool(
+            job.get("include_signature")
+            if "include_signature" in job
+            else _want_gmail_signature()
+        ),
     }
     if do_send:
         return send_email(**kwargs), True
