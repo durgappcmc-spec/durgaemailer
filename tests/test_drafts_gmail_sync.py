@@ -109,6 +109,33 @@ def test_extract_html_prefers_text_html():
     assert "Hello plain" not in html
 
 
+def test_extract_html_accepts_mime_charset_and_unwraps_document():
+    from gmail_client.drafts import _extract_html_body
+    from gmail_client.html_format import html_for_editor
+
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {
+                "mimeType": "text/html; charset=utf-8",
+                "body": {
+                    "data": _b64(
+                        "<html><body><div dir='ltr'><p>Hi Jane,</p>"
+                        "<ul><li>One</li></ul></div></body></html>"
+                    )
+                },
+            }
+        ],
+    }
+    html = _extract_html_body(payload)
+    assert "Hi Jane" in html
+    assert "<ul>" in html
+    inner = html_for_editor(html)
+    assert "<html>" not in inner.lower()
+    assert "<body>" not in inner.lower()
+    assert "Hi Jane" in inner
+
+
 def test_extract_html_falls_back_to_wrapped_plain():
     from gmail_client.drafts import _extract_html_body
 

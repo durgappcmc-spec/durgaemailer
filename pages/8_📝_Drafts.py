@@ -203,7 +203,7 @@ with st.expander("Signatures", expanded=False):
     )
     if _sid == "none":
         st.caption("None — drafts will have no signature block.")
-    else:
+    elif st.checkbox("Edit this signature", key="drafts_sig_edit_on"):
         try:
             from streamlit_quill import st_quill
 
@@ -232,6 +232,8 @@ with st.expander("Signatures", expanded=False):
             )
             st.success("Signature saved — new drafts and the dropdown will use it.")
             st.rerun()
+    else:
+        st.caption("Check “Edit this signature” to change Default / Short.")
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
     "select with checkboxes to send or remove · designation shown per recipient."
@@ -243,6 +245,11 @@ if top_a.button("🔄 Refresh from Gmail"):
 st.markdown(
     """
 <style>
+iframe[title*="quill" i],
+iframe[title*="streamlit_quill" i] {
+  min-height: 400px !important;
+  height: 400px !important;
+}
 div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) button {
   background: transparent !important;
   border: none !important;

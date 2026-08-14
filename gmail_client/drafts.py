@@ -64,17 +64,43 @@ def _decode_b64url(data: str) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _extract_plain_body(payload: dict) -> str:
+def _mime_base(part: dict) -> str:
+    return (part.get("mimeType") or "").split(";")[0].strip().lower()
+
+
+def _decode_part_text(part: dict, *, msg_id: str = "") -> str:
+    body = part.get("body") or {}
+    data = body.get("data")
+    if data:
+        return _decode_b64url(data)
+    att_id = body.get("attachmentId") or ""
+    if not att_id or not msg_id:
+        return ""
+    try:
+        svc = gmail_service()
+        att = (
+            svc.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=msg_id, id=att_id)
+            .execute()
+        )
+        return _decode_b64url(att.get("data") or "")
+    except Exception as e:
+        print(f"[gmail] part body fetch failed: {e}", file=sys.stderr)
+        return ""
+
+
+def _extract_plain_body(payload: dict, *, msg_id: str = "") -> str:
     """Prefer text/plain; fall back to stripped text/html. No clean_email_body()."""
     html = ""
     text = ""
 
     def walk(part: dict) -> None:
         nonlocal html, text
-        mime = (part.get("mimeType") or "").lower()
-        data = (part.get("body") or {}).get("data")
-        if data and mime in ("text/html", "text/plain"):
-            decoded = _decode_b64url(data)
+        mime = _mime_base(part)
+        decoded = _decode_part_text(part, msg_id=msg_id) if mime in ("text/html", "text/plain") else ""
+        if decoded:
             if mime == "text/plain" and not text:
                 text = decoded
             elif mime == "text/html" and not html:
@@ -93,17 +119,16 @@ def _extract_plain_body(payload: dict) -> str:
     return ""
 
 
-def _extract_html_body(payload: dict) -> str:
+def _extract_html_body(payload: dict, *, msg_id: str = "") -> str:
     """Prefer text/html; fall back to paragraph-wrapped plain text."""
     html = ""
     text = ""
 
     def walk(part: dict) -> None:
         nonlocal html, text
-        mime = (part.get("mimeType") or "").lower()
-        data = (part.get("body") or {}).get("data")
-        if data and mime in ("text/html", "text/plain"):
-            decoded = _decode_b64url(data)
+        mime = _mime_base(part)
+        decoded = _decode_part_text(part, msg_id=msg_id) if mime in ("text/html", "text/plain") else ""
+        if decoded:
             if mime == "text/html" and not html:
                 html = decoded
             elif mime == "text/plain" and not text:
@@ -150,12 +175,13 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         return {**empty, "error": str(e), "gmail_api_status": code}
     msg = d.get("message") or {}
     payload = msg.get("payload") or {}
+    mid = str(msg.get("id") or "")
     headers = {
         h["name"].lower(): h["value"]
         for h in payload.get("headers") or []
     }
-    body_html = _extract_html_body(payload)
-    body_text = _extract_plain_body(payload)
+    body_html = _extract_html_body(payload, msg_id=mid)
+    body_text = _extract_plain_body(payload, msg_id=mid)
     return {
         "id": did,
         "to": headers.get("to", ""),
@@ -508,21 +534,15 @@ def _draft_headers(
     }
 
 
-def _extract_bodies(payload: dict) -> tuple[str, str]:
+def _extract_bodies(payload: dict, *, msg_id: str = "") -> tuple[str, str]:
     html = ""
     text = ""
 
     def walk(part: dict) -> None:
         nonlocal html, text
-        mime = (part.get("mimeType") or "").lower()
-        body = part.get("body") or {}
-        data = body.get("data")
-        if data and mime in ("text/html", "text/plain"):
-            try:
-                raw = base64.urlsafe_b64decode(data.encode("utf-8"))
-                decoded = raw.decode("utf-8", errors="replace")
-            except Exception:
-                decoded = ""
+        mime = _mime_base(part)
+        decoded = _decode_part_text(part, msg_id=msg_id) if mime in ("text/html", "text/plain") else ""
+        if decoded:
             if mime == "text/html" and not html:
                 html = decoded
             elif mime == "text/plain" and not text:

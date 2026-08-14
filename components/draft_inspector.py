@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import re
 from typing import Any, Optional
 
 import streamlit as st
@@ -97,11 +98,15 @@ def render_draft_inspector(
         else:
             st.warning("untracked — open pixel missing")
 
-    tab_preview, tab_intel, tab_trace, tab_edit = st.tabs(
-        ["Preview", "Intelligence", "Agent Trace", "Edit"]
+    section = st.radio(
+        "Draft view",
+        ["Preview", "Intelligence", "Agent Trace", "Edit"],
+        horizontal=True,
+        key=f"{key_prefix}_section",
+        label_visibility="collapsed",
     )
 
-    with tab_preview:
+    if section == "Preview":
         # Inject Gmail HTML as-is — Streamlit markdown must not escape the body.
         body_html = draft.get("body_html") or draft.get("html") or ""
         if not body_html:
@@ -205,7 +210,7 @@ def render_draft_inspector(
                         st.session_state.opened_draft_id = ""
                     st.rerun()
 
-    with tab_intel:
+    if section == "Intelligence":
         brief = org_brief or draft.get("org_brief") or {}
         if brief:
             st.markdown(f"**Org:** {brief.get('org_name') or '—'}")
@@ -249,7 +254,7 @@ def render_draft_inspector(
                 "No intelligence brief attached (Chat/Gmail drafts are still sendable)."
             )
 
-    with tab_trace:
+    if section == "Agent Trace":
         events = trace or []
         if not events:
             sid = draft.get("phase2_session_id") or draft.get("phase1_session_id")
@@ -268,7 +273,7 @@ def render_draft_inspector(
                 with st.expander(f"#{ev.get('seq', '?')} {et}", expanded=False):
                     st.json(ev)
 
-    with tab_edit:
+    if section == "Edit":
         gid = draft.get("gmail_draft_id") or ""
         did = str(draft.get("draft_id") or "")
         if not gid and did.startswith("gmail:"):
@@ -305,7 +310,13 @@ def _render_gmail_edit_tab(
         save_gmail_draft,
         send_draft,
     )
-    from gmail_client.html_format import clean_email_body, plain_from_html
+    from gmail_client.html_format import (
+        clean_email_body,
+        html_for_editor,
+        html_from_cleaned_body,
+        looks_like_html,
+        plain_from_html,
+    )
 
     if "bcc_cache" not in st.session_state:
         st.session_state.bcc_cache = {}
@@ -349,17 +360,36 @@ def _render_gmail_edit_tab(
     nonce_key = f"quill_nonce_{gid}"
     prev_sig_key = f"sig_prev_{gid}"
     if seed_key not in st.session_state:
-        html0 = draft.get("body_html") or ""
+        html0 = html_for_editor(draft.get("body_html") or "")
+        if not (html0 or "").strip():
+            plain = draft.get("body") or draft.get("body_text") or ""
+            if looks_like_html(plain):
+                html0 = html_for_editor(plain)
+            elif plain.strip():
+                html0 = html_from_cleaned_body(plain)
         st.session_state[seed_key] = html0
         st.session_state[nonce_key] = 0
 
     nonce = int(st.session_state.get(nonce_key, 0) or 0)
     quill_key = f"quill_{gid}_{nonce}"
+    seed_html = st.session_state.get(seed_key) or draft.get("body_html") or ""
     new_body = _rich_text_editor(
-        st.session_state.get(seed_key) or draft.get("body_html") or "",
+        seed_html,
         key=quill_key,
         toolbar=_GMAIL_QUILL_TOOLBAR,
+        keep_seed_if_empty=False,
     )
+    if (seed_html or "").strip() and _quill_result_empty(new_body):
+        st.warning(
+            "Rich editor did not show the Gmail body. Edit the text below — "
+            "Save still writes to Gmail."
+        )
+        new_body = st.text_area(
+            "Email body",
+            value=seed_html,
+            height=400,
+            key=f"body_fallback_{gid}_{nonce}",
+        )
     draft["_edit_body"] = new_body or ""
 
     sig_col, edit_col = st.columns([4, 1])
@@ -683,8 +713,17 @@ def _render_edit_tab(
     st.rerun()
 
 
+def _quill_result_empty(html: str) -> bool:
+    compact = re.sub(r"\s+", "", html or "", flags=re.I)
+    return compact in ("", "<p></p>", "<p><br></p>", "<p><br/></p>")
+
+
 def _rich_text_editor(
-    html: str, *, key: str, toolbar: Optional[list] = None
+    html: str,
+    *,
+    key: str,
+    toolbar: Optional[list] = None,
+    keep_seed_if_empty: bool = True,
 ) -> str:
     """WYSIWYG editor; falls back to text_area if Quill is unavailable."""
     try:
@@ -697,8 +736,11 @@ def _rich_text_editor(
             key=key,
             placeholder="Write your email…",
         )
-        if result is None:
-            return html or ""
+        # First paint / hidden iframe often returns "" — do not wipe Gmail HTML.
+        if result is None or _quill_result_empty(str(result)):
+            if keep_seed_if_empty and (html or "").strip() and not _quill_result_empty(html):
+                return html
+            return str(result or "")
         return str(result)
     except Exception as e:
         st.warning(

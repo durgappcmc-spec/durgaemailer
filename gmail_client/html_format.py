@@ -436,6 +436,24 @@ def html_from_cleaned_body(cleaned: str) -> str:
     return "".join(parts) or "<p></p>"
 
 
+def html_for_editor(html: str) -> str:
+    """Unwrap <html>/<body> so Quill can display Gmail MIME HTML."""
+    raw = (html or "").strip()
+    if not raw:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(raw, "html.parser")
+        if soup.body:
+            inner = soup.body.decode_contents().strip()
+            if inner:
+                return inner
+    except Exception:
+        pass
+    return raw
+
+
 def looks_like_html(body: str) -> bool:
     return bool(
         re.search(
