@@ -295,6 +295,80 @@ def _route_user_msg(
     return f"[ATTACHED FILES ALREADY UPLOADED: {', '.join(names)}]\n{user_msg}"
 
 
+def _first_token(text: str) -> str:
+    parts = (text or "").strip().split(None, 1)
+    return parts[0] if parts else ""
+
+
+def _first_name_from_recipient(
+    prospect: Optional[dict[str, Any]] = None,
+    *,
+    email: str = "",
+) -> str:
+    """First name from prospect fields, else the email local-part (never IndexError)."""
+    p = prospect or {}
+    first = _first_token(str(p.get("first_name") or ""))
+    if first and "@" not in first:
+        return first
+    name = str(p.get("name") or p.get("recipient_name") or "").strip()
+    if name and "@" not in name:
+        tok = _first_token(name)
+        if tok:
+            return tok
+    addr = (
+        email
+        or str(p.get("email") or p.get("recipient_email") or "")
+    ).strip()
+    try:
+        from connectors import humanize_email_local
+
+        return _first_token(humanize_email_local(addr))
+    except Exception:
+        local = addr.split("@", 1)[0] if "@" in addr else addr
+        bits = [b for b in re.split(r"[._+\-]+", local) if b]
+        tok = bits[0] if bits else ""
+        return (tok[:1].upper() + tok[1:]) if tok else ""
+
+
+def _like_sent_prospect_ctx(
+    job: dict[str, Any],
+    *,
+    by_email: Optional[dict[str, dict[str, Any]]] = None,
+    target_company: str = "",
+) -> dict[str, Any]:
+    """Context for one like-sent clone when the To is email-only (no ZoomInfo row)."""
+    em = str(job.get("recipient_email") or "").strip()
+    p = dict((by_email or {}).get(em.lower()) or {})
+    name = str(p.get("name") or job.get("recipient_name") or "").strip()
+    if not name and em:
+        try:
+            from connectors import humanize_email_local
+
+            name = humanize_email_local(em)
+        except Exception:
+            name = ""
+    first = _first_name_from_recipient(
+        {**p, "name": name, "recipient_name": name},
+        email=em,
+    )
+    company = (
+        str(p.get("company") or p.get("organization") or "").strip()
+        or str(job.get("company") or "").strip()
+        or (target_company or "").strip()
+    )
+    return {
+        "name": name,
+        "first_name": first,
+        "email": em,
+        "recipient_email": em,
+        "recipient_name": name,
+        "title": str(
+            p.get("title") or p.get("designation") or job.get("title") or ""
+        ),
+        "company": company,
+    }
+
+
 def _apply_template(text: str, prospect: dict[str, Any]) -> str:
     """Substitute {first_name}, {name}, {title}/{designation}, {company}, {email}."""
     if not text:
@@ -4579,57 +4653,70 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 if (p.get("email") or "").strip()
                             }
                             for job in jobs:
-                                em = (job.get("recipient_email") or "").strip().lower()
-                                pctx = by_email.get(em) or {
-                                    "name": job.get("recipient_name") or "",
-                                    "first_name": (
-                                        str(job.get("first_name") or "").strip()
-                                        or str(job.get("recipient_name") or "")
-                                        .split(None, 1)[0]
-                                    ),
-                                    "email": job.get("recipient_email") or "",
-                                    "recipient_email": job.get("recipient_email") or "",
-                                    "title": job.get("title")
-                                    or job.get("designation")
-                                    or "",
-                                    "company": target_company
-                                    or job.get("company")
-                                    or "",
-                                }
-                                company = (
-                                    str(pctx.get("company") or "").strip()
-                                    or target_company
-                                    or ""
-                                )
-                                if company and not (pctx.get("company") or "").strip():
-                                    pctx = {**pctx, "company": company}
-                                company_composed = (
-                                    composed_by_company.get(company.lower())
-                                    if company
-                                    else None
-                                ) or composed
-                                personalized = _personalize_like_sent_job(
-                                    subject=company_composed.get("subject")
-                                    or job.get("subject")
-                                    or "",
-                                    html_body=company_composed.get("html_body")
-                                    or job.get("html_body")
-                                    or "",
-                                    prospect=pctx,
-                                    scrub_names=scrub_names
-                                    + (
-                                        ["{company}"]
-                                        if "{company}"
-                                        in (
-                                            (company_composed.get("subject") or "")
-                                            + (company_composed.get("html_body") or "")
-                                        )
-                                        else []
-                                    ),
-                                )
-                                job["subject"] = personalized["subject"]
-                                job["html_body"] = personalized["html_body"]
-                                job["company"] = company
+                                em = (
+                                    job.get("recipient_email") or ""
+                                ).strip().lower()
+                                try:
+                                    pctx = _like_sent_prospect_ctx(
+                                        job,
+                                        by_email=by_email,
+                                        target_company=target_company or "",
+                                    )
+                                    company = (
+                                        str(pctx.get("company") or "").strip()
+                                        or target_company
+                                        or ""
+                                    )
+                                    if company and not (
+                                        pctx.get("company") or ""
+                                    ).strip():
+                                        pctx = {**pctx, "company": company}
+                                    company_composed = (
+                                        composed_by_company.get(company.lower())
+                                        if company
+                                        else None
+                                    ) or composed
+                                    personalized = _personalize_like_sent_job(
+                                        subject=company_composed.get("subject")
+                                        or job.get("subject")
+                                        or "",
+                                        html_body=company_composed.get("html_body")
+                                        or job.get("html_body")
+                                        or "",
+                                        prospect=pctx,
+                                        scrub_names=scrub_names
+                                        + (
+                                            ["{company}"]
+                                            if "{company}"
+                                            in (
+                                                (
+                                                    company_composed.get("subject")
+                                                    or ""
+                                                )
+                                                + (
+                                                    company_composed.get("html_body")
+                                                    or ""
+                                                )
+                                            )
+                                            else []
+                                        ),
+                                    )
+                                    job["subject"] = personalized["subject"]
+                                    job["html_body"] = personalized["html_body"]
+                                    job["company"] = company
+                                    if pctx.get("recipient_name"):
+                                        job["recipient_name"] = pctx["recipient_name"]
+                                    if pctx.get("first_name"):
+                                        job["first_name"] = pctx["first_name"]
+                                except Exception as e:
+                                    print(
+                                        f"[router] like-sent personalize {em}: {e}",
+                                        file=sys.stderr,
+                                    )
+                                    yield (
+                                        f"_Could not personalize `{em or 'recipient'}` "
+                                        "— keeping the cloned body._\n"
+                                    )
 
                         email_cap = min(
                             max(int(plan.email_limit or MAX_EMAILS), 1), MAX_EMAILS

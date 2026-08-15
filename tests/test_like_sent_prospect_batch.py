@@ -102,7 +102,36 @@ def test_personalize_scrubs_magic_bus_for_sterlite():
     assert "magicbus" not in blob.replace("sterlite", "")
 
 
-def test_personalize_rewrites_khushid_greeting():
+def test_personalize_email_only_recipient_does_not_crash():
+    from agent.router import (
+        _first_name_from_recipient,
+        _like_sent_prospect_ctx,
+        _personalize_like_sent_job,
+    )
+
+    job = {"recipient_email": "annie.mathews@savethechildren.in"}
+    ctx = _like_sent_prospect_ctx(job, by_email={}, target_company="")
+    assert ctx["first_name"]
+    assert ctx["first_name"] == _first_name_from_recipient(email=job["recipient_email"])
+    out = _personalize_like_sent_job(
+        subject="Partnership",
+        html_body="<p>Dear Sheetal,</p><p>Greetings from Puppets.</p>",
+        prospect=ctx,
+        scrub_names=[],
+    )
+    assert "Dear Annie" in out["html_body"] or "Hi Annie" in out["html_body"]
+    assert "Sheetal" not in out["html_body"]
+
+    empty = {"recipient_email": "a_ansari@savethechildren.in", "recipient_name": ""}
+    ctx2 = _like_sent_prospect_ctx(empty, by_email={})
+    assert ctx2["first_name"]
+    _personalize_like_sent_job(
+        subject="Hi",
+        html_body="<p>Dear Sheetal,</p>",
+        prospect=ctx2,
+        scrub_names=["savethechildren.in"],
+    )
+
     out = _personalize_like_sent_job(
         subject="Partnership",
         html_body="<p>Hi Khushid,</p><p>We would love to partner.</p>",
