@@ -283,12 +283,17 @@ def render_draft_inspector(
                 gmail_id = draft.get("gmail_draft_id") or (
                     did.removeprefix("gmail:") if did.startswith("gmail:") else ""
                 )
+                mid = draft.get("gmail_message_id") or (
+                    did.removeprefix("gmail-msg:") if did.startswith("gmail-msg:") else ""
+                )
                 errors = []
-                if gmail_id:
+                if gmail_id or mid:
                     try:
-                        from gmail_client.drafts import delete_gmail_draft
+                        from gmail_client.drafts import delete_gmail_item
 
-                        res = delete_gmail_draft(gmail_id)
+                        res = delete_gmail_item(
+                            gmail_draft_id=gmail_id, gmail_message_id=mid
+                        )
                         if res.get("error"):
                             errors.append(res["error"])
                     except Exception as e:

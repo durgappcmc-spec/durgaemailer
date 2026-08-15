@@ -30,15 +30,42 @@ with st.sidebar:
 from core import drive_db
 from core.tracking import extract_tracking_id, inject_tracking
 from gmail_client.drafts import (
-    delete_gmail_draft,
+    delete_gmail_item,
     fetch_gmail_draft,
     fetch_gmail_message,
+    gmail_delete_refs,
     gmail_profile_email,
     list_gmail_drafts,
     send_draft,
     _bodies_are_blank,
 )
 from gmail_client.send import send_email
+
+
+def _sel_key(did: str) -> str:
+    return f"dsel_{did}"
+
+
+def _on_toggle_draft(did: str) -> None:
+    bag = set(st.session_state.get("draft_selected_ids") or [])
+    if st.session_state.get(_sel_key(did)):
+        bag.add(did)
+    else:
+        bag.discard(did)
+    st.session_state.draft_selected_ids = bag
+
+
+def _apply_selection(ids: list[str], *, selected: bool) -> None:
+    bag = set(st.session_state.get("draft_selected_ids") or [])
+    for did in ids:
+        if not did:
+            continue
+        st.session_state[_sel_key(did)] = selected
+        if selected:
+            bag.add(did)
+        else:
+            bag.discard(did)
+    st.session_state.draft_selected_ids = bag
 
 
 @st.cache_data(ttl=15)
@@ -315,7 +342,7 @@ with st.expander("Signatures", expanded=False):
         st.caption("Check “Edit this signature” to change Default / Short.")
 st.caption(
     "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
-    "select with checkboxes to send or remove · designation shown per recipient."
+    "tick one or more checkboxes, then Remove selected · designation shown per recipient."
 )
 top_a, top_b = st.columns([1, 4])
 if top_a.button("🔄 Refresh from Gmail"):
@@ -454,15 +481,160 @@ if "draft_selected_ids" not in st.session_state:
 if "opened_draft_id" not in st.session_state:
     st.session_state.opened_draft_id = ""
 
-sel_c1, sel_c2, sel_c3 = st.columns([1, 1, 4])
+
+def _remove_drafts(ids: list[str]) -> list[dict]:
+    results = []
+    for did in ids:
+        row = by_id.get(did) or {}
+        gmail_id, mid = gmail_delete_refs(did, row)
+        gmail_res: dict = {}
+        if gmail_id or mid:
+            gmail_res = delete_gmail_item(
+                gmail_draft_id=gmail_id, gmail_message_id=mid
+            )
+        try:
+            drive_db.delete_draft(did, purge=True)
+            drive_ok = True
+        except Exception as e:
+            drive_ok = False
+            gmail_res = {**gmail_res, "drive_error": str(e)}
+        bag = set(st.session_state.get("draft_selected_ids") or [])
+        bag.discard(did)
+        st.session_state.draft_selected_ids = bag
+        st.session_state.pop(_sel_key(did), None)
+        if st.session_state.get("opened_draft_id") == did:
+            st.session_state.opened_draft_id = ""
+        results.append(
+            {
+                "draft_id": did,
+                "gmail": gmail_res,
+                "drive_removed": drive_ok,
+                "ok": bool(drive_ok or (gmail_res or {}).get("ok")),
+            }
+        )
+    return results
+
+
 page_ids = [str(r.get("draft_id") or "") for r in page_rows if r.get("draft_id")]
-if sel_c1.button("☑ Select page"):
-    st.session_state.draft_selected_ids |= set(page_ids)
+all_ids = [str(r.get("draft_id") or "") for r in rows if r.get("draft_id")]
+n_sel = len(st.session_state.draft_selected_ids)
+
+sel_c1, sel_c2, sel_c3, sel_c4 = st.columns([1.15, 1.35, 1.15, 2.3])
+if sel_c1.button("☑ Select page", help="Select every draft on this page"):
+    _apply_selection(page_ids, selected=True)
     st.rerun()
-if sel_c2.button("☐ Clear selection"):
+if sel_c2.button(
+    f"☑ Select all {total}" if total else "☑ Select all",
+    help="Select every draft matching the current filters",
+    disabled=not all_ids,
+):
+    _apply_selection(all_ids, selected=True)
+    st.rerun()
+if sel_c3.button("☐ Clear selection"):
+    _apply_selection(list(st.session_state.draft_selected_ids) + page_ids, selected=False)
     st.session_state.draft_selected_ids = set()
     st.rerun()
-sel_c3.caption(f"{len(st.session_state.draft_selected_ids)} selected")
+sel_c4.caption(f"**{n_sel}** selected" + (f" of {total}" if total else ""))
+
+a1, a2, a3, a4 = st.columns(4)
+send_clicked = a1.button("📨 Send selected", type="primary")
+track_clicked = a2.button("🔒 Ensure tracking on selected")
+remove_clicked = a3.button("🗑 Remove selected")
+export_clicked = a4.button("Export CSV")
+action_ids = list(st.session_state.draft_selected_ids)
+
+if send_clicked:
+    if not action_ids:
+        st.warning("Select one or more drafts first.")
+    else:
+        results = []
+        for did in action_ids:
+            draft = _load_full_draft(did, by_id.get(did) or {})
+            results.append(_send_one(draft))
+        st.json(results)
+if track_clicked:
+    if not action_ids:
+        st.warning("Select one or more drafts first.")
+    else:
+        from core.tracking import prepare_draft_tracking
+
+        for did in action_ids:
+            draft = _load_full_draft(did, by_id.get(did) or {})
+            html, tid = prepare_draft_tracking(
+                draft.get("body_html") or "",
+                draft.get("tracking_id") or None,
+            )
+            draft["body_html"] = html
+            draft["tracking_id"] = tid
+            draft["has_open_pixel"] = False
+            try:
+                drive_db.save_draft(did, draft)
+            except Exception:
+                pass
+            gid = draft.get("gmail_draft_id") or (
+                str(did).removeprefix("gmail:") if str(did).startswith("gmail:") else ""
+            )
+            if gid:
+                try:
+                    from gmail_client.drafts import save_gmail_draft
+
+                    save_gmail_draft(
+                        gid,
+                        draft.get("to") or "",
+                        draft.get("cc") or "",
+                        draft.get("bcc") or "",
+                        draft.get("subject") or "",
+                        html,
+                        from_email=draft.get("from") or None,
+                    )
+                except Exception:
+                    pass
+        st.success(
+            f"Tracking id saved on {len(action_ids)} draft(s) — pixel is added at send."
+        )
+        st.rerun()
+if remove_clicked:
+    if not action_ids:
+        st.warning("Select one or more drafts first.")
+    else:
+        results = _remove_drafts(action_ids)
+        ok_n = sum(1 for r in results if r.get("ok"))
+        gmail_n = sum(1 for r in results if (r.get("gmail") or {}).get("ok"))
+        st.cache_data.clear()
+        st.success(
+            f"Removed {ok_n}/{len(results)} draft(s)"
+            + (f" ({gmail_n} from Gmail)" if gmail_n else "")
+        )
+        st.rerun()
+if export_clicked:
+    buf = io.StringIO()
+    w = csv.DictWriter(
+        buf,
+        fieldnames=[
+            "draft_id",
+            "recipient",
+            "cc",
+            "recipient_name",
+            "title",
+            "designation",
+            "company",
+            "subject",
+            "status",
+            "updated_at",
+            "tracking_id",
+            "origin",
+        ],
+    )
+    w.writeheader()
+    for r in rows:
+        row = {k: r.get(k) for k in w.fieldnames}
+        if not row.get("title") and not row.get("designation"):
+            row["title"] = _recipient_designation(r)
+            row["designation"] = row["title"]
+        if not row.get("company"):
+            row["company"] = _recipient_company(r)
+        w.writerow(row)
+    st.download_button("Download", buf.getvalue(), file_name="drafts.csv")
 
 h = st.columns([0.45, 1.8, 1.4, 2.2, 1.6, 1.1, 0.8, 0.9])
 h[0].markdown("**☐**")
@@ -474,22 +646,20 @@ h[5].markdown("**Updated**")
 h[6].markdown("**Status**")
 h[7].markdown("**Source**")
 
-selected: list[str] = []
 for r in page_rows:
     did = str(r.get("draft_id") or "")
     cols = st.columns([0.45, 1.8, 1.4, 2.2, 1.6, 1.1, 0.8, 0.9])
     with cols[0]:
-        checked = st.checkbox(
+        ck = _sel_key(did)
+        if ck not in st.session_state:
+            st.session_state[ck] = did in st.session_state.draft_selected_ids
+        st.checkbox(
             "select",
-            value=did in st.session_state.draft_selected_ids,
-            key=f"dsel_{did}",
+            key=ck,
+            on_change=_on_toggle_draft,
+            args=(did,),
             label_visibility="collapsed",
         )
-        if checked:
-            st.session_state.draft_selected_ids.add(did)
-            selected.append(did)
-        else:
-            st.session_state.draft_selected_ids.discard(did)
     with cols[1]:
         email = r.get("recipient") or r.get("to") or "—"
         name = (r.get("recipient_name") or "").strip()
@@ -532,122 +702,6 @@ for r in page_rows:
     cols[5].write((r.get("updated_at") or "")[:16] or "—")
     cols[6].write(r.get("status") or "draft")
     cols[7].write(r.get("origin") or r.get("source") or "—")
-
-# Prefer explicit checkboxes on this page; fall back to session selection
-selected = selected or [
-    did for did in st.session_state.draft_selected_ids if did in set(page_ids)
-]
-# If user selected across pages, use full session set for actions
-action_ids = list(st.session_state.draft_selected_ids) or selected
-
-
-def _remove_drafts(ids: list[str]) -> list[dict]:
-    results = []
-    for did in ids:
-        row = by_id.get(did) or {}
-        gmail_id = row.get("gmail_draft_id") or ""
-        if not gmail_id and str(did).startswith("gmail:"):
-            gmail_id = str(did).removeprefix("gmail:")
-        gmail_res: dict = {}
-        if gmail_id:
-            gmail_res = delete_gmail_draft(gmail_id)
-        try:
-            drive_db.delete_draft(did, purge=True)
-            drive_ok = True
-        except Exception as e:
-            drive_ok = False
-            gmail_res = {**gmail_res, "drive_error": str(e)}
-        st.session_state.draft_selected_ids.discard(did)
-        if st.session_state.get("opened_draft_id") == did:
-            st.session_state.opened_draft_id = ""
-        results.append(
-            {
-                "draft_id": did,
-                "gmail": gmail_res,
-                "drive_removed": drive_ok,
-            }
-        )
-    return results
-
-
-c1, c2, c3, c4 = st.columns(4)
-if c1.button("📨 Send selected", type="primary") and action_ids:
-    results = []
-    for did in action_ids:
-        draft = _load_full_draft(did, by_id.get(did) or {})
-        results.append(_send_one(draft))
-    st.json(results)
-if c2.button("🔒 Ensure tracking on selected") and action_ids:
-    from core.tracking import prepare_draft_tracking
-
-    for did in action_ids:
-        draft = _load_full_draft(did, by_id.get(did) or {})
-        html, tid = prepare_draft_tracking(
-            draft.get("body_html") or "",
-            draft.get("tracking_id") or None,
-        )
-        draft["body_html"] = html
-        draft["tracking_id"] = tid
-        draft["has_open_pixel"] = False
-        try:
-            drive_db.save_draft(did, draft)
-        except Exception:
-            pass
-        gid = draft.get("gmail_draft_id") or (
-            str(did).removeprefix("gmail:") if str(did).startswith("gmail:") else ""
-        )
-        if gid:
-            try:
-                from gmail_client.drafts import save_gmail_draft
-
-                save_gmail_draft(
-                    gid,
-                    draft.get("to") or "",
-                    draft.get("cc") or "",
-                    draft.get("bcc") or "",
-                    draft.get("subject") or "",
-                    html,
-                    from_email=draft.get("from") or None,
-                )
-            except Exception:
-                pass
-    st.success(f"Tracking id saved on {len(action_ids)} draft(s) — pixel is added at send.")
-    st.rerun()
-if c3.button("🗑 Remove selected") and action_ids:
-    results = _remove_drafts(action_ids)
-    ok_n = sum(1 for r in results if r.get("drive_removed"))
-    st.success(f"Removed {ok_n}/{len(results)} draft(s) from Drive"
-               + (" and Gmail" if any((r.get("gmail") or {}).get("ok") for r in results) else ""))
-    st.rerun()
-if c4.button("Export CSV"):
-    buf = io.StringIO()
-    w = csv.DictWriter(
-        buf,
-        fieldnames=[
-            "draft_id",
-            "recipient",
-            "cc",
-            "recipient_name",
-            "title",
-            "designation",
-            "company",
-            "subject",
-            "status",
-            "updated_at",
-            "tracking_id",
-            "origin",
-        ],
-    )
-    w.writeheader()
-    for r in rows:
-        row = {k: r.get(k) for k in w.fieldnames}
-        if not row.get("title") and not row.get("designation"):
-            row["title"] = _recipient_designation(r)
-            row["designation"] = row["title"]
-        if not row.get("company"):
-            row["company"] = _recipient_company(r)
-        w.writerow(row)
-    st.download_button("Download", buf.getvalue(), file_name="drafts.csv")
 
 st.divider()
 st.subheader("Open a draft")

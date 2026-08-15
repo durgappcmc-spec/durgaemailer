@@ -823,6 +823,45 @@ def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         return {"error": str(e), "gmail_draft_id": did, "tracking_id": tid}
 
 
+def gmail_delete_refs(
+    draft_id: str = "",
+    row: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Return (gmail_draft_id, gmail_message_id) for a Drafts-page row."""
+    row = row or {}
+    did = str(draft_id or row.get("draft_id") or "")
+    gmail_id = str(row.get("gmail_draft_id") or "").strip()
+    if not gmail_id and did.startswith("gmail:"):
+        gmail_id = did.removeprefix("gmail:")
+    mid = str(row.get("gmail_message_id") or "").strip()
+    if not mid and did.startswith("gmail-msg:"):
+        mid = did.removeprefix("gmail-msg:")
+    return gmail_id, mid
+
+
+def delete_gmail_item(
+    *,
+    gmail_draft_id: str = "",
+    gmail_message_id: str = "",
+) -> dict[str, Any]:
+    """Delete a Gmail draft, or trash a Drafts-folder message if there is no draft id."""
+    did = (gmail_draft_id or "").removeprefix("gmail:").strip()
+    mid = (gmail_message_id or "").removeprefix("gmail-msg:").strip()
+    if did:
+        result = delete_gmail_draft(did)
+        if result.get("ok") or not mid:
+            return result
+    if not mid:
+        return {"error": "missing gmail draft or message id"}
+    try:
+        svc = gmail_service()
+        svc.users().messages().trash(userId="me", id=mid).execute()
+        return {"ok": True, "gmail_message_id": mid, "trashed": True}
+    except Exception as e:
+        print(f"[gmail] trash draft message failed: {e}", file=sys.stderr)
+        return {"error": str(e), "gmail_message_id": mid}
+
+
 def delete_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
     """Permanently delete a Gmail draft (users.drafts.delete)."""
     did = (gmail_draft_id or "").removeprefix("gmail:")

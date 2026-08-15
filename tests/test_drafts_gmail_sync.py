@@ -289,3 +289,61 @@ def test_with_signature_appends_once_and_replace_can_remove():
     removed = replace_signature(swapped, "")
     assert "gmail_signature" not in removed
     assert "Hi Jane" in removed
+
+
+def test_gmail_delete_refs_from_draft_and_folder_ids():
+    from gmail_client.drafts import gmail_delete_refs
+
+    assert gmail_delete_refs("gmail:abc") == ("abc", "")
+    assert gmail_delete_refs("gmail-msg:mid9") == ("", "mid9")
+    assert gmail_delete_refs(
+        "gmail:abc",
+        {"gmail_draft_id": "abc", "gmail_message_id": "m1"},
+    ) == ("abc", "m1")
+    assert gmail_delete_refs(
+        "gmail-msg:mid9",
+        {"gmail_draft_id": "", "gmail_message_id": "mid9"},
+    ) == ("", "mid9")
+
+
+def test_delete_gmail_item_deletes_draft_then_trashes_message(monkeypatch):
+    from gmail_client import drafts as drafts_mod
+
+    calls: list[tuple[str, str]] = []
+
+    class _Exec:
+        def execute(self):
+            return {}
+
+    class _Drafts:
+        def delete(self, userId, id):
+            calls.append(("drafts.delete", id))
+            return _Exec()
+
+    class _Msgs:
+        def trash(self, userId, id):
+            calls.append(("messages.trash", id))
+            return _Exec()
+
+    class _Users:
+        def drafts(self):
+            return _Drafts()
+
+        def messages(self):
+            return _Msgs()
+
+    class _Svc:
+        def users(self):
+            return _Users()
+
+    monkeypatch.setattr(drafts_mod, "gmail_service", lambda: _Svc())
+
+    out = drafts_mod.delete_gmail_item(gmail_draft_id="d1")
+    assert out["ok"] is True
+    assert calls == [("drafts.delete", "d1")]
+
+    calls.clear()
+    out = drafts_mod.delete_gmail_item(gmail_message_id="m9")
+    assert out["ok"] is True
+    assert out.get("trashed") is True
+    assert calls == [("messages.trash", "m9")]
