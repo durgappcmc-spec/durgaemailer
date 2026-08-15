@@ -144,6 +144,9 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             "source": "gmail_fetch",
             "gmail_api_status": fetched.get("gmail_api_status"),
             "error": fetched.get("error"),
+            "attachments": fetched.get("attachments")
+            or fallback.get("attachments")
+            or [],
         }
         return out
     if mid:
@@ -178,6 +181,9 @@ def _load_full_draft(draft_id: str, fallback: dict) -> dict:
             "source": "gmail_fetch",
             "gmail_api_status": fetched.get("gmail_api_status"),
             "error": fetched.get("error"),
+            "attachments": fetched.get("attachments")
+            or fallback.get("attachments")
+            or [],
         }
     try:
         d = drive_db.load_draft(draft_id)

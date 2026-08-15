@@ -347,3 +347,35 @@ def test_delete_gmail_item_deletes_draft_then_trashes_message(monkeypatch):
     assert out["ok"] is True
     assert out.get("trashed") is True
     assert calls == [("messages.trash", "m9")]
+
+
+def test_extract_gmail_attachments_skips_html_body():
+    from gmail_client.drafts import extract_gmail_attachments
+
+    blob = b"%PDF-fake-bytes"
+    b64 = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
+    html_b64 = base64.urlsafe_b64encode(b"<p>Hi</p>").decode("ascii").rstrip("=")
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "text/html",
+                "body": {"data": html_b64},
+            },
+            {
+                "mimeType": "application/pdf",
+                "filename": "one-pager.pdf",
+                "headers": [
+                    {
+                        "name": "Content-Disposition",
+                        "value": 'attachment; filename="one-pager.pdf"',
+                    }
+                ],
+                "body": {"data": b64, "size": len(blob)},
+            },
+        ],
+    }
+    atts = extract_gmail_attachments(payload)
+    assert len(atts) == 1
+    assert atts[0]["name"] == "one-pager.pdf"
+    assert base64.b64decode(atts[0]["data_base64"]) == blob

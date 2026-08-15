@@ -582,6 +582,11 @@ def _render_gmail_edit_tab(
             st.session_state[f"sig_editing_{gid}"] = False
             st.rerun()
 
+    existing_atts, keep_flags, uploads = _render_attachment_editor(
+        draft.get("attachments") or [],
+        key=f"att_{gid}",
+    )
+
     col_a, col_b, col_c = st.columns([1, 1, 1])
     save_clicked = col_a.button("💾 Save to Gmail", key=f"save_{gid}")
     send_clicked = col_b.button("📤 Send now", key=f"send_{gid}")
@@ -612,7 +617,20 @@ def _render_gmail_edit_tab(
     if not save_clicked and not send_clicked:
         return
 
-    atts = _attachments_for_send(draft.get("attachments") or []) or None
+    from gmail_client.attachments import files_to_attachments
+
+    merged = merge_draft_attachments(
+        existing_atts,
+        keep_flags,
+        files_to_attachments(uploads),
+    )
+    total = _attachment_total_bytes(merged)
+    if total > 20 * 1024 * 1024:
+        st.error(
+            f"Attachments total {_fmt_size(total)} — keep under 20 MB for Gmail."
+        )
+        return
+    atts = _attachments_for_send(merged) or None
     saved = save_gmail_draft(
         gid,
         new_to,
@@ -662,6 +680,14 @@ def _render_gmail_edit_tab(
         st.error("Gmail save did not round-trip:\n\n" + "\n\n".join(issues))
         return
 
+    draft["attachments"] = _attachments_for_storage(merged)
+    try:
+        from core import drive_db
+
+        drive_db.save_draft(draft.get("draft_id") or f"gmail:{gid}", draft)
+    except Exception:
+        pass
+
     _clear_gmail_edit_keys(gid)
     if send_clicked:
         result = send_draft(gid)
@@ -677,7 +703,10 @@ def _render_gmail_edit_tab(
             st.session_state.opened_draft_id = ""
         st.rerun()
 
-    st.success("Saved to Gmail")
+    st.success(
+        "Saved to Gmail"
+        + (f" · {len(merged)} attachment(s)" if merged else "")
+    )
     st.rerun()
 
 
@@ -698,6 +727,7 @@ def _clear_gmail_edit_keys(gid: str) -> None:
         f"sig_save_{gid}",
         f"sig_cancel_{gid}",
         f"sig_editing_{gid}",
+        f"att_{gid}",
     )
     for k in list(st.session_state.keys()):
         sk = str(k)
@@ -740,33 +770,9 @@ def _render_edit_tab(
         key=f"{k}_quill",
     )
 
-    existing = list(draft.get("attachments") or [])
-    keep_flags: list[bool] = []
-    if existing:
-        st.markdown("**Current attachments**")
-        for i, att in enumerate(existing):
-            if not isinstance(att, dict):
-                keep_flags.append(False)
-                continue
-            label = (
-                f"{att.get('name') or att.get('filename') or 'file'} "
-                f"({_fmt_size(att.get('size'))})"
-            )
-            keep_flags.append(
-                st.checkbox(
-                    label,
-                    value=True,
-                    key=f"{k}_keep_att_{i}_{att.get('name') or i}",
-                )
-            )
-    else:
-        st.caption("No files attached yet.")
-
-    uploads = st.file_uploader(
-        "Attach files",
-        accept_multiple_files=True,
-        key=f"{k}_upload",
-        help="PDF, Word, Excel, images, etc. Included when you save / send.",
+    existing, keep_flags, uploads = _render_attachment_editor(
+        draft.get("attachments") or [],
+        key=f"{k}_att",
     )
 
     c1, c2 = st.columns(2)
@@ -782,16 +788,10 @@ def _render_edit_tab(
     if not save:
         return
 
-    kept = [a for a, keep in zip(existing, keep_flags) if keep and isinstance(a, dict)]
-    new_atts = files_to_attachments(list(uploads) if uploads else [])
-    # Dedupe by filename — new uploads replace same-named existing
-    by_name: dict[str, dict] = {}
-    for a in kept:
-        by_name[str(a.get("name") or a.get("filename") or "").lower()] = a
-    for a in new_atts:
-        by_name[str(a.get("name") or "").lower()] = a
-    merged = list(by_name.values())
-    total = sum(int(a.get("size") or 0) for a in merged)
+    kept_merged = merge_draft_attachments(
+        existing, keep_flags, files_to_attachments(uploads)
+    )
+    total = _attachment_total_bytes(kept_merged)
     if total > 20 * 1024 * 1024:
         st.error(
             f"Attachments total {_fmt_size(total)} — keep under 20 MB for Gmail."
@@ -823,7 +823,7 @@ def _render_edit_tab(
     draft["body_html"] = html
     draft["tracking_id"] = new_tid
     draft["has_open_pixel"] = False
-    draft["attachments"] = _attachments_for_storage(merged)
+    draft["attachments"] = _attachments_for_storage(kept_merged)
 
     did = draft.get("draft_id")
     if did:
@@ -844,7 +844,7 @@ def _render_edit_tab(
                 gmail_id,
                 draft,
                 html,
-                attachments=_attachments_for_send(merged) or None,
+                attachments=_attachments_for_send(kept_merged) or None,
                 subject=subject,
             )
         except Exception as e:
@@ -852,7 +852,7 @@ def _render_edit_tab(
 
     st.success(
         f"Saved · tracking `{str(new_tid)[:8]}…` · "
-        f"{len(merged)} attachment(s)"
+        f"{len(kept_merged)} attachment(s)"
     )
     st.markdown(html, unsafe_allow_html=True)
     st.rerun()
@@ -913,6 +913,62 @@ def _fmt_size(n: Any) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n / (1024 * 1024):.1f} MB"
+
+
+def merge_draft_attachments(
+    existing: list[Any],
+    keep_flags: list[bool],
+    new_atts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep checked files; new uploads replace the same filename."""
+    kept = [
+        a
+        for a, keep in zip(existing, keep_flags)
+        if keep and isinstance(a, dict)
+    ]
+    by_name: dict[str, dict[str, Any]] = {}
+    for a in kept:
+        by_name[str(a.get("name") or a.get("filename") or "").lower()] = a
+    for a in new_atts or []:
+        if not isinstance(a, dict):
+            continue
+        by_name[str(a.get("name") or a.get("filename") or "").lower()] = a
+    return [a for k, a in by_name.items() if k]
+
+
+def _attachment_total_bytes(atts: list[dict[str, Any]]) -> int:
+    return sum(int(a.get("size") or 0) for a in atts if isinstance(a, dict))
+
+
+def _render_attachment_editor(
+    existing: list[Any], *, key: str
+) -> tuple[list[dict[str, Any]], list[bool], list[Any]]:
+    """Checkboxes for current files plus a multi-file uploader."""
+    rows = [a for a in (existing or []) if isinstance(a, dict)]
+    keep_flags: list[bool] = []
+    if rows:
+        st.markdown("**Attachments**")
+        for i, att in enumerate(rows):
+            label = (
+                f"{att.get('name') or att.get('filename') or 'file'} "
+                f"({_fmt_size(att.get('size'))})"
+            )
+            keep_flags.append(
+                st.checkbox(
+                    label,
+                    value=True,
+                    key=f"{key}_keep_{i}_{att.get('name') or i}",
+                )
+            )
+    else:
+        st.caption("No files attached yet.")
+    uploads = st.file_uploader(
+        "Attach files",
+        accept_multiple_files=True,
+        key=f"{key}_upload",
+        help="PDF, Word, Excel, images, etc. Included when you save / send.",
+    )
+    return rows, keep_flags, list(uploads) if uploads else []
 
 
 def _attachments_for_storage(atts: list[dict[str, Any]]) -> list[dict[str, Any]]:

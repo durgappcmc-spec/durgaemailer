@@ -64,6 +64,10 @@ def _decode_b64url(data: str) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _decode_b64url_bytes(data: str) -> bytes:
+    return base64.urlsafe_b64decode((data or "") + "==")
+
+
 def _mime_base(part: dict) -> str:
     mime = (part.get("mimeType") or "").split(";")[0].strip().lower()
     if mime:
@@ -147,6 +151,115 @@ def _decode_part_text(part: dict, *, msg_id: str = "") -> str:
     except Exception as e:
         print(f"[gmail] part body fetch failed: {e}", file=sys.stderr)
         return ""
+
+
+def _decode_part_bytes(part: dict, *, msg_id: str = "") -> bytes:
+    body = part.get("body") or {}
+    data = body.get("data")
+    if data:
+        try:
+            return _decode_b64url_bytes(data)
+        except Exception:
+            return b""
+    att_id = body.get("attachmentId") or ""
+    if not att_id or not msg_id:
+        return b""
+    try:
+        svc = gmail_service()
+        att = (
+            svc.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=msg_id, id=att_id)
+            .execute()
+        )
+        return _decode_b64url_bytes(att.get("data") or "")
+    except Exception as e:
+        print(f"[gmail] attachment fetch failed: {e}", file=sys.stderr)
+        return b""
+
+
+def extract_gmail_attachments(
+    payload: dict, *, msg_id: str = "", max_bytes: int = 20 * 1024 * 1024
+) -> list[dict[str, Any]]:
+    """File parts from a Gmail payload (skips text/html and text/plain bodies)."""
+    out: list[dict[str, Any]] = []
+    skip_mime = {
+        "",
+        "text/html",
+        "text/plain",
+        "multipart/alternative",
+        "multipart/mixed",
+        "multipart/related",
+        "multipart/signed",
+    }
+
+    def walk(part: dict) -> None:
+        if not isinstance(part, dict):
+            return
+        mime = _mime_base(part)
+        filename = str(part.get("filename") or "").strip()
+        headers = {
+            str(h.get("name") or "").lower(): str(h.get("value") or "")
+            for h in (part.get("headers") or [])
+            if isinstance(h, dict)
+        }
+        disp = headers.get("content-disposition") or ""
+        is_file = bool(filename) or "attachment" in disp.lower()
+        if is_file and mime not in skip_mime:
+            size_hint = int((part.get("body") or {}).get("size") or 0)
+            if size_hint and size_hint > max_bytes:
+                print(
+                    f"[gmail] skip attachment {filename or mime}: {size_hint} bytes",
+                    file=sys.stderr,
+                )
+            else:
+                blob = _decode_part_bytes(part, msg_id=msg_id)
+                if blob and len(blob) <= max_bytes:
+                    name = filename or "file"
+                    out.append(
+                        {
+                            "name": name,
+                            "filename": name,
+                            "mime_type": mime or "application/octet-stream",
+                            "mimeType": mime or "application/octet-stream",
+                            "size": len(blob),
+                            "data_base64": base64.b64encode(blob).decode("ascii"),
+                        }
+                    )
+        for child in part.get("parts") or []:
+            walk(child)
+
+    walk(payload or {})
+    return out
+
+
+def _atts_for_gmail_mime(atts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """{name, data, mime_type} rows for _build_raw_message."""
+    out: list[dict[str, Any]] = []
+    for a in atts or []:
+        if not isinstance(a, dict):
+            continue
+        data = a.get("data")
+        if not data and a.get("data_base64"):
+            try:
+                data = base64.b64decode(a["data_base64"])
+            except Exception:
+                data = None
+        if not data:
+            continue
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        out.append(
+            {
+                "name": a.get("name") or a.get("filename") or "file",
+                "data": data,
+                "mime_type": a.get("mime_type")
+                or a.get("mimeType")
+                or "application/octet-stream",
+            }
+        )
+    return out
 
 
 def _extract_plain_body(payload: dict, *, msg_id: str = "") -> str:
@@ -243,6 +356,7 @@ def _defer_open_pixel(
     bcc: str = "",
     subject: str = "",
     from_email: str = "",
+    attachments: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Strip live open pixels from draft HTML; persist to Gmail when we have a draft id."""
     html = body_html or ""
@@ -263,7 +377,14 @@ def _defer_open_pixel(
     if did:
         try:
             saved = save_gmail_draft(
-                did, to, cc, bcc, subject, clean, from_email=from_email or None
+                did,
+                to,
+                cc,
+                bcc,
+                subject,
+                clean,
+                from_email=from_email or None,
+                attachments=_atts_for_gmail_mime(attachments) or None,
             )
             if saved.get("error"):
                 print(f"[gmail] strip draft pixel failed: {saved.get('error')}", file=sys.stderr)
@@ -310,6 +431,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
     }
     body_html = _extract_html_body(payload, msg_id=mid)
     body_text = _extract_plain_body(payload, msg_id=mid)
+    att_payload = payload
     if _bodies_are_blank(body_html, body_text) and mid:
         try:
             svc = gmail_service()
@@ -320,6 +442,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
                 .execute()
             )
             payload2 = msg2.get("payload") or {}
+            att_payload = payload2 or payload
             body_html = _extract_html_body(payload2, msg_id=mid)
             body_text = _extract_plain_body(payload2, msg_id=mid)
             if not headers:
@@ -356,6 +479,9 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         elif snip:
             body_html = f"<p>{_html.escape(snip)}</p>"
             body_text = snip
+    attachments = extract_gmail_attachments(att_payload, msg_id=mid)
+    if not attachments and att_payload is not payload:
+        attachments = extract_gmail_attachments(payload, msg_id=mid)
     body_html = _defer_open_pixel(
         body_html,
         draft_id=did,
@@ -364,6 +490,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         bcc=headers.get("bcc", ""),
         subject=headers.get("subject", ""),
         from_email=headers.get("from", ""),
+        attachments=attachments,
     )
     return {
         "id": did,
@@ -380,6 +507,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         "source": "gmail_fetch",
         "gmail_draft_id": did,
         "draft_id": f"gmail:{did}",
+        "attachments": attachments,
     }
 
 
@@ -460,6 +588,7 @@ def fetch_gmail_message(message_id: str) -> dict[str, Any]:
         "gmail_draft_id": "",
         "gmail_message_id": mid,
         "draft_id": f"gmail-msg:{mid}",
+        "attachments": extract_gmail_attachments(payload, msg_id=mid),
     }
 
 

@@ -53,3 +53,27 @@ def test_attachment_cap(monkeypatch):
         jitter_seconds=(0, 0),
     )
     assert results[0].get("error") and "25" in results[0]["error"]
+
+
+def test_merge_draft_attachments_keeps_and_replaces():
+    from components.draft_inspector import merge_draft_attachments
+
+    existing = [
+        {"name": "a.pdf", "data_base64": "YQ==", "size": 1},
+        {"name": "b.pdf", "data_base64": "Yg==", "size": 1},
+    ]
+    merged = merge_draft_attachments(
+        existing,
+        [True, False],
+        [{"name": "c.pdf", "data_base64": "Yw==", "size": 1}],
+    )
+    names = [a["name"] for a in merged]
+    assert names == ["a.pdf", "c.pdf"]
+    replaced = merge_draft_attachments(
+        existing,
+        [True, True],
+        [{"name": "a.pdf", "data_base64": "eg==", "size": 1}],
+    )
+    by = {a["name"]: a["data_base64"] for a in replaced}
+    assert by["a.pdf"] == "eg=="
+    assert by["b.pdf"] == "Yg=="
