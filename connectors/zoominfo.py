@@ -2070,6 +2070,7 @@ _COMPANY_ALIASES: dict[str, list[str]] = {
     "sterlite technologies": ["Sterlite Technologies", "Sterlite Technologies Limited"],
     "sterlite": ["Sterlite Technologies", "Sterlite Technologies Limited"],
     "room to read": ["Room to Read", "Room to Read India"],
+    "room to read india": ["Room To Read India", "Room to Read India"],
     "learning links": ["Learning Links Foundation", "Learning Links"],
     "learning links foundation": ["Learning Links Foundation"],
 }
@@ -2081,6 +2082,7 @@ _COMPANY_DOMAINS: dict[str, list[str]] = {
     "sterlite technologies": ["sterlitetech.com", "stl.tech"],
     "sterlite": ["sterlitetech.com", "stl.tech"],
     "room to read": ["roomtoread.org"],
+    "room to read india": ["roomtoreadindia.org"],
     "learning links": ["learninglinksindia.org"],
     "learning links foundation": ["learninglinksindia.org"],
 }
@@ -2136,7 +2138,11 @@ def _rank_companies_for_query(
 ) -> list[dict[str, Any]]:
     """Prefer firms whose name matches the user query (Sterlite Technologies > noise)."""
     needle_n = re.sub(r"[^a-z0-9]+", " ", (needle or "").lower()).strip()
-    tokens = [t for t in needle_n.split() if len(t) >= 4]
+    tokens = [
+        t
+        for t in needle_n.split()
+        if len(t) >= 4 and t not in _GEO_NAME_TOKENS
+    ]
     extra_domains = [
         re.sub(r"^www\.", "", str(d or "").strip().lower())
         for d in (domains or [])
@@ -2215,10 +2221,38 @@ def _rank_companies_for_query(
     return ranked
 
 
+_GEO_NAME_TOKENS = frozenset(
+    {
+        "india",
+        "indian",
+        "usa",
+        "america",
+        "american",
+        "uk",
+        "britain",
+        "british",
+        "england",
+        "singapore",
+        "bangladesh",
+        "australia",
+        "australian",
+    }
+)
+
+
+def _location_blob(query: dict[str, Any]) -> str:
+    """Location text only — never company names like 'Room to Read India'."""
+    parts = [
+        _join(query.get("locations") or ""),
+        str(query.get("country") or ""),
+    ]
+    return " ".join(p for p in parts if p).lower()
+
+
 def _guess_country(query: dict[str, Any]) -> str:
     if query.get("country"):
         return str(query["country"]).strip()
-    blob = _query_blob(query)
+    blob = _location_blob(query)
     for city in _CITY_ZIPS:
         if re.search(rf"\b{re.escape(city)}\b", blob):
             return "India"
@@ -2231,7 +2265,7 @@ def _geo_filters(query: dict[str, Any]) -> dict[str, str]:
     """Map free-text locations to ZoomInfo-accepted geo fields.
 
     ZoomInfo rejects `location` and `city` on this tenant; use country / zipCode /
-    US-Canada state instead.
+    US-Canada state instead. Company names must not be treated as places.
     """
     out: dict[str, str] = {}
     locs = []
@@ -2240,7 +2274,7 @@ def _geo_filters(query: dict[str, Any]) -> dict[str, str]:
         locs = [str(x).strip() for x in raw if str(x).strip()]
     elif raw:
         locs = [str(raw).strip()]
-    blob = " ".join(locs).lower() + " " + _query_blob(query)
+    blob = " ".join(locs).lower() + " " + _location_blob(query)
 
     zips: list[str] = []
     for city, z in _CITY_ZIPS.items():
@@ -2337,7 +2371,8 @@ def _build_contact_search_body(query: dict[str, Any], limit: int = 10) -> dict[s
     industries = _join(query.get("industries") or "")
     if industries:
         body["industryKeywords"] = industries
-    elif _is_nonprofit_query(query):
+    elif _is_nonprofit_query(query) and not names:
+        # Generic NGO hunt only — a named org must not AND industryKeywords
         body.setdefault("industryKeywords", "Nonprofit")
 
     if query.get("seniorities"):

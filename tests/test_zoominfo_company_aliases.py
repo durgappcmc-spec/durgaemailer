@@ -122,6 +122,44 @@ def test_rank_prefers_learning_links_foundation_india():
     assert ranked[0]["id"] == "2"
 
 
+def test_room_to_read_india_not_treated_as_geo_or_wrong_firm():
+    from connectors.zoominfo import (
+        _build_contact_search_body,
+        _geo_filters,
+        _guess_country,
+        _with_company_name_aliases,
+    )
+
+    q = {"company_names": ["Room to Read India"]}
+    assert _guess_country(q) == ""
+    assert "country" not in _geo_filters(q)
+    body = _build_contact_search_body(q, limit=5)
+    assert body.get("companyName")
+    assert "industryKeywords" not in body
+    assert "country" not in body
+    aliased = _with_company_name_aliases(q)
+    assert "roomtoreadindia.org" in [d.lower() for d in aliased.get("company_domains") or []]
+
+    firms = [
+        {
+            "id": "azad",
+            "name": "Azad Reading Room - India",
+            "website": "www.azadreadingroom.info",
+            "country": "India",
+        },
+        {
+            "id": "rtr",
+            "name": "Room To Read India",
+            "website": "www.roomtoreadindia.org",
+        },
+    ]
+    ranked = _rank_companies_for_query(
+        firms, "Room to Read India", domains=["roomtoreadindia.org"]
+    )
+    assert ranked[0]["id"] == "rtr"
+    assert all("azad" not in (c.get("name") or "").lower() for c in ranked)
+
+
 def test_fields_without_invalid_strips_disallowed():
     from connectors.zoominfo import _fields_without_invalid
 

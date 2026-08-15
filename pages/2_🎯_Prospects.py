@@ -462,11 +462,11 @@ with tab_saved:
 with tab_search:
     with st.form("prospect_search"):
         c1, c2 = st.columns(2)
-        titles = c1.text_input("Titles (comma-separated)", "VP Marketing, CMO")
+        titles = c1.text_input("Titles (comma-separated)", "")
         companies = c2.text_input("Companies", "")
         domains = c1.text_input("Company domains", "")
         locations = c2.text_input("Locations", "")
-        seniorities = c1.text_input("Seniorities", "vp, director, c_suite")
+        seniorities = c1.text_input("Seniorities", "")
         keywords = c2.text_input("Keywords", "")
         st.caption("Provider: **ZoomInfo** only")
         limit = st.slider("Limit", 5, 100, 50)
