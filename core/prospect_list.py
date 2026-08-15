@@ -391,6 +391,20 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
         return changed
 
 
+def delete_prospects(keys: list[str] | set[str] | tuple[str, ...]) -> int:
+    """Remove saved contacts by identity key. Returns how many were dropped."""
+    drop = {str(k).strip() for k in (keys or []) if str(k).strip()}
+    if not drop:
+        return 0
+    with _LOCK:
+        rows = [p for p in _load() if isinstance(p, dict)]
+        keep = [p for p in rows if _prospect_key(p) not in drop]
+        removed = len(rows) - len(keep)
+        if removed:
+            _persist(keep)
+        return removed
+
+
 def save_prospects_to_drive(prospects: list[dict[str, Any]]) -> dict[str, Any]:
     """Explicit ZoomInfo/search save with status for Chat UI."""
     n = save_prospects(prospects)

@@ -1,5 +1,7 @@
 # NOTE: Reject marketplace emails polluted onto a company search.
 from core.prospect_list import (
+    _prospect_key,
+    delete_prospects,
     email_blocked_for_company_search,
     filter_prospects_for_company_query,
     prospect_fits_company_query,
@@ -27,3 +29,40 @@ def test_real_sterlite_email_kept():
     }
     assert prospect_fits_company_query(good, ["sterlite tech"])
     assert not email_blocked_for_company_search(good["email"])
+
+
+def test_delete_prospects_drops_selected_keys(monkeypatch):
+    rows = [
+        {"name": "Ann", "email": "ann@acme.com", "company": "Acme"},
+        {"name": "Bob", "email": "bob@acme.com", "company": "Acme"},
+        {"name": "Cara", "email": "cara@beta.com", "company": "Beta"},
+    ]
+    store = {"rows": list(rows)}
+
+    monkeypatch.setattr(
+        "core.prospect_list._load", lambda: store["rows"]
+    )
+
+    def fake_persist(new_rows):
+        store["rows"] = list(new_rows)
+        return True
+
+    monkeypatch.setattr("core.prospect_list._persist", fake_persist)
+    n = delete_prospects(
+        [_prospect_key(rows[0]), _prospect_key(rows[2])]
+    )
+    assert n == 2
+    assert [r["email"] for r in store["rows"]] == ["bob@acme.com"]
+
+
+def test_delete_prospects_empty_is_noop(monkeypatch):
+    store = {"rows": [{"name": "Ann", "email": "ann@acme.com"}]}
+    monkeypatch.setattr("core.prospect_list._load", lambda: store["rows"])
+    monkeypatch.setattr(
+        "core.prospect_list._persist",
+        lambda _rows: (_ for _ in ()).throw(AssertionError("persist")),
+    )
+    assert delete_prospects([]) == 0
+    assert delete_prospects(["", "  "]) == 0
+    assert store["rows"][0]["email"] == "ann@acme.com"
+

@@ -1,6 +1,8 @@
 # NOTE: Search / Enrich / Saved list — saved contacts persist via prospect_list + Drive.
 from __future__ import annotations
 
+import hashlib
+
 import streamlit as st
 
 from config import APP_NAME
@@ -9,13 +11,42 @@ from connectors.prospects import enrich_fallthrough, search_all
 from core.auth_ui import logout_button, require_login
 from core.auto_sync import auto_ingest_prospects, ensure_session_sync
 from core.prospect_list import (
+    _prospect_key,
     all_prospects,
+    delete_prospects,
     reload_from_drive,
     repair_saved_prospects,
     save_prospects,
-    search_saved,
     visible_prospects,
 )
+
+
+def _sel_key(pkey: str) -> str:
+    digest = hashlib.md5(pkey.encode("utf-8")).hexdigest()[:16]
+    return f"psel_{digest}"
+
+
+def _on_toggle_saved(pkey: str) -> None:
+    bag = set(st.session_state.get("prospect_selected_keys") or [])
+    if st.session_state.get(_sel_key(pkey)):
+        bag.add(pkey)
+    else:
+        bag.discard(pkey)
+    st.session_state.prospect_selected_keys = bag
+
+
+def _apply_saved_selection(keys: list[str], *, selected: bool) -> None:
+    bag = set(st.session_state.get("prospect_selected_keys") or [])
+    for pkey in keys:
+        if not pkey:
+            continue
+        st.session_state[_sel_key(pkey)] = selected
+        if selected:
+            bag.add(pkey)
+        else:
+            bag.discard(pkey)
+    st.session_state.prospect_selected_keys = bag
+
 
 st.set_page_config(page_title=f"Prospects · {APP_NAME}", page_icon="🎯", layout="wide")
 if not require_login():
@@ -23,10 +54,14 @@ if not require_login():
 logout_button()
 
 # Persist Chat ZoomInfo hits into Saved on every visit (idempotent merge).
+_tomb = set(st.session_state.get("prospect_deleted_keys") or [])
 _session_hits = [
     p
     for p in (st.session_state.get("last_prospects") or [])
-    if p and not p.get("error") and not p.get("research_only")
+    if p
+    and not p.get("error")
+    and not p.get("research_only")
+    and _prospect_key(p) not in _tomb
 ]
 if _session_hits:
     try:
@@ -100,7 +135,13 @@ except Exception:
 n_saved = 0
 try:
     n_saved = len(
-        visible_prospects(session_prospects=st.session_state.get("last_prospects"))
+        visible_prospects(
+            session_prospects=[
+                p
+                for p in (st.session_state.get("last_prospects") or [])
+                if _prospect_key(p) not in _tomb
+            ]
+        )
     )
 except Exception:
     try:
@@ -115,7 +156,9 @@ elif st.session_state.get("_prospects_restored_n") == 0:
 tab_saved, tab_search, tab_enrich = st.tabs(["Saved", "Search", "Enrich"])
 
 with tab_saved:
-    st.caption("Contacts saved from ZoomInfo / Chat / Enrich — search and export anytime.")
+    st.caption(
+        "Contacts saved from ZoomInfo / Chat / Enrich — search, select, and export anytime."
+    )
     c1, c2, c3 = st.columns([2, 2, 1])
     q_name = c1.text_input("Search by name / email / title", key="saved_name")
     q_org = c2.text_input("Search by organisation", key="saved_org")
@@ -126,7 +169,9 @@ with tab_saved:
             hits = [
                 p
                 for p in (st.session_state.get("last_prospects") or [])
-                if p and not p.get("error")
+                if p
+                and not p.get("error")
+                and _prospect_key(p) not in _tomb
             ]
             if hits:
                 save_prospects(hits)
@@ -136,11 +181,14 @@ with tab_saved:
         st.rerun()
 
     try:
+        session_for_saved = [
+            p
+            for p in (st.session_state.get("last_prospects") or [])
+            if _prospect_key(p) not in _tomb
+        ]
         if (q_name or "").strip() or (q_org or "").strip():
             # Filter the union of durable + session so Chat hits aren't hidden
-            saved_rows = visible_prospects(
-                session_prospects=st.session_state.get("last_prospects")
-            )
+            saved_rows = visible_prospects(session_prospects=session_for_saved)
             name_n = (q_name or "").strip().lower()
             org_n = (q_org or "").strip().lower()
             filtered = []
@@ -160,9 +208,7 @@ with tab_saved:
                 filtered.append(p)
             saved_rows = filtered
         else:
-            saved_rows = visible_prospects(
-                session_prospects=st.session_state.get("last_prospects")
-            )
+            saved_rows = visible_prospects(session_prospects=session_for_saved)
     except Exception as e:
         saved_rows = []
         st.warning(f"Could not load saved contacts: {e}")
@@ -219,25 +265,168 @@ with tab_saved:
         if not real_rows and placeholders:
             pass  # warning already shown
         else:
-            df_saved = prospects_to_dataframe(saved_rows)
-            # Prefer stable column order; drop empty-only cols for readability
-            show_cols = [
-                c
-                for c in [
-                    "name",
-                    "title",
-                    "company",
-                    "email",
-                    "phone",
-                    "mobile",
-                    "linkedin_url",
-                    "location",
-                    "source",
-                ]
-                if c in df_saved.columns
-            ]
-            st.dataframe(df_saved[show_cols] if show_cols else df_saved, use_container_width=True)
+            if "prospect_selected_keys" not in st.session_state:
+                st.session_state.prospect_selected_keys = set()
+            if "saved_prospects_page" not in st.session_state:
+                st.session_state.saved_prospects_page = 1
 
+            tomb = set(st.session_state.get("prospect_deleted_keys") or [])
+            if tomb:
+                saved_rows = [
+                    p for p in saved_rows if _prospect_key(p) not in tomb
+                ]
+
+            page_size = 20
+            total = len(saved_rows)
+            filter_sig = f"{(q_name or '').strip()}|{(q_org or '').strip()}|{total}"
+            if st.session_state.get("_saved_filter_sig") != filter_sig:
+                st.session_state._saved_filter_sig = filter_sig
+                st.session_state.saved_prospects_page = 1
+            total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+            page = max(
+                1,
+                min(int(st.session_state.saved_prospects_page or 1), total_pages),
+            )
+            st.session_state.saved_prospects_page = page
+            start = (page - 1) * page_size
+            page_rows = saved_rows[start : start + page_size]
+            shown_end = min(start + page_size, total) if total else 0
+
+            cap_l, cap_r = st.columns([3, 1])
+            cap_l.caption(
+                f"{total} contacts · showing {start + 1 if total else 0}–{shown_end} "
+                f"· page {page} of {total_pages}"
+            )
+            if cap_r.button(
+                "Next →",
+                disabled=page >= total_pages or not total,
+                key="saved_next_top",
+            ):
+                st.session_state.saved_prospects_page = page + 1
+                st.rerun()
+
+            page_keys = [_prospect_key(p) for p in page_rows]
+            all_keys = [_prospect_key(p) for p in saved_rows]
+            n_sel = len(st.session_state.prospect_selected_keys)
+
+            sel_c1, sel_c2, sel_c3, sel_c4 = st.columns([1.15, 1.35, 1.15, 2.3])
+            if sel_c1.button(
+                "☑ Select page",
+                help="Select every contact on this page",
+                key="saved_sel_page",
+            ):
+                _apply_saved_selection(page_keys, selected=True)
+                st.rerun()
+            if sel_c2.button(
+                f"☑ Select all {total}" if total else "☑ Select all",
+                help="Select every contact matching the current filters",
+                disabled=not all_keys,
+                key="saved_sel_all",
+            ):
+                _apply_saved_selection(all_keys, selected=True)
+                st.rerun()
+            if sel_c3.button("☐ Clear selection", key="saved_sel_clear"):
+                _apply_saved_selection(
+                    list(st.session_state.prospect_selected_keys) + page_keys,
+                    selected=False,
+                )
+                st.session_state.prospect_selected_keys = set()
+                st.rerun()
+            sel_c4.caption(
+                f"**{n_sel}** selected" + (f" of {total}" if total else "")
+            )
+
+            remove_clicked = st.button(
+                "🗑 Remove selected",
+                key="saved_remove_selected",
+            )
+            action_keys = list(st.session_state.prospect_selected_keys)
+            if remove_clicked:
+                if not action_keys:
+                    st.warning("Select one or more contacts first.")
+                else:
+                    drop = set(action_keys)
+                    try:
+                        n_del = delete_prospects(drop)
+                    except Exception as e:
+                        n_del = 0
+                        st.warning(f"Could not delete contacts: {e}")
+                    bag = set(st.session_state.get("prospect_selected_keys") or [])
+                    tomb = set(st.session_state.get("prospect_deleted_keys") or [])
+                    tomb |= drop
+                    bag -= drop
+                    st.session_state.prospect_deleted_keys = tomb
+                    st.session_state.prospect_selected_keys = bag
+                    for pkey in drop:
+                        st.session_state.pop(_sel_key(pkey), None)
+                    remaining = [
+                        p
+                        for p in (st.session_state.get("last_prospects") or [])
+                        if _prospect_key(p) not in drop
+                    ]
+                    st.session_state.last_prospects = remaining
+                    try:
+                        from core import durable_store
+
+                        durable_store.save_session_extras(prospects=remaining)
+                    except Exception:
+                        pass
+                    st.success(f"Removed **{n_del}** contact(s) from Saved.")
+                    st.rerun()
+
+            h = st.columns([0.45, 1.6, 1.4, 1.6, 2.0, 1.2])
+            h[0].markdown("**☐**")
+            h[1].markdown("**Name**")
+            h[2].markdown("**Title**")
+            h[3].markdown("**Company**")
+            h[4].markdown("**Email**")
+            h[5].markdown("**Source**")
+
+            for i, p in enumerate(page_rows):
+                pkey = page_keys[i]
+                cols = st.columns([0.45, 1.6, 1.4, 1.6, 2.0, 1.2])
+                with cols[0]:
+                    ck = _sel_key(pkey)
+                    if ck not in st.session_state:
+                        st.session_state[ck] = (
+                            pkey in st.session_state.prospect_selected_keys
+                        )
+                    st.checkbox(
+                        "select",
+                        key=ck,
+                        on_change=_on_toggle_saved,
+                        args=(pkey,),
+                        label_visibility="collapsed",
+                    )
+                cols[1].write((p.get("name") or "—") or "—")
+                cols[2].write((p.get("title") or "—") or "—")
+                cols[3].write((p.get("company") or p.get("organization") or "—") or "—")
+                cols[4].write((p.get("email") or "—") or "—")
+                cols[5].write((p.get("source") or "—") or "—")
+
+            nav_l, nav_m, nav_r = st.columns([1, 2, 1])
+            if nav_l.button(
+                "← Previous",
+                disabled=page <= 1,
+                key="saved_prev_bottom",
+            ):
+                st.session_state.saved_prospects_page = page - 1
+                st.rerun()
+            nav_m.markdown(
+                f"<p style='text-align:center;margin:0.45rem 0 0 0'>"
+                f"Page {page} of {total_pages}</p>",
+                unsafe_allow_html=True,
+            )
+            if nav_r.button(
+                "Next →",
+                type="primary",
+                disabled=page >= total_pages or not total,
+                key="saved_next_bottom",
+            ):
+                st.session_state.saved_prospects_page = page + 1
+                st.rerun()
+
+            df_saved = prospects_to_dataframe(saved_rows)
             fname = "saved_prospects.csv"
             if (q_name or q_org or "").strip():
                 fname = "saved_prospects_filtered.csv"
