@@ -1116,36 +1116,25 @@ def _send_draft_now(draft: dict[str, Any], *, rebuild: bool = True) -> dict[str,
 
     send_atts = _attachments_for_send(draft.get("attachments") or [])
 
-    if gmail_id and (not rebuild or not send_atts):
+    if gmail_id:
+        # Persist UI files first if needed; send_gmail_draft injects tracking
+        # without dropping Gmail attachment parts.
+        if rebuild and send_atts:
+            try:
+                from gmail_client.drafts import _update_draft_html
+
+                _update_draft_html(
+                    gmail_id,
+                    draft,
+                    draft.get("body_html") or "",
+                    attachments=send_atts,
+                    subject=draft.get("subject") or "",
+                )
+            except Exception:
+                pass
         from gmail_client.drafts import send_draft
 
         return send_draft(gmail_id)
-
-    # If we have attachments to add, refresh Gmail MIME first then send
-    if gmail_id and send_atts:
-        try:
-            from gmail_client.drafts import _update_draft_html, send_gmail_draft
-            from core.tracking import inject_tracking
-
-            html, tid = inject_tracking(
-                draft.get("body_html") or "",
-                tracking_id=draft.get("tracking_id") or None,
-                recipient_email=draft.get("to") or draft.get("recipient") or "",
-                subject=draft.get("subject") or "",
-                register=True,
-            )
-            _update_draft_html(
-                gmail_id,
-                draft,
-                html,
-                attachments=send_atts,
-                subject=draft.get("subject") or "",
-            )
-            draft["body_html"] = html
-            draft["tracking_id"] = tid
-            return send_gmail_draft(gmail_id)
-        except Exception:
-            pass
 
     from gmail_client.send import send_email
     from core.tracking import inject_tracking

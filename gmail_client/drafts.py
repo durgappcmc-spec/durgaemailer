@@ -919,7 +919,119 @@ def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
         or "/.netlify/functions/open" in (body_html or "")
         or "/t/o/" in (body_html or ""),
         "from": headers.get("from") or "",
+        "attachments": fetched.get("attachments") or [],
     }
+
+
+def _replace_html_in_rfc822(raw_b64: str, new_html: str) -> str:
+    """Swap the body text/html part; leave attachment siblings untouched."""
+    if not raw_b64 or new_html is None:
+        return ""
+    try:
+        from email import policy
+        from email.parser import BytesParser
+        from email.policy import SMTP
+    except Exception:
+        return ""
+    try:
+        blob = base64.urlsafe_b64decode((raw_b64 or "") + "==")
+        msg = BytesParser(policy=policy.default).parsebytes(blob)
+        replaced = False
+        for part in msg.walk():
+            if part.get_content_type() != "text/html":
+                continue
+            if part.get_filename():
+                continue
+            if (part.get_content_disposition() or "").lower() == "attachment":
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                part.set_content(new_html, subtype="html", charset=charset)
+            except Exception:
+                if "Content-Transfer-Encoding" in part:
+                    del part["Content-Transfer-Encoding"]
+                part.set_payload(new_html.encode(charset, errors="replace"))
+                try:
+                    part.set_charset(charset)
+                except Exception:
+                    pass
+            replaced = True
+            break
+        if not replaced:
+            return ""
+        out = msg.as_bytes(policy=SMTP)
+        return base64.urlsafe_b64encode(out).decode("ascii").rstrip("=")
+    except Exception as e:
+        print(f"[gmail] replace html in rfc822 failed: {e}", file=sys.stderr)
+        return ""
+
+
+def _load_gmail_attachments(gmail_draft_id: str) -> list[dict[str, Any]]:
+    """File parts currently on the Gmail draft, ready for MIME rebuild."""
+    did = (gmail_draft_id or "").removeprefix("gmail:")
+    if not did:
+        return []
+    try:
+        svc = gmail_service()
+        wrap = svc.users().drafts().get(userId="me", id=did, format="full").execute()
+        msg = wrap.get("message") or {}
+        payload = msg.get("payload") or {}
+        mid = str(msg.get("id") or "")
+        return _atts_for_gmail_mime(
+            extract_gmail_attachments(payload, msg_id=mid)
+        )
+    except Exception as e:
+        print(f"[gmail] load draft attachments failed: {e}", file=sys.stderr)
+        return []
+
+
+def _gmail_draft_hints_files(gmail_draft_id: str) -> bool:
+    did = (gmail_draft_id or "").removeprefix("gmail:")
+    if not did:
+        return False
+    try:
+        svc = gmail_service()
+        wrap = svc.users().drafts().get(userId="me", id=did, format="full").execute()
+        payload = (wrap.get("message") or {}).get("payload") or {}
+        return _payload_hints_files(payload)
+    except Exception:
+        return False
+
+
+def _attachments_for_draft_update(
+    draft: dict[str, Any] | None,
+    gmail_draft_id: str,
+) -> list[dict[str, Any]]:
+    atts = _atts_for_gmail_mime((draft or {}).get("attachments"))
+    if atts:
+        return atts
+    return _load_gmail_attachments(gmail_draft_id)
+
+
+def _patch_gmail_draft_html(gmail_draft_id: str, body_html: str) -> bool:
+    """Rewrite only the HTML part of an existing Gmail draft (keeps files)."""
+    did = (gmail_draft_id or "").removeprefix("gmail:")
+    if not did:
+        return False
+    try:
+        from gmail_client.send import put_gmail_draft_raw
+
+        svc = gmail_service()
+        wrap = svc.users().drafts().get(userId="me", id=did, format="raw").execute()
+        msg = wrap.get("message") or {}
+        new_raw = _replace_html_in_rfc822(msg.get("raw") or "", body_html)
+        if not new_raw:
+            return False
+        put_gmail_draft_raw(
+            new_raw,
+            draft_id=did,
+            thread_id=str(msg.get("threadId") or ""),
+            use_media=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[gmail] html patch before send failed: {e}", file=sys.stderr)
+        return False
 
 
 def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
@@ -943,7 +1055,17 @@ def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
             track_clicks=True,
             track_opens=True,
         )
-        _update_draft_html(did, draft, body)
+        # Prefer in-place HTML patch so Gmail file parts are not rebuilt away.
+        patched = _patch_gmail_draft_html(did, body)
+        if not patched:
+            atts = _attachments_for_draft_update(draft, did)
+            if atts or not _gmail_draft_hints_files(did):
+                _update_draft_html(did, draft, body, attachments=atts or None)
+            else:
+                print(
+                    "[gmail] skip html rewrite before send; keep existing MIME with files",
+                    file=sys.stderr,
+                )
         draft["body_html"] = body
         draft["tracking_id"] = tid
         draft["has_open_pixel"] = True
@@ -1144,14 +1266,17 @@ def _update_draft_html(
     attachments: Optional[list[dict[str, Any]]] = None,
     subject: Optional[str] = None,
 ) -> None:
-    """Replace draft MIME with tracked HTML (+ optional attachments)."""
+    """Replace draft MIME with tracked HTML. None attachments keeps existing files."""
     from gmail_client.send import _build_raw_message, put_gmail_draft_raw
 
+    atts = attachments
+    if atts is None:
+        atts = _attachments_for_draft_update(draft, gmail_draft_id)
     raw, _tid = _build_raw_message(
         to=draft.get("to") or draft.get("recipient") or "",
         subject=subject if subject is not None else (draft.get("subject") or ""),
         html_body=body_html,
-        attachments=attachments or None,
+        attachments=atts or None,
         instrument=False,
         include_signature=False,
         from_email=(draft.get("from") or None),
@@ -1162,5 +1287,5 @@ def _update_draft_html(
     put_gmail_draft_raw(
         raw,
         draft_id=gmail_draft_id,
-        use_media=bool(attachments),
+        use_media=bool(atts),
     )
