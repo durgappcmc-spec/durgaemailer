@@ -569,10 +569,26 @@ def _build_draft_jobs(
     if dirs.get("explicit_recipient_lock"):
         from_mailbox = False
         from_prospects = False
+        skip = {
+            str(dirs.get("template_from") or "").strip().lower(),
+        }
+        try:
+            from agent.intent import parse_like_sent_request
+
+            like_ref = str(
+                (parse_like_sent_request(user_msg or "") or {}).get("reference")
+                or ""
+            ).strip().lower()
+            if like_ref and "@" in like_ref:
+                skip.add(like_ref)
+        except Exception:
+            pass
+        skip.discard("")
+        ignore = {e.lower() for e in (dirs.get("ignore") or [])} | skip
         locked = [
             a
             for a in directive_to_list(dirs)
-            if a.lower() not in {e.lower() for e in (dirs.get("ignore") or [])}
+            if a.lower() not in ignore
         ]
         payload = dict(payload)
         payload.pop("from_prospects", None)
@@ -3799,8 +3815,16 @@ HTML only in html_body. No markdown. Do not include a signature block.
             locked: list[str] = []
             if recipient_lock:
                 ignore_set = {e.lower() for e in (directives.get("ignore") or [])}
+                like_skip = ""
+                if like_ref and "@" in like_ref:
+                    like_skip = like_ref.lower()
+                tf = str(directives.get("template_from") or "").strip().lower()
                 locked = [
-                    a for a in directive_to_list(directives) if a.lower() not in ignore_set
+                    a
+                    for a in directive_to_list(directives)
+                    if a.lower() not in ignore_set
+                    and a.lower() != like_skip
+                    and a.lower() != tf
                 ]
                 n_session = len(_prospects_with_email(prospects))
                 draft_debug["recipients_final"] = locked

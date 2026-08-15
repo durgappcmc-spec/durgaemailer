@@ -276,3 +276,34 @@ def test_comma_separated_sent_to_locks_only_those_addresses():
     got = [j["recipient_email"].lower() for j in jobs]
     assert got == ["shilpi@csrbox.org", "manasi@csrbox.org"]
 
+
+def test_like_sent_to_is_not_a_second_draft_recipient():
+    from agent.intent import _heuristic_plan, parse_like_sent_request
+    from agent.router import _build_draft_jobs
+
+    msg = (
+        "draft an email to chandrakant.kumbhani.ext@ambujacement.com "
+        "and cc rahul and deepti and draft email like sent to "
+        "gargi@smilefoundationindia.org and use attached file as attachment"
+    )
+    d = parse_directives(msg)
+    tos = [e.lower() for e in d["to_list"]]
+    assert tos == ["chandrakant.kumbhani.ext@ambujacement.com"]
+    assert d["template_from"].lower() == "gargi@smilefoundationindia.org"
+    assert "gargi@smilefoundationindia.org" not in tos
+    like = parse_like_sent_request(msg)
+    assert like and like["reference"].lower() == "gargi@smilefoundationindia.org"
+    plan = _heuristic_plan(msg)
+    assert [e.lower() for e in plan.to_emails] == [
+        "chandrakant.kumbhani.ext@ambujacement.com"
+    ]
+    assert plan.like_sent_to.lower() == "gargi@smilefoundationindia.org"
+    jobs = _build_draft_jobs(
+        {"subject": "Hi", "html_body": "<p>x</p>"},
+        msg,
+        plan=plan,
+    )
+    assert [j["recipient_email"].lower() for j in jobs] == [
+        "chandrakant.kumbhani.ext@ambujacement.com"
+    ]
+

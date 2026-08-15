@@ -90,6 +90,13 @@ _TEMPLATE_PATTERNS = [
         r"sent\s+to\s+(" + _EMAIL_RE.pattern + r")",
         re.I,
     ),
+    # "draft email like sent to gargi@…" (no "the one" / "email" between like and sent)
+    re.compile(
+        r"(?:like|similar(?:\s+to)?)\s+(?:the\s+)?(?:one\s+)?"
+        r"(?:that\s+(?:was\s+)?)?(?:we\s+|you\s+|i\s+)?"
+        r"sent\s+to\s+(" + _EMAIL_RE.pattern + r")",
+        re.I,
+    ),
     re.compile(
         r"same\s+style\s+as\s+sent\s+to\s+(" + _EMAIL_RE.pattern + r")",
         re.I,
@@ -189,14 +196,23 @@ def parse_directives(text: str) -> dict[str, Any]:
     to_specific: list[str] = []
     for pat in (_DEST_TO_LIST_RE, _DRAFT_TO_RE, _SEND_TO_RE, _EMAIL_ADDR_RE, _DRAFT_FOR_RE):
         for m in pat.finditer(dest_src):
+            prefix = dest_src[max(0, m.start() - 40) : m.start()].lower()
+            if re.search(
+                r"(?:like|similar|style|modeled)(?:\s+(?:the\s+)?(?:one|email|mail))?(?:\s+sent)?\s+$",
+                prefix,
+            ):
+                continue
             chunk = (m.group(1) or "").strip()
             if chunk:
                 to_specific.extend(_EMAIL_RE.findall(chunk) or [chunk])
     to_generic: list[str] = []
     for m in _TO_EMAIL_LIST_RE.finditer(dest_src):
         start = m.start()
-        prefix = dest_src[max(0, start - 24) : start].lower()
-        if re.search(r"(?:like|similar|style|modeled)\s+$", prefix):
+        prefix = dest_src[max(0, start - 40) : start].lower()
+        if re.search(
+            r"(?:like|similar|style|modeled)(?:\s+(?:the\s+)?(?:one|email|mail))?(?:\s+sent)?\s+$",
+            prefix,
+        ):
             continue
         chunk = (m.group(1) or "").strip()
         if chunk:
@@ -220,6 +236,19 @@ def parse_directives(text: str) -> dict[str, Any]:
         others = [e for e in to_final if e.lower() != tf]
         if others:
             to_final = others
+    try:
+        from agent.intent import parse_like_sent_request
+
+        like = parse_like_sent_request(msg) or {}
+        like_ref = str(like.get("reference") or "").strip().lower()
+        if like_ref and "@" in like_ref:
+            if not template_from:
+                template_from = like.get("reference") or ""
+            others = [e for e in to_final if e.lower() != like_ref]
+            if others:
+                to_final = others
+    except Exception:
+        pass
     to = to_final[0] if to_final else ""
 
     cc: list[str] = []
