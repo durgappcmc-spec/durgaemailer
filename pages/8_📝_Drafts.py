@@ -437,7 +437,6 @@ rows.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
 q = st.text_input("Search subject/recipient/designation")
 status_f = st.selectbox("Status", ["active", "all", "draft", "ready", "sent", "deleted"])
 source_f = st.selectbox("Source", ["all", "gmail", "drive", "bulk"])
-page = st.number_input("Page", min_value=1, value=1, step=1)
 page_size = 20
 
 if q:
@@ -470,11 +469,25 @@ elif source_f == "bulk":
     rows = [r for r in rows if r.get("bulk_job_id")]
 
 total = len(rows)
-start = (int(page) - 1) * page_size
+if "drafts_page" not in st.session_state:
+    st.session_state.drafts_page = 1
+filt_key = f"{q}|{status_f}|{source_f}"
+if st.session_state.get("drafts_filter_key") != filt_key:
+    st.session_state.drafts_filter_key = filt_key
+    st.session_state.drafts_page = 1
+total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+page = max(1, min(int(st.session_state.drafts_page or 1), total_pages))
+st.session_state.drafts_page = page
+start = (page - 1) * page_size
 page_rows = rows[start : start + page_size]
-st.caption(
-    f"{total} drafts · showing {start + 1}–{min(start + page_size, total) if total else 0}"
+shown_end = min(start + page_size, total) if total else 0
+cap_l, cap_r = st.columns([3, 1])
+cap_l.caption(
+    f"{total} drafts · showing {start + 1 if total else 0}–{shown_end} · page {page} of {total_pages}"
 )
+if cap_r.button("Next →", disabled=page >= total_pages or not total, key="drafts_next_top"):
+    st.session_state.drafts_page = page + 1
+    st.rerun()
 
 if "draft_selected_ids" not in st.session_state:
     st.session_state.draft_selected_ids = set()
@@ -702,6 +715,23 @@ for r in page_rows:
     cols[5].write((r.get("updated_at") or "")[:16] or "—")
     cols[6].write(r.get("status") or "draft")
     cols[7].write(r.get("origin") or r.get("source") or "—")
+
+nav_l, nav_m, nav_r = st.columns([1, 2, 1])
+if nav_l.button("← Previous", disabled=page <= 1, key="drafts_prev_bottom"):
+    st.session_state.drafts_page = page - 1
+    st.rerun()
+nav_m.markdown(
+    f"<p style='text-align:center;margin:0.45rem 0 0 0'>Page {page} of {total_pages}</p>",
+    unsafe_allow_html=True,
+)
+if nav_r.button(
+    "Next →",
+    type="primary",
+    disabled=page >= total_pages or not total,
+    key="drafts_next_bottom",
+):
+    st.session_state.drafts_page = page + 1
+    st.rerun()
 
 st.divider()
 st.subheader("Open a draft")
