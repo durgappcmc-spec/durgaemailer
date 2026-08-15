@@ -233,3 +233,37 @@ def test_draft_an_email_to_locks_recipient():
     assert d["explicit_recipient_lock"] is True
     assert d["to"].lower() == "jane@acme.com"
 
+
+def test_comma_separated_sent_to_locks_only_those_addresses():
+    from agent.intent import parse_like_sent_request, wants_prospect_list_recipients
+    from agent.router import _build_draft_jobs
+
+    msg = (
+        "sent to shilpi@csrbox.org, manasi@csrbox.org "
+        "like email sent to lakshana@csrbox.org and cc rahul and deepti"
+    )
+    d = parse_directives(msg)
+    tos = [e.lower() for e in d["to_list"]]
+    assert tos == ["shilpi@csrbox.org", "manasi@csrbox.org"]
+    assert d["template_from"].lower() == "lakshana@csrbox.org"
+    assert d["explicit_recipient_lock"] is True
+    assert "lakshana@csrbox.org" not in tos
+    cc = [e.lower() for e in d["cc"]]
+    assert "raahul.ppcm@gmail.com" in cc
+    assert "deepti.87.srivastava@gmail.com" in cc
+    like = parse_like_sent_request(msg)
+    assert like and like["reference"].lower() == "lakshana@csrbox.org"
+    assert not wants_prospect_list_recipients(msg)
+
+    prospects = [
+        {"email": f"{n}@csrbox.org", "name": n.title()}
+        for n in ("lakshana", "other1", "other2", "shilpi")
+    ]
+    jobs = _build_draft_jobs(
+        {"from_prospects": True, "batch": True, "subject": "Hi"},
+        msg,
+        prospects=prospects,
+    )
+    got = [j["recipient_email"].lower() for j in jobs]
+    assert got == ["shilpi@csrbox.org", "manasi@csrbox.org"]
+

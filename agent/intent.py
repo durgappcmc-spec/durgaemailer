@@ -41,7 +41,8 @@ _TO_BLOCK_RE = re.compile(
     r"recipient(?:s)?|"
     r"send(?:\s+to)?"
     r")\s+(.+?)(?="
-    r"\b(?:cc|c\.?\s*c\.?|carbon\s+copy|copy(?:\s+to)?|from|subject|attach|ignore|skip)\b|"
+    r"\b(?:cc|c\.?\s*c\.?|carbon\s+copy|copy(?:\s+to)?|from|subject|attach|"
+    r"ignore|skip|like|similar)\b|"
     r"$)",
     re.I | re.S,
 )
@@ -543,16 +544,16 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
         # like info@x.org in sent / from sent
         rf"(?:like|similar\s+to)\s+{email_pat}"
         rf"(?:\s+(?:in|from)\s+(?:the\s+)?sent(?:\s+items?)?)?",
-        # like the one sent to info@x.org
+        # like the one sent to info@x.org / like email sent to info@x.org
         rf"(?:like|similar\s+to)\s+(?:the\s+)?"
         rf"(?:one\s+|email\s+|mail\s+)?(?:we\s+|you\s+|i\s+)?"
         rf"(?:sent|emailed)\s+to\s+{email_pat}",
+        # like email sent to info@x.org
+        rf"like\s+(?:the\s+)?(?:email|mail)\s+sent\s+to\s+{email_pat}",
         # same style as sent to / same as sent to / modeled on the email to
         rf"same\s+style\s+as\s+sent\s+to\s+{email_pat}",
         rf"same\s+as\s+sent\s+to\s+{email_pat}",
         rf"modeled\s+on\s+the\s+email\s+to\s+{email_pat}",
-        # sent to info@x.org (with draft/create nearby)
-        rf"(?:sent|emailed)\s+to\s+{email_pat}",
     ]
     for pat in email_patterns:
         m = re.search(pat, msg, re.I | re.S)

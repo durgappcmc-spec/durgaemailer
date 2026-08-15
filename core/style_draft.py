@@ -14,7 +14,7 @@ _DRAFT_TO_RE = re.compile(
     re.I,
 )
 _SEND_TO_RE = re.compile(
-    r"\bsend\s+to\s+(" + _EMAIL_RE.pattern + r")",
+    r"\b(?:send|sent)\s+to\s+(" + _EMAIL_RE.pattern + r")",
     re.I,
 )
 _EMAIL_ADDR_RE = re.compile(
@@ -25,8 +25,22 @@ _DRAFT_FOR_RE = re.compile(
     r"\bdraft\s+for\s+(" + _EMAIL_RE.pattern + r")",
     re.I,
 )
-_TO_EMAIL_RE = re.compile(
-    r"\bto\s+(" + _EMAIL_RE.pattern + r")",
+_EMAIL_LIST_RE = (
+    r"("
+    + _EMAIL_RE.pattern
+    + r"(?:\s*(?:[,;]|\band\b)\s*(?:and\s+)?"
+    + _EMAIL_RE.pattern
+    + r")*)"
+)
+_DEST_TO_LIST_RE = re.compile(
+    r"\b(?:draft|create|compose|write|make|send|sent)\s+"
+    r"(?:an?\s+)?(?:email\s+|mail\s+)?"
+    r"to\s+"
+    + _EMAIL_LIST_RE,
+    re.I,
+)
+_TO_EMAIL_LIST_RE = re.compile(
+    r"\bto\s+" + _EMAIL_LIST_RE,
     re.I,
 )
 _BULK_KEYWORDS = (
@@ -62,6 +76,18 @@ _ATTACH_RE = re.compile(
 _TEMPLATE_PATTERNS = [
     re.compile(
         r"like\s+the\s+one\s+sent\s+to\s+(" + _EMAIL_RE.pattern + r")",
+        re.I,
+    ),
+    re.compile(
+        r"like\s+(?:the\s+)?(?:email|mail)\s+sent\s+to\s+("
+        + _EMAIL_RE.pattern
+        + r")",
+        re.I,
+    ),
+    re.compile(
+        r"like\s+(?:the\s+)?(?:email|mail|one)\s+"
+        r"(?:that\s+(?:was\s+)?)?(?:we\s+|you\s+|i\s+)?"
+        r"sent\s+to\s+(" + _EMAIL_RE.pattern + r")",
         re.I,
     ),
     re.compile(
@@ -156,23 +182,25 @@ def parse_directives(text: str) -> dict[str, Any]:
             template_from = (m.group(1) or "").strip()
             break
 
+    dest_src = msg
+    for pat in _TEMPLATE_PATTERNS:
+        dest_src = pat.sub(" ", dest_src)
+
     to_specific: list[str] = []
-    for pat in (_DRAFT_TO_RE, _SEND_TO_RE, _EMAIL_ADDR_RE, _DRAFT_FOR_RE):
-        for m in pat.finditer(msg):
-            addr = (m.group(1) or "").strip()
-            if addr:
-                to_specific.append(addr)
+    for pat in (_DEST_TO_LIST_RE, _DRAFT_TO_RE, _SEND_TO_RE, _EMAIL_ADDR_RE, _DRAFT_FOR_RE):
+        for m in pat.finditer(dest_src):
+            chunk = (m.group(1) or "").strip()
+            if chunk:
+                to_specific.extend(_EMAIL_RE.findall(chunk) or [chunk])
     to_generic: list[str] = []
-    for m in _TO_EMAIL_RE.finditer(msg):
+    for m in _TO_EMAIL_LIST_RE.finditer(dest_src):
         start = m.start()
-        prefix = msg[max(0, start - 16) : start].lower()
-        if re.search(r"sent\s+$", prefix):
+        prefix = dest_src[max(0, start - 24) : start].lower()
+        if re.search(r"(?:like|similar|style|modeled)\s+$", prefix):
             continue
-        addr = (m.group(1) or "").strip()
-        if addr:
-            to_generic.append(addr)
-    if template_from:
-        to_generic = [c for c in to_generic if c.lower() != template_from.lower()]
+        chunk = (m.group(1) or "").strip()
+        if chunk:
+            to_generic.extend(_EMAIL_RE.findall(chunk) or [chunk])
     to_list = to_specific + to_generic
 
     def _uniq(items: list[str]) -> list[str]:
@@ -187,11 +215,23 @@ def parse_directives(text: str) -> dict[str, Any]:
         return out
 
     to_final = _uniq(to_list)
+    if template_from:
+        tf = template_from.lower()
+        others = [e for e in to_final if e.lower() != tf]
+        if others:
+            to_final = others
     to = to_final[0] if to_final else ""
 
     cc: list[str] = []
     for m in _CC_RE.finditer(msg):
-        cc.extend(_EMAIL_RE.findall(m.group(1) or ""))
+        span = m.group(1) or ""
+        cc.extend(_EMAIL_RE.findall(span))
+        try:
+            from agent.contact_aliases import resolve_names_in_text
+
+            cc.extend(resolve_names_in_text(span))
+        except Exception:
+            pass
     bcc: list[str] = []
     for m in _BCC_RE.finditer(msg):
         bcc.extend(_EMAIL_RE.findall(m.group(1) or ""))
