@@ -63,3 +63,74 @@ def test_explicit_titles_kept_with_expand():
     )
     assert titles == ["CEO", "CFO"]
     assert expand is True
+
+
+def test_room_to_read_is_nonprofit_not_csr_ladder():
+    from connectors.zoominfo import _is_nonprofit_query
+
+    q = {"company_names": ["Room to Read"]}
+    assert _is_nonprofit_query(q) is True
+    titles, expand = _title_cascade_for_query(q)
+    assert expand is True
+    assert titles[0] == "Founder"
+    assert "Head CSR" not in titles[:3]
+
+
+def test_learning_links_alias_prefers_india_foundation():
+    q = _with_company_name_aliases({"company_names": ["Learning Links"]})
+    names = [n.lower() for n in q["company_names"]]
+    assert any("foundation" in n for n in names)
+    domains = [d.lower() for d in q.get("company_domains") or []]
+    assert "learninglinksindia.org" in domains
+
+
+def test_rank_drops_reading_room_namesake():
+    firms = [
+        {"id": "1", "name": "Reading Room", "website": "www.readingroom.com"},
+        {
+            "id": "2",
+            "name": "Room to Read",
+            "website": "www.roomtoread.org",
+            "country": "United States",
+        },
+    ]
+    ranked = _rank_companies_for_query(
+        firms, "Room to Read", domains=["roomtoread.org"]
+    )
+    assert ranked[0]["id"] == "2"
+    assert all("reading room" not in (c.get("name") or "").lower() for c in ranked)
+
+
+def test_rank_prefers_learning_links_foundation_india():
+    firms = [
+        {
+            "id": "1",
+            "name": "Learning Links",
+            "website": "www.learninglinks.co.uk",
+            "country": "United Kingdom",
+        },
+        {
+            "id": "2",
+            "name": "Learning Links Foundation",
+            "website": "www.learninglinksindia.org",
+            "country": "India",
+        },
+    ]
+    ranked = _rank_companies_for_query(
+        firms, "Learning Links", domains=["learninglinksindia.org"]
+    )
+    assert ranked[0]["id"] == "2"
+
+
+def test_fields_without_invalid_strips_disallowed():
+    from connectors.zoominfo import _fields_without_invalid
+
+    class _Resp:
+        def json(self):
+            return {"invalidOutputFields": ["metroRegion", "bio"]}
+
+    out = _fields_without_invalid(
+        ["id", "email", "metroRegion", "bio", "jobTitle"], _Resp()
+    )
+    assert out == ["id", "email", "jobTitle"]
+

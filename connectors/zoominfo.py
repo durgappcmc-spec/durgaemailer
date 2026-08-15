@@ -40,18 +40,14 @@ class ZoomInfoConnector(ProspectConnector):
         "phone",
         "mobilePhone",
         "externalUrls",
-        "linkedInUrl",
         "city",
         "state",
         "country",
         "street",
         "zipCode",
-        "metroRegion",
         "managementLevel",
-        "department",
-        "companyIndustry",
-        "bio",
     ]
+    # This tenant rejects linkedInUrl / metroRegion / bio / department / companyIndustry.
     OUTPUT_FIELDS_MIN = [
         "id",
         "firstName",
@@ -67,7 +63,6 @@ class ZoomInfoConnector(ProspectConnector):
         "country",
         "street",
         "zipCode",
-        "metroRegion",
     ]
 
     def __init__(self) -> None:
@@ -225,19 +220,23 @@ class ZoomInfoConnector(ProspectConnector):
         #    Do not expand to non-CSR yet — keep slots for CSR email fallbacks.
         if names or _is_nonprofit_query(query):
             company_hits = self._search_companies(query, limit=min(15, max(limit, 5)))
-            company_hits = _rank_companies_for_query(company_hits, rank_needle)
             cascade_titles, expand = _title_cascade_for_query(query)
             domains = query.get("company_domains") or query.get("domains") or []
             if isinstance(domains, str):
                 domains = [domains] if domains.strip() else []
             domain_list = [str(d) for d in domains if d]
+            company_hits = _rank_companies_for_query(
+                company_hits, rank_needle, domains=domain_list
+            )
             if company_hits or domain_list:
+                ngo = _is_nonprofit_query(query)
                 results.extend(
                     self._contacts_for_companies(
                         company_hits[:5] if company_hits else [],
                         limit=limit,
                         titles=cascade_titles,
-                        expand=False,
+                        # NGOs rarely have "Head CSR" — pull reachable people first
+                        expand=True if ngo else False,
                         domains=domain_list,
                     )
                 )
@@ -476,8 +475,9 @@ class ZoomInfoConnector(ProspectConnector):
                     body.pop("city", None)
                     body.pop("location", None)
                     body.pop("state", None)
-                    if "country" not in body:
-                        body["country"] = _guess_country(query) or "India"
+                    guessed = _guess_country(query)
+                    if guessed and "country" not in body:
+                        body["country"] = guessed
                     resp = requests.post(
                         f"{self.BASE}/search/company",
                         headers=self._headers(),
@@ -754,30 +754,49 @@ class ZoomInfoConnector(ProspectConnector):
                 if _CSR_TITLE_RE.search(str(p.get("title") or ""))
             )
 
-        # Phase A — persona titles (require CSR-looking titles when possible)
+        # Phase A — persona titles (CSR for corporates; people-first for NGOs)
+        ngo_titles = bool(
+            title_list and title_list[0] in set(NGO_TITLE_PRIORITY)
+        )
         title_target = min(limit, max(3, (limit + 1) // 2))
-        for title in title_list[:12]:
-            if _csr_count() >= title_target:
-                break
-            for co in companies[:3]:
-                if _csr_count() >= title_target:
+        if ngo_titles or not title_list:
+            for co in companies[:2]:
+                if len(out) >= limit:
                     break
-                _append_from_company(co, job_title=title, prefer_csr=True)
+                _append_from_company(co, job_title=None, prefer_csr=False)
             for dom in domain_list[:2]:
-                if _csr_count() >= title_target:
+                if len(out) >= limit:
                     break
-                _append_from_domain(dom, job_title=title, prefer_csr=True)
-
-        # Phase A2 — broad CSR/Sustainability keyword on domain (catches
-        # "Head CSR & Sustainability" / "CMO & Head CSR" phrasing)
-        if _csr_count() < title_target:
-            for keyword in ("CSR", "Sustainability", "ESG"):
-                if _csr_count() >= title_target:
+                _append_from_domain(dom, job_title=None, prefer_csr=False)
+            for title in title_list[:4]:
+                if len(out) >= limit:
                     break
-                for dom in domain_list[:2]:
-                    _append_from_domain(dom, job_title=keyword, prefer_csr=True)
                 for co in companies[:2]:
-                    _append_from_company(co, job_title=keyword, prefer_csr=True)
+                    if len(out) >= limit:
+                        break
+                    _append_from_company(co, job_title=title, prefer_csr=False)
+        else:
+            for title in title_list[:3]:
+                if _csr_count() >= title_target:
+                    break
+                for co in companies[:2]:
+                    if _csr_count() >= title_target:
+                        break
+                    _append_from_company(co, job_title=title, prefer_csr=True)
+                for dom in domain_list[:2]:
+                    if _csr_count() >= title_target:
+                        break
+                    _append_from_domain(dom, job_title=title, prefer_csr=True)
+
+            # Phase A2 — broad CSR/Sustainability keyword on domain
+            if _csr_count() < title_target:
+                for keyword in ("CSR", "Sustainability", "ESG"):
+                    if _csr_count() >= title_target:
+                        break
+                    for dom in domain_list[:2]:
+                        _append_from_domain(dom, job_title=keyword, prefer_csr=True)
+                    for co in companies[:2]:
+                        _append_from_company(co, job_title=keyword, prefer_csr=True)
 
         # Phase B — broaden to other contacts at the same firms / domains
         if expand and len(out) < limit:
@@ -1097,12 +1116,13 @@ class ZoomInfoConnector(ProspectConnector):
                 timeout=45,
             )
             if resp.status_code == 400:
+                stripped = _fields_without_invalid(fields, resp)
                 resp = requests.post(
                     f"{self.BASE}/enrich/contact",
                     headers=self._headers(),
                     json={
                         "matchPersonInput": [match_input],
-                        "outputFields": list(self.OUTPUT_FIELDS_MIN),
+                        "outputFields": stripped or list(self.OUTPUT_FIELDS_MIN),
                     },
                     timeout=45,
                 )
@@ -1277,27 +1297,45 @@ class ZoomInfoConnector(ProspectConnector):
         return hits[0] if hits else None
 
     def _enrich_by_ids(self, person_ids: list[Any]) -> list[dict[str, Any]]:
-        enr = requests.post(
-            f"{self.BASE}/enrich/contact",
-            headers=self._headers(),
-            json={
-                "matchPersonInput": [{"personId": pid} for pid in person_ids],
-                "outputFields": list(self.OUTPUT_FIELDS),
-            },
-            timeout=60,
-        )
-        if enr.status_code == 400:
-            enr = requests.post(
+        fields = list(self.OUTPUT_FIELDS)
+        last = None
+        for _ in range(4):
+            last = requests.post(
                 f"{self.BASE}/enrich/contact",
                 headers=self._headers(),
                 json={
                     "matchPersonInput": [{"personId": pid} for pid in person_ids],
-                    "outputFields": list(self.OUTPUT_FIELDS_MIN),
+                    "outputFields": fields,
                 },
                 timeout=60,
             )
-        enr.raise_for_status()
-        return _flatten_enrich_rows(enr.json())
+            if last.status_code != 400:
+                break
+            nxt = _fields_without_invalid(fields, last)
+            if nxt == fields:
+                min_fields = list(self.OUTPUT_FIELDS_MIN)
+                if fields != min_fields:
+                    fields = min_fields
+                    continue
+                tiny = [
+                    "id",
+                    "firstName",
+                    "lastName",
+                    "email",
+                    "jobTitle",
+                    "companyName",
+                    "phone",
+                    "mobilePhone",
+                ]
+                if fields != tiny:
+                    fields = tiny
+                    continue
+                break
+            fields = nxt
+        if last is None:
+            return []
+        last.raise_for_status()
+        return _flatten_enrich_rows(last.json())
 
 
 def extract_linkedin_urls(text: str, *, limit: int = 100) -> list[str]:
@@ -1434,6 +1472,25 @@ def _pick_contact_for_linkedin(
 
 def _first_linkedin(text: Any) -> str:
     return extract_linkedin_url(str(text or ""))
+
+
+def _fields_without_invalid(fields: list[str], resp: Any) -> list[str]:
+    """Drop ZoomInfo outputFields named in a 400 invalidOutputFields payload."""
+    banned: set[str] = set()
+    try:
+        payload = resp.json() if resp is not None else {}
+    except Exception:
+        payload = {}
+    raw = []
+    if isinstance(payload, dict):
+        raw = payload.get("invalidOutputFields") or []
+    for item in raw:
+        s = str(item or "").strip()
+        if s:
+            banned.add(s.lower())
+    if not banned:
+        return list(fields)
+    return [f for f in fields if str(f).lower() not in banned]
 
 
 def _flatten_enrich_rows(enr_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1836,16 +1893,43 @@ def _query_blob(query: dict[str, Any]) -> str:
     return " ".join(p for p in parts if p).lower()
 
 
+_KNOWN_NONPROFITS = {
+    "room to read",
+    "room to read india",
+    "learning links",
+    "learning links foundation",
+    "pratham",
+    "pratham education foundation",
+    "save the children",
+    "teach for india",
+    "akshaya patra",
+    "magic bus",
+    "cry",
+    "child rights and you",
+    "help age india",
+    "helpage india",
+}
+
+
 def _is_nonprofit_query(query: dict[str, Any]) -> bool:
     blob = _query_blob(query)
-    return bool(
-        re.search(
-            r"\bngo\b|\bnon[\s-]?profit\b|\bcharit\w*\b|\bfoundation\b|\btrust\b|"
-            r"\bsocial\s+impact\b|\bngos\b",
-            blob,
-            re.I,
-        )
-    )
+    if re.search(
+        r"\bngo\b|\bnon[\s-]?profit\b|\bcharit\w*\b|\bfoundation\b|\btrust\b|"
+        r"\bsocial\s+impact\b|\bngos\b",
+        blob,
+        re.I,
+    ):
+        return True
+    names = query.get("company_names") or query.get("companies") or query.get("company") or []
+    if isinstance(names, str):
+        names = [names]
+    for raw in names:
+        key = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        if key in _KNOWN_NONPROFITS:
+            return True
+        if any(known != "cry" and known in key for known in _KNOWN_NONPROFITS):
+            return True
+    return False
 
 
 # Same persona ladder as Bulk Enrich / Phase 1 — tuned to ZoomInfo title phrasing
@@ -1985,6 +2069,9 @@ _COMPANY_ALIASES: dict[str, list[str]] = {
     "sterlite technology": ["Sterlite Technologies", "Sterlite Technologies Limited"],
     "sterlite technologies": ["Sterlite Technologies", "Sterlite Technologies Limited"],
     "sterlite": ["Sterlite Technologies", "Sterlite Technologies Limited"],
+    "room to read": ["Room to Read", "Room to Read India"],
+    "learning links": ["Learning Links Foundation", "Learning Links"],
+    "learning links foundation": ["Learning Links Foundation"],
 }
 
 # Optional website domains to help company match
@@ -1993,6 +2080,9 @@ _COMPANY_DOMAINS: dict[str, list[str]] = {
     "sterlite technology": ["sterlitetech.com", "stl.tech"],
     "sterlite technologies": ["sterlitetech.com", "stl.tech"],
     "sterlite": ["sterlitetech.com", "stl.tech"],
+    "room to read": ["roomtoread.org"],
+    "learning links": ["learninglinksindia.org"],
+    "learning links foundation": ["learninglinksindia.org"],
 }
 
 
@@ -2042,53 +2132,84 @@ def _with_company_name_aliases(query: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rank_companies_for_query(
-    companies: list[dict[str, Any]], needle: str
+    companies: list[dict[str, Any]], needle: str, domains: Optional[list[str]] = None
 ) -> list[dict[str, Any]]:
     """Prefer firms whose name matches the user query (Sterlite Technologies > noise)."""
     needle_n = re.sub(r"[^a-z0-9]+", " ", (needle or "").lower()).strip()
     tokens = [t for t in needle_n.split() if len(t) >= 4]
+    extra_domains = [
+        re.sub(r"^www\.", "", str(d or "").strip().lower())
+        for d in (domains or [])
+        if str(d or "").strip()
+    ]
 
-    def score(co: dict[str, Any]) -> tuple[int, str]:
-        name = str(co.get("name") or co.get("companyName") or "").lower()
-        name_n = re.sub(r"[^a-z0-9]+", " ", name).strip()
-        website = str(
+    def _website(co: dict[str, Any]) -> str:
+        return str(
             co.get("website")
             or co.get("companyWebsite")
             or co.get("domain")
             or ""
         ).lower()
+
+    def score(co: dict[str, Any]) -> tuple:
+        name = str(co.get("name") or co.get("companyName") or "").lower()
+        name_n = re.sub(r"[^a-z0-9]+", " ", name).strip()
+        website = _website(co)
+        country = str(co.get("country") or "").strip().lower()
         sc = 0
-        if needle_n and needle_n in name_n:
+        if needle_n and needle_n == name_n:
+            sc += 200
+        elif needle_n and needle_n in name_n:
             sc += 100
-        if name_n and needle_n and name_n in needle_n:
+        elif name_n and needle_n and name_n in needle_n:
             sc += 40
         for t in tokens:
-            if t in name_n:
+            if re.search(rf"\b{re.escape(t)}\b", name_n):
                 sc += 20
-        # Prefer exact-ish brand hits over vague subsidiaries
+        for d in extra_domains:
+            if d and d in website:
+                sc += 250
         if "sterlite" in tokens and "sterlite" in name_n and "technolog" in name_n:
             sc += 50
         if "stl.tech" in website or "sterlitetech.com" in website:
             sc += 80
         if re.search(r"\bstl\b", name_n) and "sterlite" in name_n:
             sc += 30
+        if country == "india":
+            sc += 15
         return (-sc, name)
 
     ranked = sorted([c for c in companies if isinstance(c, dict)], key=score)
-    # Drop zero-signal firms when we have a distinctive token
+    distinctive = [t for t in tokens if len(t) >= 5]
     if tokens:
-        kept = [
-            c
-            for c in ranked
-            if any(
-                t in re.sub(r"[^a-z0-9]+", " ", str(c.get("name") or "").lower())
-                for t in tokens
-            )
-            or "stl.tech"
-            in str(c.get("website") or c.get("companyWebsite") or "").lower()
-            or "sterlitetech.com"
-            in str(c.get("website") or c.get("companyWebsite") or "").lower()
-        ]
+        kept: list[dict[str, Any]] = []
+        for c in ranked:
+            name_n = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                str(c.get("name") or c.get("companyName") or "").lower(),
+            ).strip()
+            website = _website(c)
+            if needle_n and needle_n in name_n:
+                kept.append(c)
+                continue
+            if distinctive and any(
+                re.search(rf"\b{re.escape(t)}\b", name_n) for t in distinctive
+            ):
+                kept.append(c)
+                continue
+            if (
+                not distinctive
+                and tokens
+                and all(re.search(rf"\b{re.escape(t)}\b", name_n) for t in tokens)
+            ):
+                kept.append(c)
+                continue
+            if extra_domains and any(d in website for d in extra_domains if d):
+                kept.append(c)
+                continue
+            if "stl.tech" in website or "sterlitetech.com" in website:
+                kept.append(c)
         if kept:
             return kept
     return ranked
