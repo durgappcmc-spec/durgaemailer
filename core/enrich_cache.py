@@ -104,7 +104,9 @@ def format_enrichment_panel(payload: dict[str, Any]) -> str:
     title = str(p.get("title") or "").strip() or "—"
     company = str(p.get("company") or "").strip() or "—"
     email = str(p.get("email") or "").strip() or "not found"
-    phone = str(p.get("phone") or p.get("mobile") or "").strip() or "-"
+    phone = str(p.get("phone") or "").strip() or "-"
+    mobile = str(p.get("mobile") or "").strip() or "-"
+    linkedin = str(p.get("linkedin_url") or "").strip() or "—"
     source = str(p.get("source") or "ZoomInfo").strip() or "ZoomInfo"
     if source.lower() == "zoominfo":
         source = "ZoomInfo"
@@ -112,6 +114,8 @@ def format_enrichment_panel(payload: dict[str, Any]) -> str:
         f"Prospect: {name}, {title} at {company}",
         f"Email:    {email}",
         f"Phone:    {phone}",
+        f"Mobile:   {mobile}",
+        f"LinkedIn: {linkedin}",
         f"Source:   {source}",
     ]
     extras = []
@@ -134,7 +138,8 @@ def format_enrichment_fields(payload: dict[str, Any]) -> str:
     """Labeled fields for the drafting prompt — never raw JSON."""
     p = payload or {}
     email = str(p.get("email") or "").strip() or "not found"
-    phone = str(p.get("phone") or p.get("mobile") or "").strip() or "-"
+    phone = str(p.get("phone") or "").strip() or "-"
+    mobile = str(p.get("mobile") or "").strip() or "-"
     rows = [
         ("Full name", p.get("name") or ""),
         ("First name", p.get("first_name") or ""),
@@ -143,6 +148,7 @@ def format_enrichment_fields(payload: dict[str, Any]) -> str:
         ("Company", p.get("company") or ""),
         ("Verified work email", email),
         ("Phone", phone),
+        ("Mobile", mobile),
         ("Industry", p.get("industry") or ""),
         ("Location", p.get("location") or ""),
         ("Seniority", p.get("seniority") or ""),

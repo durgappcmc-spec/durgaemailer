@@ -2628,10 +2628,13 @@ def _answer_impl(
                     mobile = (
                         (c.get("mobile") or c.get("phone") or "").strip() or "—"
                     )
+                    li = (c.get("linkedin_url") or "").strip()
                     yield (
                         f"- {c.get('name') or 'Contact'}"
                         + (f" · {c.get('title')}" if c.get("title") else "")
-                        + f" · `{email}` · 📱 `{mobile}`\n"
+                        + f" · `{email}` · 📱 `{mobile}`"
+                        + (f" · {li}" if li else "")
+                        + "\n"
                     )
                 if _stop_now():
                     yield stopped_message()

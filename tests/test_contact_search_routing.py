@@ -12,8 +12,11 @@ from connectors.zoominfo import (
     extract_linkedin_urls,
     linkedin_url_variants,
     names_from_linkedin_url,
+    _linkedin_from_row,
     _linkedin_urls_match,
+    _phone_from_row,
     _pick_contact_for_linkedin,
+    _row_to_prospect,
 )
 from agent.intent import (
     _heuristic_plan,
@@ -231,3 +234,25 @@ def test_linkedin_search_does_not_pick_namesake_with_email():
         contacts[:1], asked, require_match=True
     )
     assert namesake_only is None
+
+
+def test_zoominfo_row_keeps_mobile_and_linkedin():
+    row = {
+        "id": "1",
+        "firstName": "George",
+        "lastName": "Mathew",
+        "email": "george@example.com",
+        "jobTitle": "Director",
+        "companyName": "Acme",
+        "mobilePhone": "+91 98765 43210",
+        "externalUrls": [
+            {"type": "LinkedIn", "value": "https://in.linkedin.com/in/george-mathew-31142b23"}
+        ],
+        "phoneList": [{"phone": "+91 98765 43210", "type": "mobile"}],
+    }
+    assert "george-mathew" in _linkedin_from_row(row).lower()
+    phone, mobile = _phone_from_row(row)
+    assert "98765" in mobile
+    prospect = _row_to_prospect(row)
+    assert "98765" in (prospect.get("mobile") or "")
+    assert "linkedin.com/in/george-mathew" in (prospect.get("linkedin_url") or "")

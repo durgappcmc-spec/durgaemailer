@@ -165,7 +165,9 @@ def test_enrichment_panel_and_labeled_fields():
         "title": "VP Sales",
         "company": "Acme",
         "email": "jane@acme.com",
-        "phone": "",
+        "phone": "111",
+        "mobile": "222",
+        "linkedin_url": "https://www.linkedin.com/in/janedoe",
         "source": "zoominfo",
         "industry": "Software",
         "location": "NY",
@@ -175,10 +177,13 @@ def test_enrichment_panel_and_labeled_fields():
     panel = format_enrichment_panel(p)
     assert "Prospect: Jane Doe, VP Sales at Acme" in panel
     assert "jane@acme.com" in panel
+    assert "Mobile:   222" in panel
+    assert "linkedin.com/in/janedoe" in panel
     assert "ZoomInfo" in panel
     fields = format_enrichment_fields(p)
     assert "Verified work email: jane@acme.com" in fields
-    assert "{" not in fields.split("Verified")[0]
+    assert "Mobile: 222" in fields
+    assert "LinkedIn: https://www.linkedin.com/in/janedoe" in fields
 
 
 def test_explicit_recipient_lock_ignores_session_prospects():

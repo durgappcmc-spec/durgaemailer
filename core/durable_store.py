@@ -612,6 +612,7 @@ def save_session_extras(
                         "company",
                         "phone",
                         "mobile",
+                        "linkedin_url",
                         "source",
                     )
                     if p.get(k)

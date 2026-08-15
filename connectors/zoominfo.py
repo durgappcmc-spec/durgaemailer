@@ -40,6 +40,7 @@ class ZoomInfoConnector(ProspectConnector):
         "phone",
         "mobilePhone",
         "externalUrls",
+        "linkedInUrl",
         "city",
         "state",
         "country",
@@ -1416,25 +1417,75 @@ def _linkedin_from_row(row: dict[str, Any]) -> str:
         or ""
     )
     if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-    urls = row.get("externalUrls") or row.get("externalUrl") or []
+        return extract_linkedin_url(direct) or direct.strip()
+    if isinstance(direct, list) and direct:
+        first = direct[0]
+        if isinstance(first, str) and first.strip():
+            return extract_linkedin_url(first) or first.strip()
+        if isinstance(first, dict):
+            url = str(first.get("url") or first.get("value") or "").strip()
+            if url:
+                return extract_linkedin_url(url) or url
+    urls = (
+        row.get("externalUrls")
+        or row.get("externalUrl")
+        or row.get("socialUrls")
+        or []
+    )
     if isinstance(urls, dict):
         urls = [urls]
     if isinstance(urls, list):
         for item in urls:
+            if isinstance(item, str) and "linkedin.com" in item.lower():
+                return extract_linkedin_url(item) or item.strip()
             if not isinstance(item, dict):
                 continue
-            typ = str(item.get("type") or "").lower()
-            url = str(item.get("url") or "").strip()
+            typ = str(
+                item.get("type")
+                or item.get("name")
+                or item.get("label")
+                or item.get("site")
+                or ""
+            ).lower()
+            url = str(
+                item.get("url") or item.get("value") or item.get("link") or ""
+            ).strip()
             if "linkedin" in typ or "linkedin.com" in url.lower():
-                return url
+                return extract_linkedin_url(url) or url
     return ""
 
 
 def _phone_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Return (phone, mobile) preferring non-empty values."""
-    phone = str(row.get("phone") or row.get("directPhone") or "").strip()
+    phone = str(
+        row.get("phone")
+        or row.get("directPhone")
+        or row.get("directPhoneNo")
+        or ""
+    ).strip()
     mobile = str(row.get("mobilePhone") or row.get("mobile") or "").strip()
+    for item in row.get("phoneList") or row.get("phoneNumbers") or []:
+        if isinstance(item, str) and item.strip():
+            phone = phone or item.strip()
+            continue
+        if not isinstance(item, dict):
+            continue
+        num = str(
+            item.get("phone")
+            or item.get("number")
+            or item.get("value")
+            or item.get("display")
+            or ""
+        ).strip()
+        if not num:
+            continue
+        typ = str(
+            item.get("type") or item.get("phoneType") or item.get("label") or ""
+        ).lower()
+        if "mobile" in typ or "cell" in typ:
+            mobile = mobile or num
+        else:
+            phone = phone or num
     return phone, mobile
 
 
