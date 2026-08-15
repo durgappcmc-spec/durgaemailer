@@ -22,12 +22,23 @@ _QUILL_TOOLBAR = [
 
 _EDITOR_SCROLL_CSS = """
 <style>
+/* Scroll the Quill host, not a clipped iframe (Streamlit sets scrolling=no). */
+div:has(> iframe[title*="quill" i]),
+div:has(> iframe[title*="streamlit_quill" i]),
+[data-testid="stCustomComponentV1"]:has(iframe[title*="quill" i]),
+[data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_quill" i]) {
+  max-height: 560px !important;
+  overflow-y: scroll !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain !important;
+  border: 1px solid #dadce0;
+  border-radius: 8px;
+}
 iframe[title*="quill" i],
 iframe[title*="streamlit_quill" i] {
-  min-height: 480px !important;
-  height: 480px !important;
-  max-height: 480px !important;
-  overflow: auto !important;
+  min-height: 240px !important;
+  max-height: none !important;
+  overflow: visible !important;
 }
 div[data-testid="stHtml"] iframe {
   overflow: auto !important;
@@ -42,42 +53,52 @@ _EDITOR_SCROLL_JS = """
 (function () {
   var parentDoc = window.parent && window.parent.document;
   if (!parentDoc) return;
+  function isQuillFrame(f, doc) {
+    var title = (f.getAttribute("title") || "").toLowerCase();
+    if (title.indexOf("quill") !== -1) return true;
+    return !!(doc && doc.querySelector && doc.querySelector(".ql-editor"));
+  }
   function patch() {
     parentDoc.querySelectorAll("iframe").forEach(function (f) {
-      var doc;
+      var doc = null;
       try { doc = f.contentDocument || (f.contentWindow && f.contentWindow.document); }
-      catch (e) { return; }
+      catch (e) { doc = null; }
+      if (!isQuillFrame(f, doc)) return;
+      f.setAttribute("scrolling", "yes");
+      var wrap = f.parentElement;
+      if (wrap) {
+        wrap.style.maxHeight = "560px";
+        wrap.style.overflowY = "scroll";
+        wrap.style.overflowX = "hidden";
+        wrap.style.overscrollBehavior = "contain";
+      }
       if (!doc) return;
       var editor = doc.querySelector(".ql-editor");
-      var preview = doc.querySelector(".gm-preview");
-      if (!editor && !preview) return;
-      f.setAttribute("scrolling", "yes");
-      f.style.overflow = "auto";
-      if (editor && !doc.getElementById("relay-quill-scroll")) {
+      if (!editor) return;
+      if (!doc.getElementById("relay-quill-scroll")) {
         var s = doc.createElement("style");
         s.id = "relay-quill-scroll";
         s.textContent = [
-          "html, body { height: 100% !important; margin: 0 !important; overflow: hidden !important; }",
-          "#root, #root > div { height: 100% !important; display: flex !important; flex-direction: column !important; }",
-          ".ql-toolbar.ql-snow { flex: 0 0 auto !important; }",
-          ".ql-container.ql-snow { flex: 1 1 auto !important; height: auto !important; overflow: hidden !important; display: flex !important; flex-direction: column !important; }",
-          ".ql-editor { overflow-y: auto !important; overflow-x: hidden !important; height: 100% !important; min-height: 0 !important; max-height: none !important; overscroll-behavior: contain !important; }"
+          ".ql-toolbar.ql-snow { flex: 0 0 auto !important; position: sticky !important; top: 0 !important; z-index: 2 !important; background: #fff !important; }",
+          ".ql-container.ql-snow { height: auto !important; overflow: visible !important; }",
+          ".ql-editor { max-height: 420px !important; min-height: 180px !important; overflow-y: scroll !important; overflow-x: hidden !important; overscroll-behavior: contain !important; }"
         ].join("\\n");
         (doc.head || doc.documentElement).appendChild(s);
       }
-      if (preview) {
-        if (doc.documentElement) doc.documentElement.style.overflowY = "auto";
-        if (doc.body) {
-          doc.body.style.overflowY = "auto";
-          doc.body.style.overscrollBehavior = "contain";
-        }
-      }
+      editor.style.maxHeight = "420px";
+      editor.style.overflowY = "scroll";
     });
   }
   patch();
-  setTimeout(patch, 200);
-  setTimeout(patch, 700);
-  setTimeout(patch, 1500);
+  var n = 0;
+  var iv = setInterval(function () {
+    patch();
+    if (++n > 40) clearInterval(iv);
+  }, 250);
+  try {
+    var obs = new MutationObserver(patch);
+    obs.observe(parentDoc.body, { childList: true, subtree: true });
+  } catch (e) {}
 })();
 </script>
 </body></html>
@@ -92,7 +113,7 @@ def enable_editor_mouse_scroll(*, inject_js: bool = True) -> None:
     try:
         import streamlit.components.v1 as components
 
-        components.html(_EDITOR_SCROLL_JS, height=0, scrolling=False)
+        components.html(_EDITOR_SCROLL_JS, height=1, scrolling=False)
     except Exception:
         pass
 
@@ -377,6 +398,7 @@ def render_draft_inspector(
                     st.json(ev)
 
     if section == "Edit":
+        enable_editor_mouse_scroll()
         gid = draft.get("gmail_draft_id") or ""
         did = str(draft.get("draft_id") or "")
         if not gid and did.startswith("gmail:"):
@@ -861,6 +883,7 @@ def _rich_text_editor(
             placeholder="Write your email…",
         )
         enable_editor_mouse_scroll()
+        st.caption("Scroll inside the editor to see the rest of the email.")
         # First paint / hidden iframe often returns "" — do not wipe Gmail HTML.
         if result is None or _quill_result_empty(str(result)):
             if keep_seed_if_empty and (html or "").strip() and not _quill_result_empty(html):

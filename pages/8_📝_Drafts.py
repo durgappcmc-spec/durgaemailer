@@ -353,10 +353,17 @@ st.markdown(
 <style>
 iframe[title*="quill" i],
 iframe[title*="streamlit_quill" i] {
-  min-height: 480px !important;
-  height: 480px !important;
-  max-height: 480px !important;
-  overflow: auto !important;
+  min-height: 240px !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+div:has(> iframe[title*="quill" i]),
+div:has(> iframe[title*="streamlit_quill" i]),
+[data-testid="stCustomComponentV1"]:has(iframe[title*="quill" i]) {
+  max-height: 560px !important;
+  overflow-y: scroll !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain !important;
 }
 div[data-testid="stHtml"] iframe {
   overflow: auto !important;
