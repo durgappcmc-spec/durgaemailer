@@ -8,6 +8,36 @@ from typing import Any, Optional
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$", re.I)
 
 
+def prospect_location(raw: dict[str, Any] | None) -> str:
+    """Best location string from a saved/ZoomInfo prospect row."""
+    p = raw or {}
+    direct = str(p.get("location") or p.get("personLocation") or "").strip()
+    if direct:
+        return direct
+    company = p.get("company") if isinstance(p.get("company"), dict) else {}
+    bits = [
+        p.get("city") or p.get("personCity") or (company.get("city") if company else ""),
+        p.get("metroRegion")
+        or p.get("metro_region")
+        or p.get("region")
+        or (company.get("metroRegion") if company else ""),
+        p.get("state") or p.get("personState") or (company.get("state") if company else ""),
+        p.get("country") or p.get("personCountry") or (company.get("country") if company else ""),
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for b in bits:
+        s = str(b or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return ", ".join(out)
+
+
 def looks_like_email(value: object) -> bool:
     return bool(_EMAIL_RE.match(str(value or "").strip()))
 
@@ -65,6 +95,9 @@ def sanitize_prospect(raw: dict[str, Any]) -> dict[str, Any]:
     p["last_name"] = last
     p["email"] = email
     p["company"] = company
+    loc = prospect_location(p)
+    if loc:
+        p["location"] = loc
     return p
 
 
@@ -99,7 +132,7 @@ def normalize(raw: dict[str, Any], source: str = "", source_id: str = "") -> dic
         "title": raw.get("title") or raw.get("job_title") or raw.get("jobTitle") or "",
         "company": cleaned["company"],
         "linkedin_url": raw.get("linkedin_url") or raw.get("linkedinUrl") or raw.get("linkedin") or "",
-        "location": raw.get("location") or raw.get("city") or "",
+        "location": prospect_location(raw) or raw.get("location") or raw.get("city") or "",
         "seniority": raw.get("seniority") or raw.get("managementLevel") or "",
         "department": raw.get("department") or "",
         "industry": raw.get("industry") or raw.get("companyIndustry") or "",

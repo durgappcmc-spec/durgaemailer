@@ -110,19 +110,24 @@ def format_enrichment_panel(payload: dict[str, Any]) -> str:
     source = str(p.get("source") or "ZoomInfo").strip() or "ZoomInfo"
     if source.lower() == "zoominfo":
         source = "ZoomInfo"
+    try:
+        from connectors import prospect_location
+
+        location = prospect_location(p) or "—"
+    except Exception:
+        location = str(p.get("location") or "").strip() or "—"
     lines = [
         f"Prospect: {name}, {title} at {company}",
         f"Email:    {email}",
         f"Phone:    {phone}",
         f"Mobile:   {mobile}",
+        f"Location: {location}",
         f"LinkedIn: {linkedin}",
         f"Source:   {source}",
     ]
     extras = []
     if p.get("industry"):
         extras.append(f"Industry: {p.get('industry')}")
-    if p.get("location"):
-        extras.append(f"Location: {p.get('location')}")
     if p.get("seniority"):
         extras.append(f"Seniority: {p.get('seniority')}")
     about = str(p.get("about") or "").strip()
@@ -140,6 +145,12 @@ def format_enrichment_fields(payload: dict[str, Any]) -> str:
     email = str(p.get("email") or "").strip() or "not found"
     phone = str(p.get("phone") or "").strip() or "-"
     mobile = str(p.get("mobile") or "").strip() or "-"
+    try:
+        from connectors import prospect_location
+
+        prospect_loc = prospect_location(p)
+    except Exception:
+        prospect_loc = str(p.get("location") or "").strip()
     rows = [
         ("Full name", p.get("name") or ""),
         ("First name", p.get("first_name") or ""),
@@ -150,7 +161,7 @@ def format_enrichment_fields(payload: dict[str, Any]) -> str:
         ("Phone", phone),
         ("Mobile", mobile),
         ("Industry", p.get("industry") or ""),
-        ("Location", p.get("location") or ""),
+        ("Location", prospect_loc),
         ("Seniority", p.get("seniority") or ""),
         ("LinkedIn", p.get("linkedin_url") or ""),
         ("About", p.get("about") or ""),

@@ -46,6 +46,7 @@ class ZoomInfoConnector(ProspectConnector):
         "country",
         "street",
         "zipCode",
+        "metroRegion",
         "managementLevel",
         "department",
         "companyIndustry",
@@ -66,6 +67,7 @@ class ZoomInfoConnector(ProspectConnector):
         "country",
         "street",
         "zipCode",
+        "metroRegion",
     ]
 
     def __init__(self) -> None:
@@ -1455,6 +1457,39 @@ def _linkedin_from_row(row: dict[str, Any]) -> str:
     return ""
 
 
+def _location_from_row(row: dict[str, Any]) -> str:
+    """City / region / country from ZoomInfo contact or nested company HQ."""
+    if not isinstance(row, dict):
+        return ""
+    direct = str(row.get("location") or row.get("personLocation") or "").strip()
+    if direct:
+        return direct
+    company = row.get("company") if isinstance(row.get("company"), dict) else {}
+    bits = [
+        row.get("street"),
+        row.get("city") or row.get("personCity") or company.get("city"),
+        row.get("metroRegion")
+        or row.get("metro_region")
+        or row.get("region")
+        or company.get("metroRegion"),
+        row.get("state") or row.get("personState") or company.get("state"),
+        row.get("zipCode") or row.get("zip") or company.get("zipCode"),
+        row.get("country") or row.get("personCountry") or company.get("country"),
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for b in bits:
+        s = str(b or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return ", ".join(out)
+
+
 def _phone_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Return (phone, mobile) preferring non-empty values."""
     phone = str(
@@ -1492,19 +1527,7 @@ def _phone_from_row(row: dict[str, Any]) -> tuple[str, str]:
 def _row_to_prospect(row: dict[str, Any]) -> dict[str, Any]:
     phone, mobile = _phone_from_row(row)
     linkedin = _linkedin_from_row(row)
-    street = str(row.get("street") or "").strip()
-    location = ", ".join(
-        filter(
-            None,
-            [
-                street,
-                row.get("city"),
-                row.get("state"),
-                row.get("zipCode"),
-                row.get("country"),
-            ],
-        )
-    )
+    location = _location_from_row(row)
     raw = {
         "id": row.get("id") or row.get("personId"),
         "first_name": row.get("firstName"),

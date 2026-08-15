@@ -7,6 +7,7 @@ import streamlit as st
 
 from config import APP_NAME
 from connectors.ingest_to_memory import ingest_prospects, prospects_to_dataframe
+from connectors import prospect_location
 from connectors.prospects import enrich_fallthrough, search_all
 from core.auth_ui import logout_button, require_login
 from core.auto_sync import auto_ingest_prospects, ensure_session_sync
@@ -374,19 +375,20 @@ with tab_saved:
                     st.success(f"Removed **{n_del}** contact(s) from Saved.")
                     st.rerun()
 
-            h = st.columns([0.4, 1.2, 1.1, 1.2, 1.5, 1.1, 1.4, 0.8])
+            h = st.columns([0.35, 1.1, 1.0, 1.1, 1.1, 1.4, 1.0, 1.2, 0.7])
             h[0].markdown("**☐**")
             h[1].markdown("**Name**")
             h[2].markdown("**Title**")
             h[3].markdown("**Company**")
-            h[4].markdown("**Email**")
-            h[5].markdown("**Mobile**")
-            h[6].markdown("**LinkedIn**")
-            h[7].markdown("**Source**")
+            h[4].markdown("**Location**")
+            h[5].markdown("**Email**")
+            h[6].markdown("**Mobile**")
+            h[7].markdown("**LinkedIn**")
+            h[8].markdown("**Source**")
 
             for i, p in enumerate(page_rows):
                 pkey = page_keys[i]
-                cols = st.columns([0.4, 1.2, 1.1, 1.2, 1.5, 1.1, 1.4, 0.8])
+                cols = st.columns([0.35, 1.1, 1.0, 1.1, 1.1, 1.4, 1.0, 1.2, 0.7])
                 with cols[0]:
                     ck = _sel_key(pkey)
                     if ck not in st.session_state:
@@ -403,17 +405,19 @@ with tab_saved:
                 cols[1].write((p.get("name") or "—") or "—")
                 cols[2].write((p.get("title") or "—") or "—")
                 cols[3].write((p.get("company") or p.get("organization") or "—") or "—")
-                cols[4].write((p.get("email") or "—") or "—")
+                loc = (prospect_location(p) or "").strip() or "—"
+                cols[4].write(loc)
+                cols[5].write((p.get("email") or "—") or "—")
                 mobile = (
                     (p.get("mobile") or p.get("phone") or "").strip() or "—"
                 )
-                cols[5].write(mobile)
+                cols[6].write(mobile)
                 li = (p.get("linkedin_url") or "").strip()
                 if li:
-                    cols[6].markdown(f"[profile]({li})")
+                    cols[7].markdown(f"[profile]({li})")
                 else:
-                    cols[6].write("—")
-                cols[7].write((p.get("source") or "—") or "—")
+                    cols[7].write("—")
+                cols[8].write((p.get("source") or "—") or "—")
 
             nav_l, nav_m, nav_r = st.columns([1, 2, 1])
             if nav_l.button(

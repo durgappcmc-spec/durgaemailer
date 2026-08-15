@@ -178,6 +178,7 @@ def test_enrichment_panel_and_labeled_fields():
     assert "Prospect: Jane Doe, VP Sales at Acme" in panel
     assert "jane@acme.com" in panel
     assert "Mobile:   222" in panel
+    assert "Location: NY" in panel
     assert "linkedin.com/in/janedoe" in panel
     assert "ZoomInfo" in panel
     fields = format_enrichment_fields(p)

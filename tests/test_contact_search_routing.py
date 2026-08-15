@@ -256,3 +256,27 @@ def test_zoominfo_row_keeps_mobile_and_linkedin():
     prospect = _row_to_prospect(row)
     assert "98765" in (prospect.get("mobile") or "")
     assert "linkedin.com/in/george-mathew" in (prospect.get("linkedin_url") or "")
+
+
+def test_zoominfo_row_keeps_location():
+    from connectors import prospect_location
+    from connectors.zoominfo import _location_from_row, _row_to_prospect
+
+    row = {
+        "id": "1",
+        "firstName": "Priya",
+        "lastName": "Shah",
+        "email": "priya@acme.com",
+        "jobTitle": "CSR Head",
+        "companyName": "Acme",
+        "city": "Mumbai",
+        "state": "Maharashtra",
+        "country": "India",
+        "metroRegion": "Mumbai Metro",
+    }
+    loc = _location_from_row(row)
+    assert "Mumbai" in loc
+    assert "India" in loc
+    prospect = _row_to_prospect(row)
+    assert "Mumbai" in (prospect.get("location") or "")
+    assert prospect_location({"city": "Pune", "country": "India"}) == "Pune, India"
