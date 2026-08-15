@@ -307,4 +307,88 @@ def test_like_sent_to_is_not_a_second_draft_recipient():
     assert [j["recipient_email"].lower() for j in jobs] == [
         "chandrakant.kumbhani.ext@ambujacement.com"
     ]
+    assert not (plan.like_sent_for or "").strip() or "@" not in plan.like_sent_for
+    from agent.intent import parse_explicit_draft_company, name_is_email_fragment
+
+    assert parse_explicit_draft_company(msg) == ""
+    assert name_is_email_fragment("chandrakant.kumbhani", msg)
+
+
+def test_save_the_children_list_like_sent_does_not_drop_tos():
+    from agent.intent import (
+        _heuristic_plan,
+        name_is_email_fragment,
+        parse_explicit_draft_company,
+        parse_like_sent_request,
+    )
+    from agent.router import _build_draft_jobs, _same_org_as_template, _wants_email_attachment
+
+    expected = [
+        "a_ansari@savethechildren.in",
+        "annie.mathews@savethechildren.in",
+        "a.dhar@savethechildren.in",
+        "deepika.radhu@savethechildren.in",
+        "ketaki.saksena@savethechildren.in",
+        "k.jha@savethechildren.in",
+        "madhumita.purkayastha@savethechildren.in",
+        "pankaj.kumar@savethechildren.in",
+        "puja.issar@savethechildren.in",
+        "s_dhage@savethechildren.in",
+        "s.malhotra@savethechildren.in",
+        "subhashish.neogi@savethechildren.in",
+        "surbhi.yadav@savethechildren.in",
+    ]
+    msg = (
+        "draft an email to "
+        + ",\n".join(expected)
+        + "\n and cc rahul and deepti and draft email like sent to \t\n"
+        "sheetal.srinivasamurthy@savethechildren.in and use attached as an attachment"
+    )
+    d = parse_directives(msg)
+    tos = [e.lower() for e in d["to_list"]]
+    assert tos == expected
+    assert d["template_from"].lower() == "sheetal.srinivasamurthy@savethechildren.in"
+    assert "sheetal.srinivasamurthy@savethechildren.in" not in tos
+    cc = [e.lower() for e in d["cc"]]
+    assert "sheetal.srinivasamurthy@savethechildren.in" not in cc
+    assert "raahul.ppcm@gmail.com" in cc
+    assert "deepti.87.srivastava@gmail.com" in cc
+    assert parse_explicit_draft_company(msg) == ""
+    assert name_is_email_fragment("sheetal", msg)
+    like = parse_like_sent_request(msg)
+    assert like and like["reference"].lower() == (
+        "sheetal.srinivasamurthy@savethechildren.in"
+    )
+    assert not (like.get("target") or "").strip()
+    plan = _heuristic_plan(msg)
+    assert [e.lower() for e in plan.to_emails] == expected
+    assert plan.like_sent_to.lower() == "sheetal.srinivasamurthy@savethechildren.in"
+    assert not (plan.like_sent_for or "").strip()
+    assert _same_org_as_template(plan.like_sent_to, expected)
+    assert _wants_email_attachment(msg)
+
+    prospects = [
+        {"email": "other@acme.com", "name": "Other", "company": "Acme"},
+        {
+            "email": "sheetal.srinivasamurthy@savethechildren.in",
+            "name": "Sheetal",
+            "company": "Save the Children",
+        },
+    ]
+    jobs = _build_draft_jobs(
+        {
+            "subject": "Hi",
+            "html_body": "<p>x</p>",
+            "from_prospects": True,
+            "batch": True,
+            "cc": plan.cc,
+        },
+        msg,
+        prospects=prospects,
+        plan=plan,
+    )
+    got = [j["recipient_email"].lower() for j in jobs]
+    assert got == expected
+    assert "sheetal.srinivasamurthy@savethechildren.in" not in got
+    assert jobs[0].get("cc") == plan.cc
 

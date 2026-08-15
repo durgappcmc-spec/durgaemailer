@@ -35,6 +35,7 @@ from agent.intent import (
     IntentPlan,
     classify_email_roles,
     filter_recipient_emails,
+    name_is_email_fragment,
     org_label_from_email,
     parse_contact_search_company,
     parse_explicit_draft_company,
@@ -215,6 +216,22 @@ _EMAIL_ATTACH_RE = re.compile(
 
 def _wants_email_attachment(user_msg: str) -> bool:
     return bool(_EMAIL_ATTACH_RE.search(user_msg or ""))
+
+
+def _email_domain(addr: str) -> str:
+    raw = (addr or "").strip()
+    if "@" not in raw:
+        return ""
+    return raw.split("@", 1)[1].strip().lower()
+
+
+def _same_org_as_template(like_ref: str, emails: list[str]) -> bool:
+    """True when every named To shares the like-sent template's domain."""
+    dom = _email_domain(like_ref)
+    addrs = [e for e in (emails or []) if (e or "").strip()]
+    if not dom or not addrs:
+        return False
+    return all(_email_domain(e) == dom for e in addrs)
 
 
 def _prefer_draft_over_send(user_msg: str, want_send: bool) -> bool:
@@ -3975,7 +3992,25 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             )
                             yield f"_Couldn't load message id `{like_mid}`: {e}_\n"
 
-                    # 2) Company search in Sent
+                    # 2) Exact recipient email in Sent, then company search
+                    if not ref_msg and like_ref and "@" in like_ref:
+                        try:
+                            hit = fetch_latest_sent_to(like_ref)
+                            if hit and (
+                                (hit.get("body_text") or "").strip()
+                                or (hit.get("body_html") or "").strip()
+                            ):
+                                ref_msg = {**hit, "mailbox": "sent"}
+                                sent_rows = [ref_msg]
+                                yield (
+                                    f"_Loaded sent to `{like_ref}` · "
+                                    f"**{(hit.get('subject') or '(no subject)').strip()}**_\n"
+                                )
+                        except Exception as e:
+                            print(
+                                f"[router] like-sent fetch_latest: {e}",
+                                file=sys.stderr,
+                            )
                     if not ref_msg and like_ref:
                         try:
                             sent_rows = find_sent_to_company(
@@ -4114,14 +4149,28 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         # companies need Gemini research (not Magic Bus).
                         block = set(plan.non_recipient_emails())
                         if like_ref and "@" in like_ref:
+                            # Exact template address only — never the whole domain
+                            # (same-org clones e.g. Save the Children → 13 colleagues).
                             block.add(like_ref.lower())
-                            try:
-                                block.add(like_ref.split("@", 1)[1].lower())
-                            except Exception:
-                                pass
+
+                        same_org = _same_org_as_template(
+                            like_ref, locked or list(plan.to_emails or [])
+                        )
+                        if same_org or (
+                            target_company
+                            and name_is_email_fragment(
+                                target_company, user_msg or ""
+                            )
+                        ):
+                            target_company = ""
+                            like_for = ""
+                            if same_org:
+                                scrub_names = []
 
                         early_matched: list[dict[str, Any]] = []
-                        if use_prospect_batch or target_company:
+                        if not recipient_lock and (
+                            use_prospect_batch or target_company
+                        ):
                             early_matched = list(_prospects_with_email(prospects))
                             # If chat lost last_prospects, pull saved Sterlite/etc. contacts
                             if target_company and not early_matched:
@@ -4167,11 +4216,13 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     continue
                                 filtered_early.append(p)
                             early_matched = filtered_early
-                            if early_matched:
+                            if early_matched and not recipient_lock:
                                 use_prospect_batch = True
 
                         companies_to_research: list[str] = []
-                        if target_company and target_company not in (
+                        if recipient_lock or same_org:
+                            companies_to_research = []
+                        elif target_company and target_company not in (
                             "{company}",
                             like_ref,
                             org_label_from_email(like_ref)
@@ -4303,9 +4354,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     and a.lower() == like_ref.lower()
                                 )
                             ]
-                        # "to above" / last search → always use prospect list, not
-                        # history To addresses and never the Magic Bus template.
-                        if use_prospect_batch:
+                        # Named To addresses always win over prospect-list fan-out.
+                        if use_prospect_batch and not recipient_lock:
                             recipients = []
                             matched = early_matched
                             if matched:
@@ -4417,6 +4467,20 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     "`draft to person@currentorg.org`._\n"
                                 )
 
+                        # Stamp explicit Tos onto the payload so _build_draft_jobs
+                        # cannot drop them if parse_directives on draft_msg fails.
+                        if recipients:
+                            payload.pop("from_prospects", None)
+                            payload.pop("use_prospects", None)
+                            if len(recipients) == 1:
+                                payload["recipient_email"] = recipients[0]
+                                payload.pop("recipient_emails", None)
+                                payload["batch"] = False
+                            else:
+                                payload["recipient_emails"] = recipients
+                                payload.pop("recipient_email", None)
+                                payload["batch"] = True
+
                         # Sanitize user_msg so _build_draft_jobs cannot re-scrape
                         # the template email as To via "email like info@…"
                         draft_msg = user_msg or ""
@@ -4475,6 +4539,35 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     j
                                     for j in jobs
                                     if (j.get("recipient_email") or "").lower()
+                                    not in block
+                                ]
+                        if not safe_jobs and (recipients or locked):
+                            retry_tos = [
+                                a
+                                for a in (recipients or locked)
+                                if a
+                                and a.lower() not in block
+                                and a.lower() != (like_ref or "").lower()
+                            ]
+                            if retry_tos:
+                                payload.pop("from_prospects", None)
+                                payload.pop("use_prospects", None)
+                                payload["recipient_emails"] = retry_tos
+                                payload.pop("recipient_email", None)
+                                payload["batch"] = len(retry_tos) > 1
+                                jobs = _build_draft_jobs(
+                                    payload,
+                                    draft_msg,
+                                    history=history,
+                                    prospects=None,
+                                    mailbox_messages=None,
+                                    plan=plan,
+                                )
+                                safe_jobs = [
+                                    j
+                                    for j in jobs
+                                    if (j.get("recipient_email") or "").strip().lower()
+                                    and (j.get("recipient_email") or "").lower()
                                     not in block
                                 ]
                         jobs = safe_jobs
@@ -4562,51 +4655,63 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         action = "send" if want_send else "draft"
 
                         if not jobs:
-                            # Still save the composed email to Drafts for review
-                            # (common when prospect list was empty after a redeploy).
-                            saved = False
-                            try:
-                                from gmail_client.send import save_drive_only_draft
-
-                                body = payload.get("html_body") or ""
-                                subj = payload.get("subject") or "(no subject)"
-                                if body.strip():
-                                    fb = save_drive_only_draft(
-                                        to="",
-                                        subject=subj,
-                                        html_body=body,
-                                        company=target_company or "",
-                                        from_email=headers.get("from_email"),
-                                        cc=headers.get("cc"),
-                                        source="like_sent_needs_to",
-                                        gmail_error="missing recipient",
-                                    )
-                                    if fb.get("draft_id"):
-                                        saved = True
-                                        yield (
-                                            f"I wrote a **{like_ref}**-style email for "
-                                            f"**{target_company or 'your current org'}**, "
-                                            f"but need a **To** address. Saved to "
-                                            f"**Drafts** (`{fb.get('draft_id')}`) — "
-                                            f"open it, set To, then send.\n\n"
-                                            f"Or say e.g. `draft to person@currentorg.org` "
-                                            f"or search contacts for that company first.\n"
-                                        )
-                            except Exception as e:
-                                print(
-                                    f"[router] like_sent drive fallback: {e}",
-                                    file=sys.stderr,
-                                )
-                            if not saved:
+                            named = [
+                                a
+                                for a in (recipients or locked or [])
+                                if (a or "").strip()
+                            ]
+                            if named:
                                 yield (
-                                    f"I wrote a **{like_ref}**-style email for "
-                                    f"**{target_company or 'your current org'}**, but need the "
-                                    "**To** address from your chat (not the Sent template). "
-                                    "Say e.g. `draft to person@currentorg.org` or "
-                                    "`use the previous email from chat`.\n\n"
-                                    f"**Subject:** {payload.get('subject')}\n\n"
-                                    f"{payload.get('html_body')}\n"
+                                    "I cloned the sent email but could not create "
+                                    "Gmail drafts for the named To addresses "
+                                    f"({len(named)}). Try the same request again, "
+                                    "or draft to one address first.\n"
                                 )
+                            else:
+                                # Prospect list empty — save for review with blank To
+                                saved = False
+                                try:
+                                    from gmail_client.send import save_drive_only_draft
+
+                                    body = payload.get("html_body") or ""
+                                    subj = payload.get("subject") or "(no subject)"
+                                    if body.strip():
+                                        fb = save_drive_only_draft(
+                                            to="",
+                                            subject=subj,
+                                            html_body=body,
+                                            company=target_company or "",
+                                            from_email=headers.get("from_email"),
+                                            cc=headers.get("cc"),
+                                            source="like_sent_needs_to",
+                                            gmail_error="missing recipient",
+                                        )
+                                        if fb.get("draft_id"):
+                                            saved = True
+                                            yield (
+                                                f"I wrote a **{like_ref}**-style email for "
+                                                f"**{target_company or 'your current org'}**, "
+                                                f"but need a **To** address. Saved to "
+                                                f"**Drafts** (`{fb.get('draft_id')}`) — "
+                                                f"open it, set To, then send.\n\n"
+                                                f"Or say e.g. `draft to person@currentorg.org` "
+                                                f"or search contacts for that company first.\n"
+                                            )
+                                except Exception as e:
+                                    print(
+                                        f"[router] like_sent drive fallback: {e}",
+                                        file=sys.stderr,
+                                    )
+                                if not saved:
+                                    yield (
+                                        f"I wrote a **{like_ref}**-style email for "
+                                        f"**{target_company or 'your current org'}**, but need the "
+                                        "**To** address from your chat (not the Sent template). "
+                                        "Say e.g. `draft to person@currentorg.org` or "
+                                        "`use the previous email from chat`.\n\n"
+                                        f"**Subject:** {payload.get('subject')}\n\n"
+                                        f"{payload.get('html_body')}\n"
+                                    )
                         else:
                             yield (
                                 f"{'Sending' if want_send else 'Creating Gmail draft(s)'} "

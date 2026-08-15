@@ -58,7 +58,8 @@ _BULK_KEYWORDS = (
     "draft to every prospect",
 )
 _CC_RE = re.compile(
-    r"\bcc\s+(.+?)(?=\b(?:bcc|draft\s+to|ignore|attach|like\s+the|same\s+(?:style\s+)?as|modeled)\b|$)",
+    r"\bcc\s+(.+?)(?=\b(?:bcc|draft\s+to|draft\s+email|ignore|attach|"
+    r"like\s+(?:the|sent)|same\s+(?:style\s+)?as|modeled)\b|$)",
     re.I | re.S,
 )
 _BCC_RE = re.compile(

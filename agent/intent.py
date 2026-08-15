@@ -437,6 +437,24 @@ def resolve_like_sent_from_history(
     return out
 
 
+def name_is_email_fragment(name: str, text: str) -> bool:
+    """True when `name` is a local-part (or prefix) of an email in `text`.
+
+    Stops 'like sent to sheetal.srinivasamurthy@…' from becoming company
+    'sheetal' via a lookahead that treats the '.' in the address as a period.
+    """
+    name = (name or "").strip()
+    blob = text or ""
+    if not name or len(name) < 2 or "@" in name:
+        return bool(name and "@" in name)
+    esc = re.escape(name)
+    if re.search(rf"(?i)\b{esc}@[A-Za-z0-9.\-]+", blob):
+        return True
+    if re.search(rf"(?i)\b{esc}\.[A-Za-z0-9._%+\-]+@", blob):
+        return True
+    return False
+
+
 def parse_explicit_draft_company(user_msg: str) -> str:
     """Extract company from 'draft to Sterlite Tech like …' / 'to Sterlite Tech'."""
     msg = (user_msg or "").strip()
@@ -448,15 +466,16 @@ def parse_explicit_draft_company(user_msg: str) -> str:
         r"in\b|sent\b|items?\b|using\b|based\b)"
         r"[A-Za-z0-9][A-Za-z0-9&.\'\-]*){0,6})"
     )
+    # Do not treat the '.' inside an email as end-of-sentence.
+    end_ok = r"(?=\s+like\b|\s+similar\b|(?:[.?!](?:\s|$))|$)"
     patterns = [
         # draft/create … to Sterlite Tech like email@…
         rf"\b(?:draft|create|compose|write|make|send)\b.{{0,40}}?\bto\s+{company}"
-        rf"(?=\s+like\b|\s+similar\b|\s*[.?!]|$)",
+        + end_ok,
         # to Sterlite Tech like …
         rf"\bto\s+{company}\s+(?=like\b|similar\b)",
         # for Sterlite Tech (when like-sent is also present)
-        rf"\b(?:for|about|targeting)\s+{company}"
-        rf"(?=\s+like\b|\s+similar\b|\s*[.?!]|$)",
+        rf"\b(?:for|about|targeting)\s+{company}" + end_ok,
     ]
     stop_tail = re.compile(
         r"\s+\b(?:and|with|cc|from|subject|attach|draft|send|please|thanks|"
@@ -479,7 +498,7 @@ def parse_explicit_draft_company(user_msg: str) -> str:
             re.I,
         ):
             continue
-        if "@" in name:
+        if "@" in name or name_is_email_fragment(name, msg):
             continue
         return name
     return ""
@@ -516,6 +535,13 @@ def parse_like_sent_request(user_msg: str) -> Optional[dict[str, str]]:
 
     def _target_from_msg(reference: str) -> str:
         explicit = parse_explicit_draft_company(msg)
+        if explicit and name_is_email_fragment(explicit, msg):
+            explicit = ""
+        if explicit and "@" in (reference or ""):
+            local = reference.split("@", 1)[0].lower()
+            el = explicit.lower()
+            if el == local or local.startswith(el + "."):
+                explicit = ""
         if explicit and explicit.lower() != reference.lower():
             return explicit
         # "search contacts from Sterlite … and draft like email@" → Sterlite is target
