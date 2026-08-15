@@ -413,3 +413,48 @@ def test_search_all_skips_linkedin_only_rows():
     assert "Has Mobile" in names
     assert "LI only" not in names
 
+
+def test_required_fields_are_email_or_mobile_not_both():
+    from connectors.zoominfo import (
+        _REACHABLE_REQUIRED_FIELDS,
+        _build_contact_search_body,
+        _with_required_field,
+    )
+
+    assert _REACHABLE_REQUIRED_FIELDS == ("email", "mobilePhone")
+    assert all("," not in field for field in _REACHABLE_REQUIRED_FIELDS)
+    base = _build_contact_search_body({"company_names": ["Acme"]}, limit=5)
+    assert "requiredFields" not in base
+    email_body = _with_required_field(base, "email")
+    mobile_body = _with_required_field(base, "mobilePhone")
+    assert email_body["requiredFields"] == "email"
+    assert mobile_body["requiredFields"] == "mobilePhone"
+    assert email_body["requiredFields"] != "email,mobilePhone"
+
+
+def test_zoominfo_search_sends_required_fields_email_then_mobile():
+    from connectors.zoominfo import ZoomInfoConnector, _REACHABLE_REQUIRED_FIELDS
+
+    posted: list[dict] = []
+    zi = ZoomInfoConnector.__new__(ZoomInfoConnector)
+    zi._configured = lambda: True
+    zi._search_companies = lambda query, limit=10: []
+    zi._contacts_for_companies = lambda *a, **k: []
+
+    def fake_rows(body, fallback_country=""):
+        posted.append(dict(body))
+        return []
+
+    zi._search_contact_rows = fake_rows
+    zi._enrich_contact_rows = lambda contacts, limit=10: []
+    out = zi.search(
+        {"company_names": ["Acme Corp"], "skip_web_csr": True},
+        limit=5,
+    )
+    assert out == []
+    fields = [b.get("requiredFields") for b in posted]
+    assert fields == list(_REACHABLE_REQUIRED_FIELDS)
+    assert all("," not in (f or "") for f in fields)
+    assert all(b.get("companyName") for b in posted)
+
+

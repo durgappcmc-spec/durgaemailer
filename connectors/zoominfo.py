@@ -355,48 +355,27 @@ class ZoomInfoConnector(ProspectConnector):
             ]
 
         if body:
+            last_err = ""
             try:
-                resp = requests.post(
-                    f"{self.BASE}/search/contact",
-                    headers=self._headers(),
-                    json=body,
-                    timeout=45,
-                )
-                if resp.status_code == 400:
-                    # Retry without any geo fields that may still be invalid
-                    retry = {
-                        k: v
-                        for k, v in body.items()
-                        if k
-                        not in ("location", "city", "metroRegion", "state", "zipCode")
-                    }
-                    if "country" not in retry and _guess_country(query):
-                        retry["country"] = _guess_country(query)
-                    if len(retry) > 2:
-                        resp = requests.post(
-                            f"{self.BASE}/search/contact",
-                            headers=self._headers(),
-                            json=retry,
-                            timeout=45,
+                for field in _REACHABLE_REQUIRED_FIELDS:
+                    remaining = max(limit - len(results), 0)
+                    if remaining <= 0:
+                        break
+                    req_body = _with_required_field(body, field)
+                    try:
+                        contacts = self._search_contact_rows(
+                            req_body,
+                            fallback_country=_guess_country(query) or "",
                         )
-                if resp.status_code >= 400 and not results:
-                    detail = (resp.text or "")[:300]
-                    return [
-                        {
-                            "source": self.name,
-                            "error": f"{resp.status_code} from ZoomInfo: {detail}",
-                        }
-                    ]
-                if resp.status_code < 400:
-                    resp.raise_for_status()
-                    data = resp.json()
-                    contacts = data.get("data") or data.get("contacts") or []
+                    except Exception as e:
+                        last_err = str(e)
+                        print(
+                            f"[zoominfo] search error (requiredFields={field}): {e}",
+                            file=sys.stderr,
+                        )
+                        continue
                     contacts = sorted(
-                        [
-                            c
-                            for c in contacts
-                            if isinstance(c, dict)
-                        ],
+                        contacts,
                         key=lambda c: (
                             0 if c.get("hasEmail") else 1,
                             0 if c.get("hasSupplementalEmail") else 1,
@@ -406,12 +385,15 @@ class ZoomInfoConnector(ProspectConnector):
                     )
                     flagged = [c for c in contacts if _search_hit_has_contact(c)]
                     results.extend(
-                        self._enrich_contact_rows(flagged or contacts, limit=limit)
+                        self._enrich_contact_rows(
+                            flagged or contacts, limit=remaining
+                        )
                     )
             except Exception as e:
                 print(f"[zoominfo] search error: {e}", file=sys.stderr)
-                if not results:
-                    return [{"source": self.name, "error": str(e)}]
+                last_err = str(e)
+            if not results and last_err:
+                return [{"source": self.name, "error": last_err}]
 
         # Dedupe; keep only people with email or mobile
         seen: set[str] = set()
@@ -559,6 +541,54 @@ class ZoomInfoConnector(ProspectConnector):
 
         return list(by_id.values())
 
+    def _search_contact_rows(
+        self,
+        body: dict[str, Any],
+        *,
+        fallback_country: str = "",
+    ) -> list[dict[str, Any]]:
+        """POST /search/contact. Retry without geo or requiredFields on 400."""
+        payload = dict(body)
+        resp = requests.post(
+            f"{self.BASE}/search/contact",
+            headers=self._headers(),
+            json=payload,
+            timeout=45,
+        )
+        if resp.status_code == 400:
+            retry = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("location", "city", "metroRegion", "state", "zipCode")
+            }
+            if fallback_country and "country" not in retry:
+                retry["country"] = fallback_country
+            if retry != payload and len(retry) > 2:
+                resp = requests.post(
+                    f"{self.BASE}/search/contact",
+                    headers=self._headers(),
+                    json=retry,
+                    timeout=45,
+                )
+                payload = retry
+        if resp.status_code == 400 and payload.get("requiredFields"):
+            retry = {k: v for k, v in payload.items() if k != "requiredFields"}
+            if len(retry) > 2:
+                print(
+                    "[zoominfo] requiredFields rejected; retrying without",
+                    file=sys.stderr,
+                )
+                resp = requests.post(
+                    f"{self.BASE}/search/contact",
+                    headers=self._headers(),
+                    json=retry,
+                    timeout=45,
+                )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        rows = data.get("data") or data.get("contacts") or []
+        return [r for r in rows if isinstance(r, dict)]
+
     def _contacts_for_companies(
         self,
         companies: list[dict[str, Any]],
@@ -644,80 +674,78 @@ class ZoomInfoConnector(ProspectConnector):
             cid = co.get("id") or co.get("companyId")
             if not cid:
                 return
-            body: dict[str, Any] = {
-                "companyId": str(cid),
-                "rpp": _contact_search_rpp(limit - len(out)),
-                "page": 1,
-            }
-            if job_title:
-                body["jobTitle"] = job_title
-            try:
-                resp = requests.post(
-                    f"{self.BASE}/search/contact",
-                    headers=self._headers(),
-                    json=body,
-                    timeout=45,
+            for field in _REACHABLE_REQUIRED_FIELDS:
+                if len(out) >= limit:
+                    return
+                body: dict[str, Any] = {
+                    "companyId": str(cid),
+                    "rpp": _contact_search_rpp(limit - len(out)),
+                    "page": 1,
+                    "requiredFields": field,
+                }
+                if job_title:
+                    body["jobTitle"] = job_title
+                try:
+                    rows = self._search_contact_rows(body)
+                except Exception as e:
+                    label = job_title or "(any)"
+                    print(
+                        f"[zoominfo] contacts-for-company error "
+                        f"({label}/{field}): {e}",
+                        file=sys.stderr,
+                    )
+                    continue
+                added = _append_rows(
+                    rows,
+                    company_name=str(co.get("name") or ""),
+                    job_title=job_title,
+                    prefer_csr=prefer_csr,
                 )
-                resp.raise_for_status()
-                rows = (resp.json() or {}).get("data") or []
-            except Exception as e:
-                label = job_title or "(any)"
-                print(
-                    f"[zoominfo] contacts-for-company error ({label}): {e}",
-                    file=sys.stderr,
-                )
-                return
-            added = _append_rows(
-                rows,
-                company_name=str(co.get("name") or ""),
-                job_title=job_title,
-                prefer_csr=prefer_csr,
-            )
-            if added:
-                print(
-                    f"[zoominfo] title hit {job_title!r} → +{added} "
-                    f"at {co.get('name') or co.get('id')}",
-                    file=sys.stderr,
-                )
+                if added:
+                    print(
+                        f"[zoominfo] title hit {job_title!r} "
+                        f"required={field} → +{added} "
+                        f"at {co.get('name') or co.get('id')}",
+                        file=sys.stderr,
+                    )
 
         def _append_from_domain(
             domain: str, *, job_title: Optional[str] = None, prefer_csr: bool = False
         ) -> None:
             if len(out) >= limit or not domain:
                 return
-            body: dict[str, Any] = {
-                "companyWebsite": domain,
-                "rpp": _contact_search_rpp(limit - len(out)),
-                "page": 1,
-            }
-            if job_title:
-                body["jobTitle"] = job_title
-            try:
-                resp = requests.post(
-                    f"{self.BASE}/search/contact",
-                    headers=self._headers(),
-                    json=body,
-                    timeout=45,
+            for field in _REACHABLE_REQUIRED_FIELDS:
+                if len(out) >= limit:
+                    return
+                body: dict[str, Any] = {
+                    "companyWebsite": domain,
+                    "rpp": _contact_search_rpp(limit - len(out)),
+                    "page": 1,
+                    "requiredFields": field,
+                }
+                if job_title:
+                    body["jobTitle"] = job_title
+                try:
+                    rows = self._search_contact_rows(body)
+                except Exception as e:
+                    print(
+                        f"[zoominfo] domain contact error "
+                        f"({domain!r}/{job_title!r}/{field}): {e}",
+                        file=sys.stderr,
+                    )
+                    continue
+                added = _append_rows(
+                    rows,
+                    company_name=domain,
+                    job_title=job_title or f"domain:{domain}",
+                    prefer_csr=prefer_csr,
                 )
-                resp.raise_for_status()
-                rows = (resp.json() or {}).get("data") or []
-            except Exception as e:
-                print(
-                    f"[zoominfo] domain contact error ({domain!r}/{job_title!r}): {e}",
-                    file=sys.stderr,
-                )
-                return
-            added = _append_rows(
-                rows,
-                company_name=domain,
-                job_title=job_title or f"domain:{domain}",
-                prefer_csr=prefer_csr,
-            )
-            if added:
-                print(
-                    f"[zoominfo] domain hit {domain!r} title={job_title!r} → +{added}",
-                    file=sys.stderr,
-                )
+                if added:
+                    print(
+                        f"[zoominfo] domain hit {domain!r} title={job_title!r} "
+                        f"required={field} → +{added}",
+                        file=sys.stderr,
+                    )
 
         def _csr_count() -> int:
             return sum(
@@ -1558,6 +1586,19 @@ def _prospect_has_email_or_mobile(row: dict[str, Any] | None) -> bool:
         if str(row.get("email") or "").strip():
             return True
         return bool(str(row.get("mobile") or row.get("phone") or "").strip())
+
+
+# ZoomInfo requiredFields is AND. Search email, then mobile — never both at once.
+_REACHABLE_REQUIRED_FIELDS = ("email", "mobilePhone")
+
+
+def _with_required_field(body: dict[str, Any], field: str) -> dict[str, Any]:
+    """Copy a contact-search body and require one reachable field."""
+    out = dict(body)
+    flag = str(field or "").strip()
+    if flag:
+        out["requiredFields"] = flag
+    return out
 
 
 def _contact_search_rpp(want: int) -> int:
