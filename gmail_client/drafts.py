@@ -234,6 +234,26 @@ def extract_gmail_attachments(
     return out
 
 
+def _payload_hints_files(payload: dict) -> bool:
+    """True when Gmail MIME lists a filename/attachment even if bytes were not fetched."""
+
+    def walk(part: dict) -> bool:
+        if not isinstance(part, dict):
+            return False
+        if str(part.get("filename") or "").strip():
+            return True
+        for h in part.get("headers") or []:
+            if not isinstance(h, dict):
+                continue
+            if (h.get("name") or "").lower() != "content-disposition":
+                continue
+            if "attachment" in (h.get("value") or "").lower():
+                return True
+        return any(walk(c) for c in (part.get("parts") or []) if isinstance(c, dict))
+
+    return walk(payload or {})
+
+
 def _atts_for_gmail_mime(atts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """{name, data, mime_type} rows for _build_raw_message."""
     out: list[dict[str, Any]] = []
@@ -357,6 +377,7 @@ def _defer_open_pixel(
     subject: str = "",
     from_email: str = "",
     attachments: Optional[list[dict[str, Any]]] = None,
+    skip_persist: bool = False,
 ) -> str:
     """Strip live open pixels from draft HTML; persist to Gmail when we have a draft id."""
     html = body_html or ""
@@ -374,7 +395,7 @@ def _defer_open_pixel(
         except Exception:
             return html
     did = (draft_id or "").removeprefix("gmail:")
-    if did:
+    if did and not skip_persist:
         try:
             saved = save_gmail_draft(
                 did,
@@ -482,6 +503,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
     attachments = extract_gmail_attachments(att_payload, msg_id=mid)
     if not attachments and att_payload is not payload:
         attachments = extract_gmail_attachments(payload, msg_id=mid)
+    hinted_files = _payload_hints_files(att_payload) or _payload_hints_files(payload)
     body_html = _defer_open_pixel(
         body_html,
         draft_id=did,
@@ -491,6 +513,7 @@ def fetch_gmail_draft(draft_id: str) -> dict[str, Any]:
         subject=headers.get("subject", ""),
         from_email=headers.get("from", ""),
         attachments=attachments,
+        skip_persist=bool(hinted_files and not attachments),
     )
     return {
         "id": did,
@@ -611,7 +634,7 @@ def save_gmail_draft(
         plain_from_html,
         sanitize_email_html,
     )
-    from gmail_client.send import _build_raw_message, default_from_email
+    from gmail_client.send import _build_raw_message, default_from_email, put_gmail_draft_raw
 
     did = (draft_id or "").removeprefix("gmail:")
     if not did:
@@ -645,12 +668,10 @@ def save_gmail_draft(
             cc=cc_n or None,
             bcc=bcc_n or None,
         )
-        svc = gmail_service()
-        updated = (
-            svc.users()
-            .drafts()
-            .update(userId="me", id=did, body={"message": {"raw": raw}})
-            .execute()
+        updated = put_gmail_draft_raw(
+            raw,
+            draft_id=did,
+            use_media=bool(attachments),
         )
         return {
             "ok": True,
@@ -1124,7 +1145,7 @@ def _update_draft_html(
     subject: Optional[str] = None,
 ) -> None:
     """Replace draft MIME with tracked HTML (+ optional attachments)."""
-    from gmail_client.send import _build_raw_message
+    from gmail_client.send import _build_raw_message, put_gmail_draft_raw
 
     raw, _tid = _build_raw_message(
         to=draft.get("to") or draft.get("recipient") or "",
@@ -1138,9 +1159,8 @@ def _update_draft_html(
         bcc=draft.get("bcc") or None,
         recipient_name=draft.get("recipient_name") or None,
     )
-    svc = gmail_service()
-    svc.users().drafts().update(
-        userId="me",
-        id=gmail_draft_id,
-        body={"message": {"raw": raw}},
-    ).execute()
+    put_gmail_draft_raw(
+        raw,
+        draft_id=gmail_draft_id,
+        use_media=bool(attachments),
+    )

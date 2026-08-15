@@ -55,6 +55,46 @@ def test_attachment_cap(monkeypatch):
     assert results[0].get("error") and "25" in results[0]["error"]
 
 
+def test_build_raw_message_keeps_attachment_as_mixed_sibling():
+    import base64
+    from email import policy
+    from email.parser import BytesParser
+
+    from gmail_client.send import _build_raw_message
+
+    blob = b"%PDF-fake-attachment%"
+    raw, _tid = _build_raw_message(
+        "a@x.org",
+        "Hi",
+        "<p>Hello</p>",
+        attachments=[
+            {
+                "name": "one-pager.pdf",
+                "data": blob,
+                "mime_type": "application/pdf",
+            }
+        ],
+        instrument=False,
+        include_signature=False,
+        plain_body="Hello",
+        from_email="csr@example.com",
+    )
+    decoded = base64.urlsafe_b64decode(raw + "==")
+    text = decoded.decode("latin1")
+    assert text.lower().count("\nfrom:") + (
+        1 if text.lower().startswith("from:") else 0
+    ) == 1
+    msg = BytesParser(policy=policy.default).parsebytes(decoded)
+    files = [p.get_filename() for p in msg.walk() if p.get_filename()]
+    assert files == ["one-pager.pdf"]
+    for part in msg.walk():
+        if part.get_filename() != "one-pager.pdf":
+            continue
+        assert part.get_content_type() == "application/pdf"
+        assert part.get_content_disposition() == "attachment"
+        assert part.get_payload(decode=True) == blob
+
+
 def test_merge_draft_attachments_keeps_and_replaces():
     from components.draft_inspector import merge_draft_attachments
 

@@ -617,13 +617,7 @@ def _render_gmail_edit_tab(
     if not save_clicked and not send_clicked:
         return
 
-    from gmail_client.attachments import files_to_attachments
-
-    merged = merge_draft_attachments(
-        existing_atts,
-        keep_flags,
-        files_to_attachments(uploads),
-    )
+    merged = merge_draft_attachments(existing_atts, keep_flags, uploads)
     total = _attachment_total_bytes(merged)
     if total > 20 * 1024 * 1024:
         st.error(
@@ -676,6 +670,28 @@ def _render_gmail_edit_tab(
     elif want_bcc and not gmail_bcc:
         print(f"[gmail] Bcc omitted by API (cached locally): {want_bcc!r}")
 
+    gmail_atts = fetched.get("attachments") or []
+    if atts and not gmail_atts:
+        saved = save_gmail_draft(
+            gid,
+            new_to,
+            new_cc,
+            new_bcc,
+            new_subject,
+            new_body,
+            attachments=atts,
+            from_email=draft.get("from") or None,
+        )
+        if saved.get("error"):
+            st.error(saved["error"])
+            return
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        fetched = fetch_gmail_draft(gid)
+        gmail_atts = fetched.get("attachments") or []
+
     if issues:
         st.error("Gmail save did not round-trip:\n\n" + "\n\n".join(issues))
         return
@@ -689,6 +705,12 @@ def _render_gmail_edit_tab(
         pass
 
     _clear_gmail_edit_keys(gid)
+    if atts and not gmail_atts:
+        st.warning(
+            "Saved the draft text, but Gmail did not keep the attachment. "
+            "Open Edit and click Save to Gmail again."
+        )
+        st.rerun()
     if send_clicked:
         result = send_draft(gid)
         if result.get("error"):
@@ -740,7 +762,6 @@ def _render_edit_tab(
 ) -> None:
     from core.tracking import inject_tracking, strip_tracking
     from core import drive_db
-    from gmail_client.attachments import files_to_attachments
 
     st.caption(
         "Edit like a normal email — bold, font, bullets, links. "
@@ -788,9 +809,7 @@ def _render_edit_tab(
     if not save:
         return
 
-    kept_merged = merge_draft_attachments(
-        existing, keep_flags, files_to_attachments(uploads)
-    )
+    kept_merged = merge_draft_attachments(existing, keep_flags, uploads)
     total = _attachment_total_bytes(kept_merged)
     if total > 20 * 1024 * 1024:
         st.error(
@@ -942,8 +961,14 @@ def _attachment_total_bytes(atts: list[dict[str, Any]]) -> int:
 
 def _render_attachment_editor(
     existing: list[Any], *, key: str
-) -> tuple[list[dict[str, Any]], list[bool], list[Any]]:
-    """Checkboxes for current files plus a multi-file uploader."""
+) -> tuple[list[dict[str, Any]], list[bool], list[dict[str, Any]]]:
+    """Checkboxes for current files plus a multi-file uploader.
+
+    New uploads are staged in session so a Quill rerun does not drop the bytes
+    before Save to Gmail.
+    """
+    from gmail_client.attachments import files_to_attachments
+
     rows = [a for a in (existing or []) if isinstance(a, dict)]
     keep_flags: list[bool] = []
     if rows:
@@ -966,9 +991,22 @@ def _render_attachment_editor(
         "Attach files",
         accept_multiple_files=True,
         key=f"{key}_upload",
-        help="PDF, Word, Excel, images, etc. Included when you save / send.",
+        help="PDF, Word, Excel, images, etc. Saved onto the Gmail draft when you click Save.",
     )
-    return rows, keep_flags, list(uploads) if uploads else []
+    staged_key = f"{key}_staged"
+    if uploads:
+        st.session_state[staged_key] = files_to_attachments(list(uploads))
+    staged = [
+        a
+        for a in (st.session_state.get(staged_key) or [])
+        if isinstance(a, dict)
+    ]
+    if staged:
+        names = ", ".join(
+            str(a.get("name") or a.get("filename") or "file") for a in staged
+        )
+        st.caption(f"Ready to save: {names}")
+    return rows, keep_flags, staged
 
 
 def _attachments_for_storage(atts: list[dict[str, Any]]) -> list[dict[str, Any]]:

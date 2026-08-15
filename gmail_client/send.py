@@ -6,9 +6,11 @@ import base64
 import re
 import sys
 import time
-from email.mime.application import MIMEApplication
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.policy import SMTP
 from typing import Any, Optional
 
 from config import settings
@@ -167,7 +169,57 @@ def _build_raw_message(
 
     cc_header = _normalize_cc(cc)
     bcc_header = _normalize_cc(bcc)
-    msg = MIMEMultipart("alternative")
+
+    alt = MIMEMultipart("alternative")
+    if plain_body is not None:
+        alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+    alt.attach(MIMEText(body, "html", "utf-8"))
+
+    if attachments:
+        # Headers belong only on the outer mixed part. Putting From/To/Subject
+        # on the inner alternative makes Gmail treat that as the whole message
+        # and drop sibling file parts.
+        msg = MIMEMultipart("mixed")
+        _apply_rfc822_headers(
+            msg,
+            from_addr=from_addr,
+            to=to,
+            cc_header=cc_header,
+            bcc_header=bcc_header,
+            subject=subject,
+            recipient_name=recipient_name,
+        )
+        msg.attach(alt)
+        for att in attachments:
+            part = _mime_attachment_part(att)
+            if part is not None:
+                msg.attach(part)
+    else:
+        msg = alt
+        _apply_rfc822_headers(
+            msg,
+            from_addr=from_addr,
+            to=to,
+            cc_header=cc_header,
+            bcc_header=bcc_header,
+            subject=subject,
+            recipient_name=recipient_name,
+        )
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes(policy=SMTP)).decode("ascii")
+    return raw, tracking_id
+
+
+def _apply_rfc822_headers(
+    msg: MIMEMultipart,
+    *,
+    from_addr: str,
+    to: str,
+    cc_header: str,
+    bcc_header: str,
+    subject: str,
+    recipient_name: Optional[str],
+) -> None:
     if from_addr:
         msg["From"] = from_addr
     msg["To"] = to
@@ -178,31 +230,85 @@ def _build_raw_message(
     msg["Subject"] = subject
     if recipient_name:
         msg["X-Recipient-Name"] = recipient_name
-    if plain_body is not None:
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-    msg.attach(MIMEText(body, "html", "utf-8"))
 
-    if attachments:
-        mixed = MIMEMultipart("mixed")
-        if from_addr:
-            mixed["From"] = from_addr
-        mixed["To"] = to
-        if cc_header:
-            mixed["Cc"] = cc_header
-        if bcc_header:
-            mixed["Bcc"] = bcc_header
-        mixed["Subject"] = subject
-        mixed.attach(msg)
-        for att in attachments:
-            part = MIMEApplication(att.get("data") or b"", Name=att.get("name") or "file")
-            part["Content-Disposition"] = (
-                f'attachment; filename="{att.get("name") or "file"}"'
+
+def _mime_attachment_part(att: dict[str, Any]) -> Optional[MIMEBase]:
+    if not isinstance(att, dict):
+        return None
+    data = att.get("data") or att.get("content")
+    if not data and att.get("data_base64"):
+        try:
+            data = base64.b64decode(att["data_base64"])
+        except Exception:
+            data = None
+    if not data:
+        return None
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    name = str(att.get("name") or att.get("filename") or "file")
+    mime = str(
+        att.get("mime_type") or att.get("mimeType") or "application/octet-stream"
+    )
+    main, _, sub = mime.partition("/")
+    if not main or not sub:
+        main, sub = "application", "octet-stream"
+    part = MIMEBase(main, sub)
+    part.set_payload(data)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=name)
+    return part
+
+
+def put_gmail_draft_raw(
+    raw: str,
+    *,
+    draft_id: Optional[str] = None,
+    thread_id: str = "",
+    use_media: bool = False,
+) -> dict[str, Any]:
+    """Create or update a Gmail draft from RFC822 raw. Media upload keeps files."""
+    svc = gmail_service()
+    tid = (thread_id or "").strip()
+    if use_media:
+        try:
+            from googleapiclient.http import MediaInMemoryUpload
+
+            blob = base64.urlsafe_b64decode((raw or "") + "==")
+            media = MediaInMemoryUpload(blob, mimetype="message/rfc822")
+            body: dict[str, Any] = {"message": {}}
+            if tid:
+                body["message"]["threadId"] = tid
+            if draft_id:
+                return (
+                    svc.users()
+                    .drafts()
+                    .update(
+                        userId="me",
+                        id=draft_id,
+                        body=body,
+                        media_body=media,
+                    )
+                    .execute()
+                )
+            return (
+                svc.users()
+                .drafts()
+                .create(userId="me", body=body, media_body=media)
+                .execute()
             )
-            mixed.attach(part)
-        msg = mixed
-
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    return raw, tracking_id
+        except Exception as e:
+            print(f"[gmail] media draft upload failed, using JSON raw: {e}", file=sys.stderr)
+    body = {"message": {"raw": raw}}
+    if tid:
+        body["message"]["threadId"] = tid
+    if draft_id:
+        return (
+            svc.users()
+            .drafts()
+            .update(userId="me", id=draft_id, body=body)
+            .execute()
+        )
+    return svc.users().drafts().create(userId="me", body=body).execute()
 
 
 def _verify_gmail_plain_matches(gmail_draft_id: str, body_cleaned: str) -> None:
@@ -305,12 +411,8 @@ def create_draft(
     )
     instrumented_html = body
     try:
-        svc = gmail_service()
-        draft = (
-            svc.users()
-            .drafts()
-            .create(userId="me", body={"message": {"raw": raw}})
-            .execute()
+        draft = put_gmail_draft_raw(
+            raw, use_media=bool(attachments)
         )
         message = draft.get("message") or {}
         result = {
