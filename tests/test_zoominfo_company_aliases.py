@@ -160,6 +160,54 @@ def test_room_to_read_india_not_treated_as_geo_or_wrong_firm():
     assert all("azad" not in (c.get("name") or "").lower() for c in ranked)
 
 
+def test_breakthrough_india_aliases_and_rank():
+    from connectors.zoominfo import (
+        _is_nonprofit_query,
+        _strip_geo_company_name,
+        _title_cascade_for_query,
+        _with_company_name_aliases,
+    )
+
+    assert _strip_geo_company_name("Breakthrough India") == "Breakthrough"
+    q = _with_company_name_aliases({"company_names": ["Breakthrough India"]})
+    names = [n.lower() for n in q["company_names"]]
+    assert "breakthrough" in names
+    assert "inbreakthrough.org" in [d.lower() for d in q.get("company_domains") or []]
+    assert _is_nonprofit_query({"company_names": ["Breakthrough"]}) is True
+    titles, _expand = _title_cascade_for_query({"company_names": ["Breakthrough India"]})
+    assert titles[0] == "Founder"
+
+    firms = [
+        {
+            "id": "hk",
+            "name": "Breakthrough",
+            "website": "www.breakthrough.org.hk",
+            "country": "Canada",
+        },
+        {
+            "id": "bmgi",
+            "name": "Breakthrough Management Group India Pvt",
+            "website": "www.innovatewithbmgi.com",
+            "country": "India",
+        },
+        {
+            "id": "ngo",
+            "name": "Breakthrough",
+            "website": "www.inbreakthrough.org",
+            "country": "India",
+            "city": "New Delhi",
+        },
+    ]
+    ranked = _rank_companies_for_query(
+        firms, "Breakthrough India", domains=["inbreakthrough.org"]
+    )
+    assert ranked[0]["id"] == "ngo"
+    ranked2 = _rank_companies_for_query(
+        firms, "Breakthrough", domains=["inbreakthrough.org"]
+    )
+    assert ranked2[0]["id"] == "ngo"
+
+
 def test_fields_without_invalid_strips_disallowed():
     from connectors.zoominfo import _fields_without_invalid
 

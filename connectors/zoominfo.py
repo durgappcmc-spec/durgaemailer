@@ -517,27 +517,30 @@ class ZoomInfoConnector(ProspectConnector):
                 body["companyKeywords"] = keywords
             body.update(geo)
             _post_company(body, names)
-            if len(by_id) >= max(limit, 10):
-                break
 
-        if not by_id and query.get("company_domains"):
-            for dom in (
-                query["company_domains"]
-                if isinstance(query["company_domains"], list)
-                else [_join(query["company_domains"])]
-            )[:3]:
-                d = str(dom or "").strip()
-                if not d:
-                    continue
-                body = {
-                    "rpp": min(max(int(limit), 1), 100),
-                    "page": 1,
-                    "companyWebsite": d,
-                }
-                body.update(geo)
-                _post_company(body, f"domain:{d}")
-                if by_id:
-                    break
+        # India pass: ZI's India UI ranks local "Breakthrough" / NGOs first;
+        # unscoped name search fills with US/HK namesakes and would skip this.
+        for names in (name_candidates or [])[:4]:
+            if not str(names or "").strip():
+                continue
+            body = {
+                "rpp": min(max(int(limit), 1), 100),
+                "page": 1,
+                "companyName": str(names).strip(),
+                "country": "India",
+            }
+            _post_company(body, f"{names}+India")
+
+        domains_q = query.get("company_domains") or query.get("domains") or []
+        if isinstance(domains_q, str):
+            domains_q = [domains_q] if domains_q.strip() else []
+        for d in [str(x).strip() for x in domains_q if str(x).strip()][:3]:
+            body = {
+                "rpp": min(max(int(limit), 1), 100),
+                "page": 1,
+                "companyWebsite": d,
+            }
+            _post_company(body, f"domain:{d}")
 
         return list(by_id.values())
 
@@ -1908,6 +1911,8 @@ _KNOWN_NONPROFITS = {
     "child rights and you",
     "help age india",
     "helpage india",
+    "breakthrough",
+    "breakthrough india",
 }
 
 
@@ -2073,6 +2078,8 @@ _COMPANY_ALIASES: dict[str, list[str]] = {
     "room to read india": ["Room To Read India", "Room to Read India"],
     "learning links": ["Learning Links Foundation", "Learning Links"],
     "learning links foundation": ["Learning Links Foundation"],
+    "breakthrough": ["Breakthrough"],
+    "breakthrough india": ["Breakthrough", "Breakthrough India"],
 }
 
 # Optional website domains to help company match
@@ -2085,6 +2092,8 @@ _COMPANY_DOMAINS: dict[str, list[str]] = {
     "room to read india": ["roomtoreadindia.org"],
     "learning links": ["learninglinksindia.org"],
     "learning links foundation": ["learninglinksindia.org"],
+    "breakthrough": ["inbreakthrough.org"],
+    "breakthrough india": ["inbreakthrough.org"],
 }
 
 
@@ -2113,6 +2122,20 @@ def _with_company_name_aliases(query: dict[str, Any]) -> dict[str, Any]:
                 continue
             seen.add(lk)
             expanded.append(c)
+        stripped = _strip_geo_company_name(raw)
+        if stripped:
+            for cand in [stripped] + _COMPANY_ALIASES.get(stripped.lower(), []):
+                c = str(cand).strip()
+                if not c:
+                    continue
+                lk = c.lower()
+                if lk in seen:
+                    continue
+                seen.add(lk)
+                expanded.append(c)
+            for d in _COMPANY_DOMAINS.get(stripped.lower(), []):
+                if d and d not in domain_extra:
+                    domain_extra.append(d)
         for d in _COMPANY_DOMAINS.get(key, []):
             if d and d not in domain_extra:
                 domain_extra.append(d)
@@ -2143,6 +2166,7 @@ def _rank_companies_for_query(
         for t in needle_n.split()
         if len(t) >= 4 and t not in _GEO_NAME_TOKENS
     ]
+    brand_n = " ".join(tokens).strip()
     extra_domains = [
         re.sub(r"^www\.", "", str(d or "").strip().lower())
         for d in (domains or [])
@@ -2165,6 +2189,8 @@ def _rank_companies_for_query(
         sc = 0
         if needle_n and needle_n == name_n:
             sc += 200
+        elif brand_n and brand_n == name_n:
+            sc += 180
         elif needle_n and needle_n in name_n:
             sc += 100
         elif name_n and needle_n and name_n in needle_n:
@@ -2183,6 +2209,8 @@ def _rank_companies_for_query(
             sc += 30
         if country == "india":
             sc += 15
+        if re.search(r"\.org(?:\b|/|$)", website):
+            sc += 25
         return (-sc, name)
 
     ranked = sorted([c for c in companies if isinstance(c, dict)], key=score)
@@ -2238,6 +2266,16 @@ _GEO_NAME_TOKENS = frozenset(
         "australian",
     }
 )
+
+
+def _strip_geo_company_name(name: str) -> str:
+    """'Breakthrough India' → 'Breakthrough' (country is not part of the ZI name)."""
+    parts = [p for p in re.sub(r"\s+", " ", str(name or "").strip()).split(" ") if p]
+    kept = [p for p in parts if p.lower().strip(".,") not in _GEO_NAME_TOKENS]
+    out = " ".join(kept).strip()
+    if not out or out.lower() == str(name or "").strip().lower():
+        return ""
+    return out
 
 
 def _location_blob(query: dict[str, Any]) -> str:
