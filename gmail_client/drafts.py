@@ -873,6 +873,151 @@ def list_gmail_drafts(limit: int = 200) -> list[dict[str, Any]]:
     return rows
 
 
+def draft_identity_keys(row: dict[str, Any]) -> set[str]:
+    """Stable ids used to match a Gmail draft to its Drive metadata row."""
+    keys: set[str] = set()
+    did = str(row.get("draft_id") or "").strip()
+    gid = str(row.get("gmail_draft_id") or "").strip().removeprefix("gmail:")
+    mid = str(row.get("gmail_message_id") or "").strip()
+    if mid.startswith("gmail-msg:"):
+        mid = mid.removeprefix("gmail-msg:")
+    if did:
+        keys.add(did)
+        if did.startswith("gmail:"):
+            keys.add(did.removeprefix("gmail:"))
+        elif did.startswith("gmail-msg:"):
+            keys.add(did.removeprefix("gmail-msg:"))
+            keys.add(did)
+        else:
+            keys.add(f"gmail:{did}")
+    if gid:
+        keys.add(gid)
+        keys.add(f"gmail:{gid}")
+    if mid:
+        keys.add(mid)
+        keys.add(f"gmail-msg:{mid}")
+    return {k for k in keys if k}
+
+
+def _drive_row_had_gmail(row: dict[str, Any]) -> bool:
+    did = str(row.get("draft_id") or "")
+    gid = str(row.get("gmail_draft_id") or "").strip()
+    mid = str(row.get("gmail_message_id") or "").strip()
+    return bool(
+        gid
+        or mid
+        or did.startswith("gmail:")
+        or did.startswith("gmail-msg:")
+    )
+
+
+def merge_gmail_and_drive_drafts(
+    gmail_rows: list[dict[str, Any]],
+    drive_rows: list[dict[str, Any]],
+    *,
+    gmail_ok: bool = True,
+) -> list[dict[str, Any]]:
+    """Gmail Drafts folder is the list of emails still to send.
+
+    Drive only enriches matching live Gmail rows (title, tracking). A Drive
+    copy of a Gmail draft that is no longer in Drafts (already sent or
+    discarded) is hidden. True Drive-only fallbacks (never reached Gmail)
+    stay visible so a failed create is not lost.
+    """
+    by_primary: dict[str, dict[str, Any]] = {}
+    key_to_primary: dict[str, str] = {}
+
+    def _index(row: dict[str, Any], primary: str) -> None:
+        by_primary[primary] = row
+        for k in draft_identity_keys(row):
+            key_to_primary[k] = primary
+
+    for r in gmail_rows or []:
+        if r.get("error"):
+            continue
+        primary = str(r.get("draft_id") or "").strip()
+        if not primary:
+            gid = str(r.get("gmail_draft_id") or "").strip()
+            primary = f"gmail:{gid}" if gid else ""
+        if not primary:
+            continue
+        _index(
+            {**r, "origin": "gmail", "status": r.get("status") or "draft"},
+            primary,
+        )
+
+    leftovers: list[dict[str, Any]] = []
+    for r in drive_rows or []:
+        keys = draft_identity_keys(r)
+        hit = next((key_to_primary[k] for k in keys if k in key_to_primary), None)
+        if hit:
+            cur = by_primary[hit]
+            if not cur.get("tracking_id") and r.get("tracking_id"):
+                cur["tracking_id"] = r["tracking_id"]
+            cur["has_open_pixel"] = cur.get("has_open_pixel") or r.get(
+                "has_open_pixel"
+            )
+            for extra in (
+                "title",
+                "designation",
+                "company",
+                "recipient_name",
+                "bulk_job_id",
+            ):
+                if not cur.get(extra) and r.get(extra):
+                    cur[extra] = r[extra]
+            cur["origin"] = "drive+gmail"
+            continue
+        leftovers.append(r)
+
+    for r in leftovers:
+        status = str(r.get("status") or "draft").lower()
+        if status in ("sent", "deleted"):
+            continue
+        did = str(r.get("draft_id") or "").strip()
+        if not did:
+            continue
+        if gmail_ok and _drive_row_had_gmail(r):
+            # Gmail Drafts no longer has this message → already sent/removed
+            continue
+        _index({**r, "origin": r.get("source") or "drive"}, did)
+
+    return list(by_primary.values())
+
+
+def mark_drive_draft_sent(
+    *,
+    gmail_draft_id: str = "",
+    draft_id: str = "",
+) -> None:
+    """Flip Drive index status so a sent Gmail draft cannot reappear as to-send."""
+    try:
+        from core import drive_db
+    except Exception:
+        return
+    ids: list[str] = []
+    if draft_id:
+        ids.append(str(draft_id).strip())
+    gid = str(gmail_draft_id or "").strip().removeprefix("gmail:")
+    if gid:
+        ids.append(f"gmail:{gid}")
+        ids.append(gid)
+    seen: set[str] = set()
+    for did in ids:
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        try:
+            d = drive_db.load_draft(did)
+        except Exception:
+            continue
+        d["status"] = "sent"
+        try:
+            drive_db.save_draft(did, d)
+        except Exception as e:
+            print(f"[gmail] mark drive sent skipped {did}: {e}", file=sys.stderr)
+
+
 def get_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
     """Full draft. HTML is primary; text/plain is not re-cleaned on read."""
     fetched = fetch_gmail_draft(gmail_draft_id)
@@ -1079,6 +1224,10 @@ def send_gmail_draft(gmail_draft_id: str) -> dict[str, Any]:
             .drafts()
             .send(userId="me", body={"id": did})
             .execute()
+        )
+        mark_drive_draft_sent(
+            gmail_draft_id=did,
+            draft_id=str(draft.get("draft_id") or ""),
         )
         return {
             "ok": True,

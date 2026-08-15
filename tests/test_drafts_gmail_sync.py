@@ -379,3 +379,72 @@ def test_extract_gmail_attachments_skips_html_body():
     assert len(atts) == 1
     assert atts[0]["name"] == "one-pager.pdf"
     assert base64.b64decode(atts[0]["data_base64"]) == blob
+
+
+def test_merge_hides_drive_copy_after_gmail_send():
+    from gmail_client.drafts import merge_gmail_and_drive_drafts
+
+    gmail = [
+        {
+            "draft_id": "gmail:live1",
+            "gmail_draft_id": "live1",
+            "to": "annie@savethechildren.in",
+            "subject": "KMMP",
+            "status": "draft",
+        }
+    ]
+    drive = [
+        {
+            "draft_id": "gmail:live1",
+            "gmail_draft_id": "live1",
+            "title": "Director",
+            "tracking_id": "tid-1",
+            "status": "draft",
+        },
+        {
+            "draft_id": "gmail:sent9",
+            "gmail_draft_id": "sent9",
+            "to": "a_ansari@savethechildren.in",
+            "subject": "Already sent",
+            "status": "draft",
+        },
+        {
+            "draft_id": "draft_fallback1",
+            "to": "need@to.example",
+            "subject": "Gmail create failed",
+            "status": "draft",
+        },
+        {
+            "draft_id": "gmail:oldsent",
+            "gmail_draft_id": "oldsent",
+            "status": "sent",
+            "subject": "Marked sent",
+        },
+    ]
+    rows = merge_gmail_and_drive_drafts(gmail, drive, gmail_ok=True)
+    ids = {r["draft_id"] for r in rows}
+    assert "gmail:live1" in ids
+    live = next(r for r in rows if r["draft_id"] == "gmail:live1")
+    assert live.get("title") == "Director"
+    assert live.get("tracking_id") == "tid-1"
+    assert live.get("origin") == "drive+gmail"
+    assert "gmail:sent9" not in ids
+    assert "gmail:oldsent" not in ids
+    assert "draft_fallback1" in ids
+
+
+def test_merge_keeps_drive_when_gmail_unavailable():
+    from gmail_client.drafts import merge_gmail_and_drive_drafts
+
+    drive = [
+        {
+            "draft_id": "gmail:x",
+            "gmail_draft_id": "x",
+            "subject": "Could be live",
+            "status": "draft",
+        }
+    ]
+    rows = merge_gmail_and_drive_drafts([], drive, gmail_ok=False)
+    assert [r["draft_id"] for r in rows] == ["gmail:x"]
+    hidden = merge_gmail_and_drive_drafts([], drive, gmail_ok=True)
+    assert hidden == []

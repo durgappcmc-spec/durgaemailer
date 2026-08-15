@@ -36,6 +36,7 @@ from gmail_client.drafts import (
     gmail_delete_refs,
     gmail_profile_email,
     list_gmail_drafts,
+    merge_gmail_and_drive_drafts,
     send_draft,
     _bodies_are_blank,
 )
@@ -347,13 +348,20 @@ with st.expander("Signatures", expanded=False):
     else:
         st.caption("Check “Edit this signature” to change Default / Short.")
 st.caption(
-    "Review drafts from Chat / Schedule / Bulk · click a subject to open · "
-    "tick one or more checkboxes, then Remove selected · designation shown per recipient."
+    "Live Gmail Drafts only — already-sent mail is hidden. "
+    "Click a subject to open · tick checkboxes to send or remove."
 )
 top_a, top_b = st.columns([1, 4])
 if top_a.button("🔄 Refresh from Gmail"):
     st.cache_data.clear()
+    try:
+        drive_db.invalidate_cache()
+    except Exception:
+        pass
     st.rerun()
+_flash = st.session_state.pop("drafts_flash", None)
+if _flash:
+    st.success(_flash)
 st.markdown(
     """
 <style>
@@ -393,17 +401,18 @@ div[data-testid="stHorizontalBlock"] div[data-testid="column"]:nth-child(4) butt
     unsafe_allow_html=True,
 )
 
-# Gmail first (source of truth); Drive only adds designation / tracking metadata
-with st.spinner("Loading Gmail drafts…"):
+# Live Gmail Drafts folder is the source of truth
+with st.spinner("Syncing Gmail drafts…"):
     gmail_rows = list_gmail_drafts(limit=200)
 gmail_err = next((r for r in gmail_rows if r.get("error")), None)
+gmail_ok = not bool(gmail_err)
 if gmail_err:
     st.warning(f"Gmail drafts unavailable: {gmail_err.get('error')}")
     gmail_rows = []
 else:
     st.caption(
-        f"Synced **{len(gmail_rows)}** Gmail Drafts-folder item(s) for this account. "
-        "Click **Refresh from Gmail** if a new draft is missing."
+        f"Synced **{len(gmail_rows)}** unsent Gmail Drafts-folder item(s). "
+        "Sent mail is not listed. Click **Refresh from Gmail** after sending in Gmail."
     )
 
 try:
@@ -413,28 +422,12 @@ except Exception as e:
     st.error(f"Could not load Drive drafts index: {e}")
     drive_rows = []
 
-by_id: dict[str, Any] = {}
-for r in gmail_rows:
-    did = r.get("draft_id")
-    if did:
-        by_id[did] = {**r, "origin": "gmail"}
-for r in drive_rows:
-    did = r.get("draft_id")
-    if not did:
-        continue
-    if did in by_id:
-        cur = by_id[did]
-        if not cur.get("tracking_id") and r.get("tracking_id"):
-            cur["tracking_id"] = r["tracking_id"]
-        cur["has_open_pixel"] = cur.get("has_open_pixel") or r.get("has_open_pixel")
-        for extra in ("title", "designation", "company", "recipient_name", "bulk_job_id"):
-            if not cur.get(extra) and r.get(extra):
-                cur[extra] = r[extra]
-        cur["origin"] = "drive+gmail"
-    else:
-        by_id[did] = {**r, "origin": r.get("source") or "drive"}
-
-rows = list(by_id.values())
+rows = merge_gmail_and_drive_drafts(
+    gmail_rows, drive_rows, gmail_ok=gmail_ok
+)
+by_id: dict[str, Any] = {
+    str(r.get("draft_id") or ""): r for r in rows if r.get("draft_id")
+}
 # Backfill designation/company from Saved prospects when Gmail metadata lacks them
 for r in rows:
     if not _recipient_designation(r) or not _recipient_company(r):
@@ -577,7 +570,24 @@ if send_clicked:
         for did in action_ids:
             draft = _load_full_draft(did, by_id.get(did) or {})
             results.append(_send_one(draft))
-        st.json(results)
+        ok_n = sum(1 for r in results if not r.get("error"))
+        fail_n = len(results) - ok_n
+        st.session_state["drafts_flash"] = (
+            f"Sent **{ok_n}** of {len(results)}."
+            + (f" **{fail_n}** failed." if fail_n else "")
+            + " List refreshed from Gmail."
+        )
+        bag = set(st.session_state.get("draft_selected_ids") or [])
+        for did in action_ids:
+            bag.discard(did)
+            st.session_state.pop(_sel_key(did), None)
+        st.session_state.draft_selected_ids = bag
+        st.cache_data.clear()
+        try:
+            drive_db.invalidate_cache()
+        except Exception:
+            pass
+        st.rerun()
 if track_clicked:
     if not action_ids:
         st.warning("Select one or more drafts first.")
