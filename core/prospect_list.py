@@ -177,6 +177,8 @@ def _scrub_mailbox_noise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Drop marketplace templates wrongly tagged onto a company search
         if email_blocked_for_company_search(str(r.get("email") or "")):
             continue
+        if not has_email_or_mobile(r):
+            continue
         out.append(r)
     return out
 
@@ -237,6 +239,8 @@ def visible_prospects(*, session_prospects: Optional[list[dict[str, Any]]] = Non
         if _is_mailbox_noise(p):
             continue
         sp = slim_prospect(p)
+        if not has_email_or_mobile(sp):
+            continue
         if not (
             (sp.get("email") or "").strip()
             or (sp.get("name") or "").strip()
@@ -339,6 +343,8 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
                 continue
             if email_blocked_for_company_search(str(p.get("email") or "")):
                 continue
+            if not has_email_or_mobile(p):
+                continue
             # Need at least a name or email or company signal
             if not (
                 (p.get("email") or "").strip()
@@ -374,6 +380,7 @@ def save_prospects(prospects: list[dict[str, Any]]) -> int:
         if changed:
             # Always drop raw blobs from the full list before persist
             rows = [slim_prospect(r) for r in rows if isinstance(r, dict)]
+            rows = _scrub_mailbox_noise(rows)
             drive_ok = _persist(rows)
             if not drive_ok:
                 # One retry after clearing Drive file-id cache
@@ -700,6 +707,17 @@ def has_email(row: dict[str, Any] | None) -> bool:
     if not row:
         return False
     return bool((row.get("email") or "").strip())
+
+
+def has_email_or_mobile(row: dict[str, Any] | None) -> bool:
+    """True when the contact has an email and/or a mobile/phone number."""
+    if not row:
+        return False
+    if has_email(row):
+        return True
+    return bool(
+        str(row.get("mobile") or row.get("phone") or "").strip()
+    )
 
 
 def count_with_email(rows: list[dict[str, Any]] | None) -> int:
