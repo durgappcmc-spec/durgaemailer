@@ -16,12 +16,13 @@ from connectors import ProspectConnector, normalize
 
 _JWT_CACHE = _DATA / "zoominfo_jwt.cache"
 # Canonical detector (protocol required) plus protocol-optional paste-safe variant.
+# Country hosts like in.linkedin.com / uk.linkedin.com must match too.
 _LINKEDIN_CANON_RE = re.compile(
-    r"https?://(www\.)?linkedin\.com/(in|company)/[^\s\]\)]+",
+    r"https?://(?:(?:www|[a-z]{2})\.)?linkedin\.com/(in|company)/[^\s\]\)]+",
     re.I,
 )
 _LINKEDIN_RE = re.compile(
-    r"(?:https?://)?(?:[\w.-]+\.)?linkedin\.com/(in|company)/([^\s\]\)]+)",
+    r"(?:https?://)?(?:(?:www|[a-z]{2})\.)?linkedin\.com/(in|company)/([^\s\]\)]+)",
     re.I,
 )
 
@@ -872,22 +873,20 @@ class ZoomInfoConnector(ProspectConnector):
         if linkedin and kind == "company" and not company:
             company = company_name_from_linkedin_url(linkedin)
 
-        # Primary: Enrich Contact by LinkedIn URL (personLinkedInUrl / company path)
+        # Primary: Enrich Contact by LinkedIn URL (try country + www hosts)
         if linkedin and kind == "in":
             hit = self._enrich_by_person_linkedin(linkedin)
-            if hit and (hit.get("email") or "").strip():
-                return hit
             if hit:
-                last_partial = hit
-            else:
-                last_partial = None
+                # Identity came from the URL — do not replace with a namesake who has email
+                return hit
+            last_partial = None
         else:
             last_partial = None
 
-        # Fallback 1: Person Search by (first, last, company); prefer LinkedIn URL match
+        # Fallback 1: Person Search by (first, last); keep only LinkedIn URL matches
         if linkedin and first and last:
             hit = self._search_person_then_enrich(
-                first, last, company, linkedin_url=linkedin
+                first, last, company, linkedin_url=linkedin, require_linkedin_match=True
             )
             if hit and (hit.get("email") or "").strip():
                 return hit
@@ -916,6 +915,7 @@ class ZoomInfoConnector(ProspectConnector):
                         co_name,
                         linkedin_url=linkedin if kind == "in" else "",
                         domain=domain,
+                        require_linkedin_match=bool(linkedin and kind == "in"),
                     )
                     if hit and (hit.get("email") or "").strip():
                         if not hit.get("industry"):
@@ -986,6 +986,18 @@ class ZoomInfoConnector(ProspectConnector):
             elif linkedin and kind == "company":
                 match_input["companyLinkedInUrl"] = linkedin
 
+        if (
+            linkedin
+            and kind == "in"
+            and not (
+                identifier.get("email")
+                or identifier.get("source_id")
+                or identifier.get("personId")
+            )
+        ):
+            # URL + name already tried; first/last enrich would pick a namesake
+            match_input = {}
+
         if match_input:
             hit = self._post_enrich_contact(match_input, linkedin=linkedin)
             if hit and (hit.get("email") or "").strip():
@@ -1034,21 +1046,28 @@ class ZoomInfoConnector(ProspectConnector):
             if rows[0].get("errorMessage") or rows[0].get("invalidInputFields"):
                 return None
             prospect = _row_to_prospect(rows[0])
+            row_li = _linkedin_from_row(rows[0])
+            if linkedin and row_li and not _linkedin_urls_match(linkedin, row_li):
+                return None
             if linkedin:
-                prospect["linkedin_url"] = linkedin
+                prospect["linkedin_url"] = extract_linkedin_url(linkedin) or linkedin
             return prospect
         except Exception as e:
             print(f"[zoominfo] enrich error: {e}", file=sys.stderr)
             return None
 
     def _enrich_by_person_linkedin(self, url: str) -> Optional[dict[str, Any]]:
-        """Primary: ZoomInfo Enrich Contact by personLinkedInUrl."""
-        hit = self._post_enrich_contact({"personLinkedInUrl": url}, linkedin=url)
-        if hit and (hit.get("email") or "").strip():
-            return hit
-        # Some tenants only accept linkedInUrl
-        alt = self._post_enrich_contact({"linkedInUrl": url}, linkedin=url)
-        return alt or hit
+        """Primary: ZoomInfo Enrich Contact by personLinkedInUrl (all host variants)."""
+        last = None
+        for variant in linkedin_url_variants(url):
+            for key in ("personLinkedInUrl", "linkedInUrl"):
+                hit = self._post_enrich_contact({key: variant}, linkedin=url)
+                if not hit:
+                    continue
+                if (hit.get("email") or "").strip():
+                    return hit
+                last = last or hit
+        return last
 
     def _search_person_then_enrich(
         self,
@@ -1058,6 +1077,7 @@ class ZoomInfoConnector(ProspectConnector):
         *,
         linkedin_url: str = "",
         domain: str = "",
+        require_linkedin_match: bool = False,
     ) -> Optional[dict[str, Any]]:
         try:
             search_body: dict[str, Any] = {
@@ -1072,49 +1092,79 @@ class ZoomInfoConnector(ProspectConnector):
                 search_body["companyWebsite"] = (
                     domain.lower().removeprefix("www.").split("/")[0]
                 )
+            if linkedin_url:
+                canon = extract_linkedin_url(linkedin_url) or linkedin_url
+                search_body["linkedInUrl"] = canon
+                search_body["personLinkedInUrl"] = canon
             resp = requests.post(
                 f"{self.BASE}/search/contact",
                 headers=self._headers(),
                 json=search_body,
                 timeout=45,
             )
+            if resp.status_code == 400 and linkedin_url:
+                search_body.pop("linkedInUrl", None)
+                search_body.pop("personLinkedInUrl", None)
+                resp = requests.post(
+                    f"{self.BASE}/search/contact",
+                    headers=self._headers(),
+                    json=search_body,
+                    timeout=45,
+                )
             resp.raise_for_status()
             contacts = (resp.json() or {}).get("data") or []
             if not contacts:
                 return None
-            chosen = None
-            if linkedin_url:
-                for c in contacts:
-                    if not isinstance(c, dict):
+            chosen = _pick_contact_for_linkedin(
+                contacts, linkedin_url, require_match=require_linkedin_match
+            )
+            if chosen is None and linkedin_url and require_linkedin_match:
+                ranked = [c for c in contacts if isinstance(c, dict)][:5]
+                for c in ranked:
+                    pid = c.get("personId") or c.get("id")
+                    if not pid:
                         continue
-                    if _linkedin_urls_match(linkedin_url, _linkedin_from_row(c)):
-                        chosen = c
-                        break
+                    rows = self._enrich_by_ids([pid])
+                    if not rows:
+                        continue
+                    if not _linkedin_urls_match(
+                        linkedin_url, _linkedin_from_row(rows[0])
+                    ):
+                        continue
+                    prospect = _row_to_prospect(rows[0])
+                    prospect["linkedin_url"] = (
+                        extract_linkedin_url(linkedin_url) or linkedin_url
+                    )
+                    if not prospect.get("company"):
+                        prospect["company"] = _company_name(c) or company
+                    return prospect
+                return None
             if chosen is None:
-                ranked = sorted(
-                    [c for c in contacts if isinstance(c, dict)],
-                    key=lambda c: (
-                        0 if c.get("hasEmail") else 1,
-                        0 if c.get("hasSupplementalEmail") else 1,
-                    ),
-                )
-                chosen = ranked[0] if ranked else None
-            if not chosen:
                 return None
             pid = chosen.get("personId") or chosen.get("id")
             if not pid:
                 prospect = _row_to_prospect(chosen)
                 if linkedin_url:
-                    prospect["linkedin_url"] = linkedin_url
+                    prospect["linkedin_url"] = (
+                        extract_linkedin_url(linkedin_url) or linkedin_url
+                    )
                 return prospect
             rows = self._enrich_by_ids([pid])
             if rows:
                 prospect = _row_to_prospect(rows[0])
                 if linkedin_url:
-                    prospect["linkedin_url"] = linkedin_url
+                    prospect["linkedin_url"] = (
+                        extract_linkedin_url(linkedin_url) or linkedin_url
+                    )
                 if not prospect.get("company"):
                     prospect["company"] = _company_name(chosen) or company
                 return prospect
+            prospect = _row_to_prospect(chosen)
+            if linkedin_url:
+                prospect["linkedin_url"] = (
+                    extract_linkedin_url(linkedin_url) or linkedin_url
+                )
+            return prospect
         except Exception as e:
             print(f"[zoominfo] linkedin→search enrich error: {e}", file=sys.stderr)
         return None
@@ -1265,6 +1315,54 @@ def _linkedin_urls_match(a: str, b: str) -> bool:
     if not sa or not sb:
         return False
     return ka == kb and sa.lower().rstrip("/") == sb.lower().rstrip("/")
+
+
+def linkedin_url_variants(url: str) -> list[str]:
+    """Hosts ZoomInfo may store: original country host, www, and bare linkedin.com."""
+    raw = (url or "").strip()
+    kind, slug = _linkedin_kind_slug(raw)
+    if not kind or not slug:
+        return [raw] if raw else []
+    hosts: list[str] = []
+    host_m = re.search(r"https?://([^/]+)/", raw, re.I)
+    orig_host = (host_m.group(1) if host_m else "").lower().rstrip(".")
+    for host in (orig_host, "www.linkedin.com", "in.linkedin.com", "linkedin.com"):
+        if host and host not in hosts:
+            hosts.append(host)
+    out: list[str] = []
+    seen: set[str] = set()
+    for host in hosts:
+        candidate = f"https://{host}/{kind}/{slug}"
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def _pick_contact_for_linkedin(
+    contacts: list[Any],
+    linkedin_url: str,
+    *,
+    require_match: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Pick a search row. When a LinkedIn URL is required, never fall back to a namesake."""
+    rows = [c for c in contacts if isinstance(c, dict)]
+    if linkedin_url:
+        for c in rows:
+            if _linkedin_urls_match(linkedin_url, _linkedin_from_row(c)):
+                return c
+        if require_match:
+            return None
+    ranked = sorted(
+        rows,
+        key=lambda c: (
+            0 if c.get("hasEmail") else 1,
+            0 if c.get("hasSupplementalEmail") else 1,
+        ),
+    )
+    return ranked[0] if ranked else None
 
 
 def _first_linkedin(text: Any) -> str:

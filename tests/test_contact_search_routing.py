@@ -7,7 +7,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from connectors.zoominfo import extract_linkedin_url, extract_linkedin_urls
+from connectors.zoominfo import (
+    extract_linkedin_url,
+    extract_linkedin_urls,
+    linkedin_url_variants,
+    names_from_linkedin_url,
+    _linkedin_urls_match,
+    _pick_contact_for_linkedin,
+)
 from agent.intent import (
     _heuristic_plan,
     parse_contact_search_company,
@@ -172,3 +179,55 @@ def test_collect_linkedin_urls_from_prior_user_paste():
     assert len(urls) == 2
     assert urls[0].endswith("/one-person")
     assert urls[1].endswith("/two-person")
+
+
+def test_india_linkedin_url_extracts_and_routes_to_zoominfo():
+    msg = (
+        "find contact from linkedinurl: "
+        "https://in.linkedin.com/in/george-mathew-31142b23"
+    )
+    urls = extract_linkedin_urls(msg)
+    assert urls == ["https://www.linkedin.com/in/george-mathew-31142b23"]
+    assert names_from_linkedin_url(urls[0]) == ("George", "Mathew")
+    assert wants_linkedin_contact_lookup(msg)
+    plan = _heuristic_plan(msg)
+    assert plan.action == "prospect_enrich"
+    assert "zoominfo" in plan.agents
+    assert plan.draft is False
+
+
+def test_linkedin_country_host_matches_www_slug():
+    country = "https://in.linkedin.com/in/george-mathew-31142b23"
+    www = "https://www.linkedin.com/in/george-mathew-31142b23/"
+    assert _linkedin_urls_match(country, www)
+    variants = linkedin_url_variants(country)
+    assert "https://in.linkedin.com/in/george-mathew-31142b23" in variants
+    assert "https://www.linkedin.com/in/george-mathew-31142b23" in variants
+
+
+def test_linkedin_search_does_not_pick_namesake_with_email():
+    asked = "https://www.linkedin.com/in/george-mathew-31142b23"
+    contacts = [
+        {
+            "personId": "wrong",
+            "hasEmail": True,
+            "firstName": "George",
+            "lastName": "Mathew",
+            "externalUrls": [
+                {"type": "linkedin", "url": "https://www.linkedin.com/in/other-george"}
+            ],
+        },
+        {
+            "personId": "right",
+            "hasEmail": False,
+            "firstName": "George",
+            "lastName": "Mathew",
+            "externalUrls": [{"type": "linkedin", "url": asked}],
+        },
+    ]
+    picked = _pick_contact_for_linkedin(contacts, asked, require_match=True)
+    assert picked and picked["personId"] == "right"
+    namesake_only = _pick_contact_for_linkedin(
+        contacts[:1], asked, require_match=True
+    )
+    assert namesake_only is None

@@ -8,7 +8,7 @@ from typing import Any, Optional
 _PROCESS_CACHE: dict[str, dict[str, Any]] = {}
 
 _LINKEDIN_NORM_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?linkedin\.com/(in|company)/([^/?#\s\]\)]+)",
+    r"(?:https?://)?(?:(?:www|[a-z]{2})\.)?linkedin\.com/(in|company)/([^/?#\s\]\)]+)",
     re.I,
 )
 

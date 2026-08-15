@@ -153,6 +153,10 @@ def test_enrichment_cache_skips_second_store_lookup():
     assert normalize_linkedin_url(url) == normalize_linkedin_url(
         "https://www.linkedin.com/in/janedoe/"
     )
+    india = "https://in.linkedin.com/in/george-mathew-31142b23"
+    assert normalize_linkedin_url(india) == (
+        "https://www.linkedin.com/in/george-mathew-31142b23"
+    )
 
 
 def test_enrichment_panel_and_labeled_fields():
