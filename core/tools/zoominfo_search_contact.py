@@ -57,6 +57,7 @@ class ZoominfoSearchContactTool:
 
     def run(self, inputs: ZoominfoSearchContactInput, ctx: ToolContext) -> ToolResult:
         from connectors.zoominfo import ZoomInfoConnector
+        from core.prospect_list import has_email_or_mobile as _prospect_has_email_or_mobile
         from core import drive_db
 
         # Backfill persona from agent extras when planner omits titles
@@ -128,11 +129,15 @@ class ZoominfoSearchContactTool:
             if hits and isinstance(hits, list) and hits[0].get("error"):
                 last_err = hits[0].get("error")
                 continue
-            people = [h for h in (hits or []) if h and not h.get("error")]
+            people = [
+                h
+                for h in (hits or [])
+                if h and not h.get("error") and _prospect_has_email_or_mobile(h)
+            ]
             if not people:
                 continue
 
-            # Prefer rows that already have email/mobile
+            # Prefer rows that already have email, then mobile
             people = sorted(
                 people,
                 key=lambda p: (
@@ -153,7 +158,7 @@ class ZoominfoSearchContactTool:
                     "contact": contact,
                     "matched_on": matched,
                     "candidates": [_normalize_contact(p) for p in people[:5]],
-                    "incomplete": not bool(contact.get("email") or contact.get("mobile")),
+                    "incomplete": False,
                 },
                 cost={"zi_credits": 2},
             )

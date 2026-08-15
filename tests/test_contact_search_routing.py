@@ -280,3 +280,136 @@ def test_zoominfo_row_keeps_location():
     prospect = _row_to_prospect(row)
     assert "Mumbai" in (prospect.get("location") or "")
     assert prospect_location({"city": "Pune", "country": "India"}) == "Pune, India"
+
+
+def test_search_hit_has_contact_email_or_mobile_flags():
+    from connectors.zoominfo import _search_hit_has_contact
+
+    assert _search_hit_has_contact({"hasEmail": True, "firstName": "A"})
+    assert _search_hit_has_contact({"hasSupplementalEmail": True})
+    assert _search_hit_has_contact({"hasMobilePhone": True})
+    assert _search_hit_has_contact({"hasDirectPhone": True})
+    assert _search_hit_has_contact({"email": "a@x.com"})
+    assert _search_hit_has_contact({"mobilePhone": "+91 99999 11111"})
+    assert not _search_hit_has_contact(
+        {
+            "id": "3",
+            "firstName": "No",
+            "lastName": "Contact",
+            "hasEmail": False,
+            "hasMobilePhone": False,
+            "jobTitle": "CSR Head",
+            "externalUrls": [
+                {"type": "linkedin", "url": "https://linkedin.com/in/blank-person"}
+            ],
+        }
+    )
+
+
+def test_enrich_contact_rows_drops_blank_stubs():
+    from connectors.zoominfo import ZoomInfoConnector
+
+    zi = ZoomInfoConnector.__new__(ZoomInfoConnector)
+
+    def fake_enrich(ids):
+        out = []
+        if "1" in [str(i) for i in ids]:
+            out.append(
+                {
+                    "id": "1",
+                    "firstName": "Asha",
+                    "lastName": "Rao",
+                    "email": "asha@example.org",
+                    "jobTitle": "CSR Head",
+                }
+            )
+        if "2" in [str(i) for i in ids]:
+            out.append(
+                {
+                    "id": "2",
+                    "firstName": "Blank",
+                    "lastName": "Person",
+                    "jobTitle": "CSR Head",
+                }
+            )
+        return out
+
+    zi._enrich_by_ids = fake_enrich
+    rows = [
+        {"id": "1", "hasEmail": True, "firstName": "Asha", "lastName": "Rao"},
+        {
+            "id": "2",
+            "hasEmail": False,
+            "firstName": "Blank",
+            "lastName": "Person",
+            "jobTitle": "CSR Head",
+        },
+    ]
+    out = zi._enrich_contact_rows(rows, limit=5)
+    assert len(out) == 1
+    assert (out[0].get("email") or "") == "asha@example.org"
+
+    # Flags omitted: still drop people enrich left without email or mobile
+    rows_no_flags = [
+        {"id": "1", "firstName": "Asha", "lastName": "Rao"},
+        {"id": "2", "firstName": "Blank", "lastName": "Person"},
+    ]
+    out2 = zi._enrich_contact_rows(rows_no_flags, limit=5)
+    assert len(out2) == 1
+    assert (out2[0].get("email") or "") == "asha@example.org"
+
+
+def test_enrich_contact_rows_keeps_mobile_only():
+    from connectors.zoominfo import ZoomInfoConnector
+
+    zi = ZoomInfoConnector.__new__(ZoomInfoConnector)
+
+    def fake_enrich(ids):
+        return [
+            {
+                "id": "9",
+                "firstName": "Maya",
+                "lastName": "Shah",
+                "mobilePhone": "+91 99999 11111",
+                "jobTitle": "Director",
+            }
+        ]
+
+    zi._enrich_by_ids = fake_enrich
+    rows = [
+        {"id": "9", "hasMobilePhone": True, "firstName": "Maya", "lastName": "Shah"}
+    ]
+    out = zi._enrich_contact_rows(rows, limit=5)
+    assert len(out) == 1
+    blob = f"{out[0].get('mobile') or ''} {out[0].get('phone') or ''}"
+    assert "99999" in blob
+
+
+def test_search_all_skips_linkedin_only_rows():
+    from connectors import prospects as prospects_mod
+
+    class _Fake:
+        def search(self, query, limit=10):
+            return [
+                {"name": "Has Mail", "email": "a@x.com", "source": "zoominfo"},
+                {
+                    "name": "LI only",
+                    "email": "",
+                    "mobile": "",
+                    "linkedin_url": "https://linkedin.com/in/x",
+                    "source": "zoominfo",
+                },
+                {"name": "Has Mobile", "email": "", "mobile": "+91 1", "source": "zoominfo"},
+            ]
+
+    orig = prospects_mod.get_connector
+    prospects_mod.get_connector = lambda name: _Fake()
+    try:
+        rows = prospects_mod.search_all({"company_names": "Acme"}, limit_per_provider=10)
+    finally:
+        prospects_mod.get_connector = orig
+    names = [r.get("name") for r in rows]
+    assert "Has Mail" in names
+    assert "Has Mobile" in names
+    assert "LI only" not in names
+

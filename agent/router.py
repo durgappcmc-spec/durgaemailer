@@ -3302,6 +3302,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 email_blocked_for_company_search,
                 enough_emailed_contacts,
                 filter_prospects_for_company_query,
+                has_email_or_mobile,
                 lookup_for_query,
                 wants_force_refresh,
             )
@@ -3341,7 +3342,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
             )
 
             if use_saved:
-                ok = cached[:limit]
+                ok = [p for p in cached if has_email_or_mobile(p)][:limit]
                 errs: list[dict[str, Any]] = []
                 prospect_out = ok
                 saved_ids: list[str] = []
@@ -3409,7 +3410,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 results = search_all(
                     q, providers=tuple(providers), limit_per_provider=limit
                 )
-                ok = [p for p in results if not p.get("error")]
+                ok = [
+                    p
+                    for p in results
+                    if not p.get("error") and has_email_or_mobile(p)
+                ]
                 # Ensure ZoomInfo rows are tagged for the Saved list
                 for p in ok:
                     if not (p.get("source") or "").strip():

@@ -197,7 +197,9 @@ class ZoomInfoConnector(ProspectConnector):
                     "last_name": query.get("last_name"),
                 }
             )
-            return [hit] if hit else []
+            if hit and _prospect_has_email_or_mobile(hit):
+                return [hit]
+            return []
 
         limit = min(max(int(limit), 1), 100)
         results: list[dict[str, Any]] = []
@@ -252,16 +254,16 @@ class ZoomInfoConnector(ProspectConnector):
             return [
                 p
                 for p in rows
-                if (p.get("email") or "").strip()
+                if _prospect_has_email_or_mobile(p)
                 and _CSR_TITLE_RE.search(str(p.get("title") or p.get("jobTitle") or ""))
             ]
 
-        # Keep emailed CSR when available (free slots from email-less CSR stubs)
+        # Keep reachable CSR when available (drop name-only CSR stubs)
         if _csr_with_email(results):
             results = [
                 p
                 for p in results
-                if (p.get("email") or "").strip()
+                if _prospect_has_email_or_mobile(p)
                 or not _CSR_TITLE_RE.search(
                     str(p.get("title") or p.get("jobTitle") or "")
                 )
@@ -305,14 +307,14 @@ class ZoomInfoConnector(ProspectConnector):
                         limit=web_n,
                         zi=self,
                     )
-                    # Prefer enriched rows that actually have email
-                    with_mail = [h for h in web_hits if (h.get("email") or "").strip()]
-                    add = with_mail or web_hits
+                    add = [
+                        h for h in web_hits if _prospect_has_email_or_mobile(h)
+                    ]
                     if add:
                         results.extend(add)
                         print(
                             f"[zoominfo] Google→LI→ZI CSR: +{len(add)} "
-                            f"({len(with_mail)} with email) for {company_label!r}",
+                            f"with email/mobile for {company_label!r}",
                             file=sys.stderr,
                         )
             except Exception as e:
@@ -390,22 +392,37 @@ class ZoomInfoConnector(ProspectConnector):
                     data = resp.json()
                     contacts = data.get("data") or data.get("contacts") or []
                     contacts = sorted(
-                        contacts,
+                        [
+                            c
+                            for c in contacts
+                            if isinstance(c, dict)
+                        ],
                         key=lambda c: (
                             0 if c.get("hasEmail") else 1,
                             0 if c.get("hasSupplementalEmail") else 1,
+                            0 if c.get("hasMobilePhone") else 1,
+                            0 if c.get("hasDirectPhone") else 1,
                         ),
                     )
-                    results.extend(self._enrich_contact_rows(contacts, limit=limit))
+                    flagged = [c for c in contacts if _search_hit_has_contact(c)]
+                    results.extend(
+                        self._enrich_contact_rows(flagged or contacts, limit=limit)
+                    )
             except Exception as e:
                 print(f"[zoominfo] search error: {e}", file=sys.stderr)
                 if not results:
                     return [{"source": self.name, "error": str(e)}]
 
-        # Dedupe; prefer CSR contacts that have email
+        # Dedupe; keep only people with email or mobile
         seen: set[str] = set()
         merged: list[dict[str, Any]] = []
         for p in sorted(results, key=_contact_relevance_key):
+            if p.get("error"):
+                if not merged:
+                    merged.append(p)
+                continue
+            if not _prospect_has_email_or_mobile(p):
+                continue
             key = (
                 (p.get("email") or "").strip().lower()
                 or str(p.get("source_id") or "")
@@ -576,8 +593,11 @@ class ZoomInfoConnector(ProspectConnector):
                 [r for r in rows if isinstance(r, dict)],
                 key=lambda c: (
                     0 if _CSR_TITLE_RE.search(str(c.get("jobTitle") or "")) else 1,
+                    0 if _search_hit_has_contact(c) else 1,
                     0 if c.get("hasEmail") else 1,
                     0 if c.get("hasSupplementalEmail") else 1,
+                    0 if c.get("hasMobilePhone") else 1,
+                    0 if c.get("hasDirectPhone") else 1,
                 ),
             )
             if prefer_csr:
@@ -587,17 +607,19 @@ class ZoomInfoConnector(ProspectConnector):
                     if _CSR_TITLE_RE.search(str(r.get("jobTitle") or ""))
                 ]
                 if csr_only:
-                    with_email = [
-                        r
-                        for r in csr_only
-                        if r.get("hasEmail") or r.get("hasSupplementalEmail")
+                    with_contact = [
+                        r for r in csr_only if _search_hit_has_contact(r)
                     ]
-                    # Prefer CSR rows ZoomInfo flags as having email
-                    ranked = with_email or csr_only
+                    # Prefer CSR ZoomInfo flags as having email or phone
+                    ranked = with_contact or csr_only
                 # else keep full ranked (title filter may have been too strict)
+            flagged = [r for r in ranked if _search_hit_has_contact(r)]
+            ranked = flagged or ranked
             before = len(out)
             batch = self._enrich_contact_rows(ranked, limit=limit - len(out))
             for p in batch:
+                if not p.get("error") and not _prospect_has_email_or_mobile(p):
+                    continue
                 key = (
                     p.get("email") or p.get("source_id") or p.get("name") or ""
                 ).lower()
@@ -624,7 +646,7 @@ class ZoomInfoConnector(ProspectConnector):
                 return
             body: dict[str, Any] = {
                 "companyId": str(cid),
-                "rpp": min(25, max(5, limit - len(out) + 5)),
+                "rpp": _contact_search_rpp(limit - len(out)),
                 "page": 1,
             }
             if job_title:
@@ -665,7 +687,7 @@ class ZoomInfoConnector(ProspectConnector):
                 return
             body: dict[str, Any] = {
                 "companyWebsite": domain,
-                "rpp": min(25, max(5, limit - len(out) + 5)),
+                "rpp": _contact_search_rpp(limit - len(out)),
                 "page": 1,
             }
             if job_title:
@@ -746,32 +768,41 @@ class ZoomInfoConnector(ProspectConnector):
                 _append_from_domain(dom, job_title=None, prefer_csr=False)
 
         out.sort(key=_contact_relevance_key)
-        return out[:limit]
+        return [p for p in out if _prospect_has_email_or_mobile(p)][:limit]
 
     def _enrich_contact_rows(
         self, contacts: list[dict[str, Any]], limit: int = 10
     ) -> list[dict[str, Any]]:
-        """Search hits → enrich for email/mobile; never drop people if enrich is thin."""
+        """Search hits → enrich for email/mobile; drop people with neither."""
+        limit = min(max(int(limit or 1), 1), 100)
         ranked = sorted(
-            contacts,
+            [c for c in contacts if isinstance(c, dict)],
             key=lambda c: (
                 0 if c.get("hasEmail") else 1,
                 0 if c.get("hasSupplementalEmail") else 1,
+                0 if c.get("hasMobilePhone") else 1,
+                0 if c.get("hasDirectPhone") else 1,
             ),
         )
-        ranked = [c for c in ranked if isinstance(c, dict)][: max(limit, 10)]
+        flagged = [c for c in ranked if _search_hit_has_contact(c)]
+        pool = flagged or ranked
+        pool_n = min(len(pool), max(limit * 3, 15))
+        pool = pool[:pool_n]
         person_ids: list[Any] = []
         search_by_id: dict[str, dict[str, Any]] = {}
-        for c in ranked:
+        for c in pool:
             pid = c.get("personId") or c.get("id")
             if not pid:
                 continue
             pid_s = str(pid)
             person_ids.append(pid)
             search_by_id[pid_s] = c
-        person_ids = person_ids[:limit]
         if not person_ids:
-            return [_row_to_prospect(c) for c in ranked[:limit]]
+            return [
+                p
+                for p in (_row_to_prospect(c) for c in pool[:limit])
+                if _prospect_has_email_or_mobile(p)
+            ]
 
         enriched_by_id: dict[str, dict[str, Any]] = {}
         try:
@@ -789,22 +820,20 @@ class ZoomInfoConnector(ProspectConnector):
                     row = {**row, "company": search_hit.get("company")}
                 if not row.get("jobTitle") and search_hit.get("jobTitle"):
                     row = {**row, "jobTitle": search_hit.get("jobTitle")}
-                enriched_by_id[rid] = _row_to_prospect(row)
+                prospect = _row_to_prospect(row)
+                if _prospect_has_email_or_mobile(prospect):
+                    enriched_by_id[rid] = prospect
         except Exception as e:
             print(f"[zoominfo] enrich-after-search error: {e}", file=sys.stderr)
 
-        # If batch enrich returned almost nothing, try one-by-one for emails
-        missing_email_ids = [
+        # Retry one-by-one when batch enrich left email/mobile empty
+        missing_ids = [
             pid
             for pid in person_ids
-            if not (enriched_by_id.get(str(pid)) or {}).get("email")
+            if not _prospect_has_email_or_mobile(enriched_by_id.get(str(pid)) or {})
         ]
-        if missing_email_ids and len(enriched_by_id) < len(person_ids):
-            for pid in missing_email_ids[: min(limit, 10)]:
-                if str(pid) in enriched_by_id and (
-                    enriched_by_id[str(pid)].get("email") or ""
-                ).strip():
-                    continue
+        if missing_ids:
+            for pid in missing_ids[: min(max(limit, 10), 15)]:
                 try:
                     one = self._enrich_by_ids([pid])
                 except Exception:
@@ -816,7 +845,7 @@ class ZoomInfoConnector(ProspectConnector):
                         continue
                     rid = str(row.get("id") or row.get("personId") or pid)
                     prospect = _row_to_prospect(row)
-                    if not (prospect.get("email") or "").strip():
+                    if not _prospect_has_email_or_mobile(prospect):
                         continue
                     search_hit = search_by_id.get(str(pid)) or {}
                     if not prospect.get("company") and search_hit:
@@ -828,9 +857,16 @@ class ZoomInfoConnector(ProspectConnector):
 
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for c in ranked[:limit]:
+        for c in pool:
             pid = str(c.get("personId") or c.get("id") or "")
-            prospect = enriched_by_id.get(pid) or _row_to_prospect(c)
+            prospect = enriched_by_id.get(pid)
+            if not prospect:
+                stub = _row_to_prospect(c)
+                if not _prospect_has_email_or_mobile(stub):
+                    continue
+                prospect = stub
+            elif not _prospect_has_email_or_mobile(prospect):
+                continue
             key = (
                 (prospect.get("email") or "").strip().lower()
                 or str(prospect.get("source_id") or pid)
@@ -1490,6 +1526,46 @@ def _location_from_row(row: dict[str, Any]) -> str:
     return ", ".join(out)
 
 
+def _search_hit_has_contact(row: dict[str, Any] | None) -> bool:
+    """True when a free ZoomInfo search hit has email or phone (flags or fields)."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("hasEmail") or row.get("hasSupplementalEmail"):
+        return True
+    if row.get("hasMobilePhone") or row.get("hasDirectPhone") or row.get("hasPhone"):
+        return True
+    if str(row.get("email") or row.get("emailAddress") or "").strip():
+        return True
+    phone = (
+        row.get("mobilePhone")
+        or row.get("mobile")
+        or row.get("phone")
+        or row.get("directPhone")
+        or ""
+    )
+    return bool(str(phone).strip())
+
+
+def _prospect_has_email_or_mobile(row: dict[str, Any] | None) -> bool:
+    """True after enrich/normalize when email or mobile/phone is present."""
+    try:
+        from core.prospect_list import has_email_or_mobile
+
+        return has_email_or_mobile(row)
+    except Exception:
+        if not row:
+            return False
+        if str(row.get("email") or "").strip():
+            return True
+        return bool(str(row.get("mobile") or row.get("phone") or "").strip())
+
+
+def _contact_search_rpp(want: int) -> int:
+    """Request extra search hits so filtering blanks still fills `want`."""
+    want = max(int(want or 1), 1)
+    return min(50, max(15, want * 3 + 5))
+
+
 def _phone_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Return (phone, mobile) preferring non-empty values."""
     phone = str(
@@ -1764,17 +1840,18 @@ _STL_EMAIL_RE = re.compile(r"@(?:stl\.tech|sterlitetech\.com)\b", re.I)
 
 
 def _contact_relevance_key(row: dict[str, Any]) -> tuple:
-    """Sort key: CSR-with-email first, then CSR, then stl.tech, then any email."""
+    """Sort key: CSR-with-contact first, then CSR, then stl.tech, then any email."""
     title = str(row.get("title") or row.get("jobTitle") or "")
     email = str(row.get("email") or "").strip().lower()
+    reachable = _prospect_has_email_or_mobile(row)
     is_csr = bool(_CSR_TITLE_RE.search(title))
-    # 0 = CSR + email, 1 = CSR no email, 2 = non-CSR
-    csr_tier = 0 if (is_csr and email) else (1 if is_csr else 2)
+    # 0 = CSR + email/mobile, 1 = CSR no contact, 2 = non-CSR
+    csr_tier = 0 if (is_csr and reachable) else (1 if is_csr else 2)
     csr_strong = 0 if re.search(r"\bcsr\b", title, re.I) else 1
     stl = 0 if email and _STL_EMAIL_RE.search(email) else 1
-    has_email = 0 if email else 1
+    has_contact = 0 if reachable else 1
     name = str(row.get("name") or "").lower()
-    return (csr_tier, csr_strong, stl, has_email, name)
+    return (csr_tier, csr_strong, stl, has_contact, name)
 
 NGO_TITLE_PRIORITY: list[str] = [
     "Founder",
@@ -2056,7 +2133,10 @@ def _sanitize_keywords(val: Any) -> str:
 
 
 def _build_contact_search_body(query: dict[str, Any], limit: int = 10) -> dict[str, Any]:
-    body: dict[str, Any] = {"rpp": min(max(int(limit), 1), 100), "page": 1}
+    body: dict[str, Any] = {
+        "rpp": min(max(int(limit) * 3, 10), 100),
+        "page": 1,
+    }
     if query.get("first_name"):
         body["firstName"] = str(query["first_name"]).strip()
     if query.get("last_name"):

@@ -39,6 +39,19 @@ def _dedupe_key(p: dict[str, Any]) -> str:
     return f"nc:{name}|{company}"
 
 
+def _row_has_email_or_mobile(row: dict[str, Any] | None) -> bool:
+    try:
+        from core.prospect_list import has_email_or_mobile
+
+        return has_email_or_mobile(row)
+    except Exception:
+        if not row:
+            return False
+        if str(row.get("email") or "").strip():
+            return True
+        return bool(str(row.get("mobile") or row.get("phone") or "").strip())
+
+
 def search_all(
     query: dict[str, Any],
     providers: tuple[str, ...] | list[str] = ("zoominfo",),
@@ -58,6 +71,8 @@ def search_all(
         for row in rows:
             if "error" in row:
                 results.append(row)
+                continue
+            if not _row_has_email_or_mobile(row):
                 continue
             key = _dedupe_key(row)
             if key in seen and key != "nc:|":

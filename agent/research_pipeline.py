@@ -215,6 +215,17 @@ def enrich_one_org_on_zoominfo(
 
     # Deepen: re-enrich each row to pull email + mobilePhone when missing
     matched = _deepen_email_and_mobile(matched)
+    try:
+        from core.prospect_list import has_email_or_mobile
+
+        matched = [r for r in matched if has_email_or_mobile(r)]
+    except Exception:
+        matched = [
+            r
+            for r in matched
+            if str(r.get("email") or "").strip()
+            or str(r.get("mobile") or r.get("phone") or "").strip()
+        ]
 
     contacts: list[dict[str, Any]] = []
     seen: set[str] = set()
