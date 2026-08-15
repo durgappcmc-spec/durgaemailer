@@ -134,3 +134,65 @@ def test_like_sent_clone_drops_click_tracking_autolink():
     html = _full_text_to_html(cleaned)
     assert "netlify" not in html.lower()
     assert "click?id=" not in html
+
+
+def test_like_sent_clone_keeps_full_body_and_youtube():
+    from agent.router import _compose_like_sent_email
+
+    yt = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    html = f"""
+    <p>Dear IndiaMART Team,</p>
+    <p>We would like to explore a CSR partnership around education and media.</p>
+    <p>Our work includes classroom films, teacher training, and community screenings.</p>
+    <p>Watch a short film here: <a href="{yt}">Karuna classroom film</a></p>
+    <p>We can also share a one-pager and a sample episode.</p>
+    <p>Why IndiaMART specifically: your MSME network reaches teachers nationwide.</p>
+    <p>Next step: a 20-minute call next week.</p>
+    <p>Thank you,</p>
+    """
+    out = _compose_like_sent_email(
+        user_msg="create an email like the one sent to IndiaMART for Flipkart",
+        reference_msg={
+            "subject": "CSR idea for IndiaMART",
+            "body_text": "short gmail snippet only",
+            "body_html": html,
+        },
+        reference_company="IndiaMART",
+        target_company="Flipkart",
+        research_notes="",
+        first_name="Priya",
+    )
+    body = out["html_body"]
+    assert yt in body
+    assert "youtube.com/watch" in body
+    assert "Flipkart" in (out["subject"] or "")
+    assert "IndiaMART" not in (out["subject"] or "")
+    assert "classroom films" in body.lower() or "teacher training" in body.lower()
+    assert "one-pager" in body.lower() or "sample episode" in body.lower()
+    assert _plain_word_count(body) > 40
+
+
+def test_html_company_swap_does_not_rewrite_youtube_href():
+    from agent.router import _replace_html_company_names
+
+    yt = "https://youtu.be/abc123IndiaMART"
+    html = f'<p>Hello IndiaMART</p><p><a href="{yt}">video</a></p>'
+    out = _replace_html_company_names(html, "IndiaMART", "Flipkart")
+    assert yt in out
+    assert "Hello Flipkart" in out
+    assert 'href="https://youtu.be/abc123IndiaMART"' in out
+
+
+def test_full_reference_text_keeps_youtube_href():
+    from agent.router import _full_reference_text
+
+    yt = "https://www.youtube.com/watch?v=keepme"
+    html = f'<p>See this film</p><p><a href="{yt}">Watch</a></p>'
+    text = _full_reference_text("See this film", html)
+    assert yt in text
+
+
+def _plain_word_count(html: str) -> int:
+    from bs4 import BeautifulSoup
+
+    return len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).split())

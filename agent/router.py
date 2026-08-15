@@ -1058,29 +1058,69 @@ def _run_styled_directive_draft(
             )
         else:
             yield (
-                f"_Loaded sent style · "
-                f"**{(style_ref.get('subject') or '(no subject)').strip()}**_\n"
+                f"_Loaded sent email · "
+                f"**{(style_ref.get('subject') or '(no subject)').strip()}** "
+                f"({len(style_ref.get('body_html') or style_ref.get('body_text') or '')} chars)_\n"
             )
-    composed = compose_styled_email(
-        to_email=to,
-        enrichment=enrichment,
-        style_template=style_ref,
-        user_msg=user_msg,
-    )
-    model = composed.get("provider") or "gemini"
-    yield f"_Chat model: **{model}**_\n"
     name = str((enrichment or {}).get("name") or "").strip()
     title = str((enrichment or {}).get("title") or "").strip()
     company = str((enrichment or {}).get("company") or "").strip()
+    first = str((enrichment or {}).get("first_name") or "").strip() or (
+        name.split(None, 1)[0] if name else ""
+    )
+    if style_ref and (
+        (style_ref.get("body_html") or "").strip()
+        or (style_ref.get("body_text") or "").strip()
+    ):
+        notes = ""
+        if company:
+            yield f"**Gemini research** for **{company}**…\n"
+            notes, _web = _research_company_for_like_sent(
+                company=company,
+                ref_subj=str(style_ref.get("subject") or ""),
+                ref_to=str(style_ref.get("to") or template_from),
+                ref_body=(style_ref.get("body_text") or "")[:12000],
+                user_msg=user_msg or "",
+            )
+        from agent.intent import org_label_from_email
+
+        composed = _compose_like_sent_email(
+            user_msg=user_msg or "",
+            reference_msg=style_ref,
+            reference_company=org_label_from_email(template_from) or template_from,
+            target_company=company or "{company}",
+            research_notes=notes,
+            first_name=first,
+        )
+        html_body = composed.get("html_body") or ""
+        subject = composed.get("subject") or "(no subject)"
+        model = "like-sent clone"
+        yield (
+            f"_Keeping the full sent email "
+            f"(**{composed.get('char_count') or '?'}** chars) and revising "
+            f"subject/name/org details"
+            + (" — YouTube links kept." if "youtu" in html_body.lower() else ".")
+            + "\n"
+        )
+    else:
+        composed = compose_styled_email(
+            to_email=to,
+            enrichment=enrichment,
+            style_template=style_ref,
+            user_msg=user_msg,
+        )
+        model = composed.get("provider") or "gemini"
+        html_body = composed.get("html_body") or composed.get("body_cleaned") or ""
+        subject = composed.get("subject") or "(no subject)"
+    yield f"_Chat model: **{model}**_\n"
     job = {
         "recipient_email": to,
         "recipient_name": name,
-        "first_name": str((enrichment or {}).get("first_name") or "").strip()
-        or (name.split(None, 1)[0] if name else ""),
+        "first_name": first,
         "title": title,
         "company": company,
-        "subject": composed.get("subject") or "(no subject)",
-        "html_body": composed.get("body_cleaned") or composed.get("html_body") or "",
+        "subject": subject,
+        "html_body": html_body,
         "from_email": plan.from_email or default_from_email(),
         "cc": list(directives.get("cc") or plan.cc or []),
         "bcc": list(directives.get("bcc") or []),
@@ -1477,8 +1517,8 @@ def _personalize_like_sent_job(
             continue
         if old.lower() == company.lower():
             continue
-        subj = _replace_company_names(subj, old, company)
-        body = _replace_company_names(body, old, company)
+        subj = _replace_outside_urls(subj, old, company)
+        body = _replace_html_company_names(body, old, company)
     # Greetings like "Dear Magic Bus Team" → Dear {First} / Dear {Company} team
     first = str(pctx.get("first_name") or "").strip()
     if not first:
@@ -1609,6 +1649,177 @@ def _replace_company_names(
     return out
 
 
+_YOUTUBE_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com)/[^\s<>\"']+",
+    re.I,
+)
+_HTTP_URL_SPLIT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
+
+
+def _replace_outside_urls(
+    text: str,
+    old_company: str,
+    new_company: str,
+    *,
+    extra_phrases: Optional[list[str]] = None,
+) -> str:
+    """Swap org names in prose; never rewrite URLs (YouTube, sites, files)."""
+    if not text or not old_company or not new_company:
+        return text or ""
+    parts = _HTTP_URL_SPLIT_RE.split(text)
+    out: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            out.append(part)
+        else:
+            out.append(
+                _replace_company_names(
+                    part,
+                    old_company,
+                    new_company,
+                    extra_phrases=extra_phrases,
+                )
+            )
+    return "".join(out)
+
+
+def _replace_html_company_names(
+    html: str,
+    old_company: str,
+    new_company: str,
+    *,
+    extra_phrases: Optional[list[str]] = None,
+) -> str:
+    """Replace org names in HTML text only — leave href/src (YouTube) untouched."""
+    if not html or not old_company or not new_company:
+        return html or ""
+    try:
+        from bs4 import BeautifulSoup
+        from bs4 import NavigableString
+
+        soup = BeautifulSoup(html, "html.parser")
+        for node in list(soup.find_all(string=True)):
+            if not isinstance(node, NavigableString):
+                continue
+            parent = getattr(node, "parent", None)
+            if parent is not None and parent.name in ("script", "style"):
+                continue
+            updated = _replace_outside_urls(
+                str(node),
+                old_company,
+                new_company,
+                extra_phrases=extra_phrases,
+            )
+            if updated != str(node):
+                node.replace_with(updated)
+        for tag in soup.find_all(True):
+            for attr in ("title", "alt", "aria-label"):
+                if not tag.has_attr(attr):
+                    continue
+                tag[attr] = _replace_outside_urls(
+                    str(tag.get(attr) or ""),
+                    old_company,
+                    new_company,
+                    extra_phrases=extra_phrases,
+                )
+        return str(soup)
+    except Exception:
+        return _replace_outside_urls(
+            html, old_company, new_company, extra_phrases=extra_phrases
+        )
+
+
+def _content_urls(html_or_text: str) -> list[str]:
+    """http(s) links to keep when cloning (YouTube, docs, site pages)."""
+    blob = html_or_text or ""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(url: str) -> None:
+        u = (url or "").strip().rstrip(").,;]")
+        if not u.startswith("http"):
+            return
+        key = u.lower()
+        if key in seen:
+            return
+        if "durgaemailer-tracking" in key or "/.netlify/functions/" in key:
+            return
+        seen.add(key)
+        found.append(u)
+
+    for u in _YOUTUBE_URL_RE.findall(blob):
+        _add(u)
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(blob, "html.parser")
+        for tag in soup.find_all(["a", "iframe", "embed", "source", "img"]):
+            for attr in ("href", "src"):
+                _add(str(tag.get(attr) or ""))
+    except Exception:
+        pass
+    for u in _HTTP_URL_SPLIT_RE.findall(blob):
+        _add(u)
+    return found
+
+
+def _html_plain_keep_links(html: str) -> str:
+    """Plain text that still includes href/src URLs (YouTube must survive)."""
+    if not (html or "").strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = str(a.get("href") or "").strip()
+            label = a.get_text(" ", strip=True)
+            if href.startswith("http") and href not in (label or ""):
+                a.append(f" {href}")
+        for tag in soup.find_all(["iframe", "embed", "source"]):
+            src = str(tag.get("src") or "").strip()
+            if src.startswith("http"):
+                tag.replace_with(f" {src} ")
+        return soup.get_text("\n").strip()
+    except Exception:
+        return html
+
+
+def _restore_missing_urls(html: str, urls: list[str]) -> str:
+    """If a clone dropped YouTube/other links, append them before the sign-off."""
+    if not html:
+        return html or ""
+    missing = [u for u in urls if u and u not in html]
+    if not missing:
+        return html
+    import html as _esc
+
+    block = "".join(
+        f'<p><a href="{_esc.escape(u, quote=True)}">{_esc.escape(u)}</a></p>'
+        for u in missing
+    )
+    m = re.search(
+        r"(?is)(<p[^>]*>[^<]{0,80}(?:thanks,?|thank you|best regards|"
+        r"warm regards|kind regards|regards)\b)",
+        html,
+    )
+    if m:
+        return html[: m.start()] + block + html[m.start() :]
+    return html.rstrip() + block
+
+
+def _plain_len(html_or_text: str) -> int:
+    raw = html_or_text or ""
+    if "<" in raw:
+        try:
+            from bs4 import BeautifulSoup
+
+            raw = BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+        except Exception:
+            raw = re.sub(r"<[^>]+>", " ", raw)
+    return len(re.sub(r"\s+", "", raw))
+
+
 def _strip_email_noise(html: str) -> str:
     """Remove scripts/styles/tracking pixels; keep real content and original hrefs."""
     if not (html or "").strip():
@@ -1647,23 +1858,19 @@ def _strip_email_noise(html: str) -> str:
 
 
 def _full_reference_text(body_text: str, body_html: str) -> str:
-    """Return the complete plain-text email body (no truncation, no tracking URLs)."""
+    """Return the complete plain-text email body (no truncation; keep YouTube URLs)."""
     from core.tracking import strip_visible_tracking_urls
 
     text = strip_visible_tracking_urls((body_text or "").strip())
     html = _strip_email_noise(body_html or "")
-    html_text = ""
-    if html:
-        try:
-            from bs4 import BeautifulSoup
-
-            html_text = BeautifulSoup(html, "html.parser").get_text("\n").strip()
-        except Exception:
-            html_text = html
-        html_text = strip_visible_tracking_urls(html_text)
-    # Prefer whichever source is more complete
-    if len(html_text) > len(text) + 80:
-        return html_text
+    html_text = strip_visible_tracking_urls(_html_plain_keep_links(html)) if html else ""
+    html_has_links = bool(
+        _YOUTUBE_URL_RE.search((body_html or "") + html_text)
+        or re.search(r"<a\s[^>]*href=", body_html or "", re.I)
+        or re.search(r"<iframe\b", body_html or "", re.I)
+    )
+    if html_has_links or len(html_text) > len(text) + 80:
+        return html_text or text
     return text or html_text
 
 
@@ -1804,10 +2011,10 @@ def _compose_like_sent_for_company(
     for old in scrub_names:
         if not old or old.lower() == target.lower():
             continue
-        composed["html_body"] = _replace_company_names(
+        composed["html_body"] = _replace_html_company_names(
             composed.get("html_body") or "", old, target
         )
-        composed["subject"] = _replace_company_names(
+        composed["subject"] = _replace_outside_urls(
             composed.get("subject") or "", old, target
         )
     return composed
@@ -1834,6 +2041,73 @@ def _unique_prospect_companies(
     return out
 
 
+def _llm_revise_like_sent(
+    *,
+    html: str,
+    subject: str,
+    target: str,
+    research_notes: str,
+    first_name: str = "",
+    must_keep_urls: list[str],
+    user_msg: str = "",
+) -> Optional[tuple[str, str]]:
+    """Org-personalize a full HTML clone. Returns None if the model shortened or dropped links."""
+    if not html or not target or target == "{company}":
+        return None
+    url_lines = "\n".join(f"- {u}" for u in (must_keep_urls or [])[:50])
+    name_bit = f"Use greeting first name: {first_name}." if first_name else ""
+    try:
+        raw = extract_json(
+            f"""Revise this COMPLETE HTML outreach email for {target}.
+{name_bit}
+User request: {user_msg[:1500]}
+
+HARD RULES:
+- Return the FULL email. Keep every section, offer, ask, list, CTA, and video.
+- Do NOT summarize into a few lines. Keep similar length (at least 80% of original).
+- Keep EVERY URL below exactly as written — especially YouTube (youtube.com / youtu.be / iframe src).
+- Update subject, recipient name, company name, and org-specific rationale using the research.
+- Keep HTML (p, a, ul, ol, li, iframe, img except tracking pixels). No markdown.
+
+Original subject:
+{subject}
+
+Original HTML:
+{html[:40000]}
+
+Research on {target}:
+{(research_notes or '')[:6000]}
+
+URLs that MUST remain in html_body:
+{url_lines or '(none listed)'}
+
+Return JSON: {{"subject":"...","html_body":"...complete html..."}}""",
+            system=(
+                "You clone a full HTML email for a new organisation. "
+                "Never summarize. Never drop YouTube or other links. JSON only."
+            ),
+            max_tokens=8000,
+        )
+        data = json.loads(raw or "{}")
+        new_html = str((data or {}).get("html_body") or "").strip()
+        new_subj = str((data or {}).get("subject") or "").strip()
+        if not new_html:
+            return None
+        if _plain_len(new_html) < int(_plain_len(html) * 0.75):
+            return None
+        missing = [
+            u
+            for u in (must_keep_urls or [])
+            if u and u not in new_html and "youtube" in u.lower()
+        ]
+        if missing:
+            return None
+        return new_subj or subject, new_html
+    except Exception as e:
+        print(f"[router] like-sent LLM revise failed: {e}", file=sys.stderr)
+        return None
+
+
 def _compose_like_sent_email(
     *,
     user_msg: str,
@@ -1842,95 +2116,119 @@ def _compose_like_sent_email(
     target_company: str,
     research_notes: str,
     document_context: str = "",
+    first_name: str = "",
 ) -> dict[str, str]:
-    """Keep the FULL sent email; swap company names; lightly adapt Why-section only."""
+    """Clone the FULL sent email (links included), then personalize names/org/subject."""
     ref_subject = (reference_msg.get("subject") or "").strip()
     ref_body = (reference_msg.get("body_text") or "").strip()
     ref_html = (reference_msg.get("body_html") or "").strip()
 
+    cleaned_html = _strip_email_noise(ref_html)
     full_text = _full_reference_text(ref_body, ref_html)
     target = (target_company or "").strip() or "{company}"
-    phrases = _detect_company_phrases(full_text + "\n" + ref_subject, reference_company)
+    phrases = _detect_company_phrases(
+        full_text + "\n" + ref_subject + "\n" + cleaned_html,
+        reference_company,
+    )
+    keep_urls = _content_urls(
+        "\n".join(
+            [
+                cleaned_html,
+                full_text,
+                ref_body,
+                ref_html,
+            ]
+        )
+    )
 
-    # 1) Deterministic full-body company swap — never summarize / never drop sections
-    swapped = _replace_company_names(
+    swapped_subject = (
+        _replace_outside_urls(
+            ref_subject,
+            reference_company,
+            target,
+            extra_phrases=phrases,
+        )
+        or ref_subject
+    )
+    swapped_text = _replace_outside_urls(
         full_text,
         reference_company,
         target,
         extra_phrases=phrases,
     )
-    swapped_subject = _replace_company_names(
-        ref_subject,
-        reference_company,
-        target,
-        extra_phrases=phrases,
-    ) or ref_subject
 
-    # 2) Optional: rewrite only "Why X specifically" using research (rest untouched)
-    if research_notes.strip() and target and target != "{company}":
-        swapped = _adapt_why_section(
-            swapped,
-            reference_company=reference_company,
-            target_company=target,
-            research_notes=research_notes,
-        )
-
-    # 3) If HTML source is richer structurally, swap names inside cleaned HTML instead
     html_out = ""
-    cleaned_html = _strip_email_noise(ref_html)
-    if cleaned_html and len(cleaned_html) > 200:
-        html_swapped = _replace_company_names(
+    if cleaned_html and (
+        len(cleaned_html) > 80
+        or "<a" in cleaned_html.lower()
+        or "iframe" in cleaned_html.lower()
+        or _YOUTUBE_URL_RE.search(cleaned_html)
+    ):
+        html_out = _replace_html_company_names(
             cleaned_html,
             reference_company,
             target,
             extra_phrases=phrases,
         )
-        # Prefer HTML only when it still contains essentially the full text
-        try:
-            from bs4 import BeautifulSoup
-
-            html_plain = BeautifulSoup(html_swapped, "html.parser").get_text("\n")
-        except Exception:
-            html_plain = html_swapped
-        if len(re.sub(r"\s+", "", html_plain)) >= int(
-            len(re.sub(r"\s+", "", swapped)) * 0.9
-        ):
-            # Also apply why-section text into HTML path by rebuilding from swapped text
-            # when why-section was adapted (swapped may differ from html_plain)
-            if len(swapped) >= len(full_text) * 0.9:
-                html_out = _full_text_to_html(swapped)
-            else:
-                html_out = html_swapped
-
     if not html_out:
-        html_out = _full_text_to_html(swapped)
+        if research_notes.strip() and target and target != "{company}":
+            swapped_text = _adapt_why_section(
+                swapped_text,
+                reference_company=reference_company,
+                target_company=target,
+                research_notes=research_notes,
+            )
+        html_out = _full_text_to_html(swapped_text)
 
-    # Final scrub for leftover reference company
+    if first_name and html_out:
+        html_out = _ensure_designation_in_greeting(html_out, first_name=first_name)
+
+    if research_notes.strip() and target and target != "{company}":
+        revised = _llm_revise_like_sent(
+            html=html_out,
+            subject=swapped_subject,
+            target=target,
+            research_notes=research_notes,
+            first_name=first_name,
+            must_keep_urls=keep_urls,
+            user_msg=user_msg or "",
+        )
+        if revised:
+            swapped_subject, html_out = revised
+
+    html_out = _restore_missing_urls(html_out, keep_urls)
+
+    if _plain_len(html_out) < int(_plain_len(full_text) * 0.7) and full_text:
+        html_out = _restore_missing_urls(
+            _full_text_to_html(swapped_text),
+            keep_urls,
+        )
+
     if _reference_still_present(html_out + swapped_subject, reference_company):
-        html_out = _replace_company_names(
+        html_out = _replace_html_company_names(
             html_out, reference_company, target, extra_phrases=phrases
         )
-        swapped_subject = _replace_company_names(
+        swapped_subject = _replace_outside_urls(
             swapped_subject, reference_company, target, extra_phrases=phrases
         )
-        swapped = _replace_company_names(
-            swapped, reference_company, target, extra_phrases=phrases
+        swapped_text = _replace_outside_urls(
+            swapped_text, reference_company, target, extra_phrases=phrases
         )
 
-    # Drop cloned Gmail signature so append_signature adds it once later;
-    # also render any leftover **markdown** inside HTML and hide tracking URLs.
     try:
-        from gmail_client.html_format import (
-            normalize_email_html,
-            strip_trailing_signature_block,
-        )
+        from gmail_client.html_format import normalize_email_html
         from core.tracking import strip_tracking, strip_visible_tracking_urls
 
         html_out = strip_visible_tracking_urls(html_out)
         html_out = strip_tracking(html_out)
-        html_out = strip_trailing_signature_block(html_out)
+        # Flattening the signature would drop YouTube <a>/<iframe> parts.
+        if not keep_urls and not _YOUTUBE_URL_RE.search(html_out or ""):
+            from gmail_client.html_format import strip_trailing_signature_block
+
+            html_out = strip_trailing_signature_block(html_out)
         html_out = normalize_email_html(html_out)
         html_out = strip_visible_tracking_urls(html_out)
+        html_out = _restore_missing_urls(html_out, keep_urls)
     except Exception:
         pass
 
@@ -1954,8 +2252,8 @@ Return JSON: {{"alignment_summary":"..."}}""",
         "html_body": html_out,
         "alignment_summary": alignment,
         "paragraph_count": str(html_out.count("<p>")),
-        "char_count": str(len(swapped)),
-        "plain_preview": swapped[:1200],
+        "char_count": str(max(len(swapped_text), _plain_len(html_out))),
+        "plain_preview": swapped_text[:1200],
     }
 
 
@@ -3497,6 +3795,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 directives.get("explicit_recipient_lock")
                 or directive_to_list(directives)
             )
+            like_clone = bool(like_ref or like_mid)
+            locked: list[str] = []
             if recipient_lock:
                 ignore_set = {e.lower() for e in (directives.get("ignore") or [])}
                 locked = [
@@ -3506,6 +3806,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 draft_debug["recipients_final"] = locked
                 draft_debug["draft_path"] = "single"
                 draft_debug["ignored_count"] = max(0, n_session - len(locked))
+            if recipient_lock and not like_clone:
                 dirs = dict(directives)
                 if not dirs.get("cc"):
                     dirs["cc"] = list(plan.cc or [])
@@ -3545,14 +3846,17 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         if dom:
                             like_ref = dom.group(1).split(".")[0]
 
-            if not recipient_lock and not directives.get("to") and (like_ref or like_mid):
-                # Clone angle from a prior sent email → draft to named company /
-                # last-search prospects — never the Sent template (Magic Bus / IndiaMART).
+            if like_ref or like_mid:
+                # Clone the full sent email, then revise names/org — including when
+                # the user also named an explicit To address.
                 explicit_company = (
                     parse_explicit_draft_company(user_msg or "")
                     or (like_for or "").strip()
                 )
-                use_prospect_batch = bool(
+                if recipient_lock:
+                    use_prospect_batch = False
+                else:
+                    use_prospect_batch = bool(
                     _prospects_with_email(prospects)
                     and (
                         bool(explicit_company)
@@ -3572,6 +3876,15 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 )
                 if explicit_company and not target_company:
                     target_company = explicit_company
+                if recipient_lock and not target_company and locked:
+                    enr = _lookup_enrichment_for(
+                        locked[0], prospects, prospect_out
+                    )
+                    target_company = str(
+                        (enr or {}).get("company")
+                        or (enr or {}).get("organization")
+                        or ""
+                    ).strip()
                 yield (
                     "**Like-sent:** "
                     + (
@@ -3849,8 +4162,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         elif like_for:
                             companies_to_research = [like_for]
 
-                        ref_body_for_research = (
-                            (ref_msg.get("body_text") or body_preview) or ""
+                        ref_body_for_research = _full_reference_text(
+                            ref_msg.get("body_text") or body_preview or "",
+                            ref_msg.get("body_html") or "",
                         )[:12000]
                         for company in companies_to_research:
                             if _stop_now():
@@ -3951,11 +4265,20 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             and not (
                                 like_ref
                                 and "@" in like_ref
-                                and e.lower().endswith(
-                                    "@" + like_ref.split("@", 1)[1].lower()
-                                )
+                                and e.lower() == like_ref.lower()
                             )
                         ]
+                        if recipient_lock and locked:
+                            recipients = [
+                                a
+                                for a in locked
+                                if a.lower() not in block
+                                and not (
+                                    like_ref
+                                    and "@" in like_ref
+                                    and a.lower() == like_ref.lower()
+                                )
+                            ]
                         # "to above" / last search → always use prospect list, not
                         # history To addresses and never the Magic Bus template.
                         if use_prospect_batch:
