@@ -155,7 +155,7 @@ with tab_overview:
 with tab_followups:
     st.caption(
         "Opened (and optionally clicked) **draft sends** with recipient + subject — for follow-up outreach. "
-        "First / last open times are Indian Standard Time."
+        "Sent / first / last open times are Indian Standard Time."
     )
     include_unopened = st.toggle("Include tracked sends with no opens yet", value=False)
     exclude_bots_f = st.toggle("Exclude bot opens", value=True, key="fu_bots")
@@ -213,6 +213,7 @@ with tab_followups:
         reverse=True,
     )
     for r in fu_rows:
+        r["sent_at"] = format_ist(r["sent_at"]) if r["sent_at"] else ""
         r["first_open"] = format_ist(r["first_open"]) if r["first_open"] else ""
         r["last_open"] = format_ist(r["last_open"]) if r["last_open"] else ""
     opened_only = [r for r in fu_rows if r["opens"] > 0 or r["clicks"] > 0]
@@ -246,6 +247,7 @@ with tab_followups:
                 + (f" · {r['recipient_name']}" if r.get("recipient_name") else "")
                 + (f"  \n{r['designation']}" if r.get("designation") else "")
                 + f"  \n{(r.get('subject') or '')[:100]}"
+                + (f"  \nSent: {r['sent_at']}" if r.get("sent_at") else "")
                 + (
                     f"  \nFirst open: {r['first_open']} · Last open: {r['last_open']}"
                     if r.get("first_open") or r.get("last_open")
@@ -263,7 +265,7 @@ with tab_followups:
 with tab_hot:
     st.caption(
         "Opened draft sends with full email details. Create a follow-up draft in Chat in one click. "
-        "First / last open times are Indian Standard Time."
+        "Sent / first / last open times are Indian Standard Time."
     )
     days = st.slider("Days window", 1, 60, 14)
     min_opens = st.slider("Min opens", 1, 20, 1)
@@ -358,6 +360,7 @@ with tab_hot:
     ]
     hot.sort(key=lambda x: (x["clicks"], x["opens"], x["last_open"]), reverse=True)
     for row in hot:
+        row["sent_at"] = format_ist(row["sent_at"]) if row["sent_at"] else ""
         row["first_open"] = format_ist(row["first_open"]) if row["first_open"] else ""
         row["last_open"] = format_ist(row["last_open"]) if row["last_open"] else ""
     df = pd.DataFrame(hot)
@@ -403,7 +406,8 @@ with tab_hot:
                 + (f" · {row['recipient_name']}" if row.get("recipient_name") else "")
                 + (f"  \n{row['designation']}" if row.get("designation") else "")
                 + f"  \n{(row.get('subject') or '')[:100]}  \n"
-                f"Opens: {row['opens']} · Clicks: {row['clicks']}"
+                + (f"Sent: {row['sent_at']}  \n" if row.get("sent_at") else "")
+                + f"Opens: {row['opens']} · Clicks: {row['clicks']}"
                 + (
                     f" · First open: {row['first_open']}"
                     if row.get("first_open")
@@ -439,8 +443,12 @@ with tab_lookup:
             st.info("No draft sends found for that address.")
         for srow in mine:
             eid = srow.get("email_id")
-            with st.expander(f"{srow.get('sent_at')} — {srow.get('subject')} ({eid})"):
-                st.write(srow)
+            sent_ist = format_ist(srow.get("sent_at") or "") if srow.get("sent_at") else ""
+            with st.expander(f"{sent_ist or srow.get('sent_at')} — {srow.get('subject')} ({eid})"):
+                shown = dict(srow)
+                if sent_ist:
+                    shown["sent_at"] = sent_ist
+                st.write(shown)
                 o = [r for r in (opens.get("rows") or []) if r.get("email_id") == eid]
                 c = [r for r in (clicks.get("rows") or []) if r.get("email_id") == eid]
                 st.markdown(f"**Opens ({len(o)})**")

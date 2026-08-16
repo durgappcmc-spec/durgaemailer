@@ -1,4 +1,4 @@
-# NOTE: Tracking open times are stored as UTC; display them in IST (no DST).
+# NOTE: Tracking sent/open times are stored as UTC; display them in IST (no DST).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
