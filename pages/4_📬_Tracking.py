@@ -11,6 +11,7 @@ import streamlit as st
 
 from config import APP_NAME, settings
 from core.auth_ui import logout_button, require_login
+from core.prospect_list import designation_for_row, titles_by_email
 
 st.set_page_config(page_title=f"Tracking · {APP_NAME}", page_icon="📬", layout="wide")
 if not require_login():
@@ -86,12 +87,26 @@ def _parse_dt(val: str) -> datetime | None:
         return None
 
 
-def _queue_followup(email: str, subject: str, name: str = "") -> None:
+@st.cache_data(ttl=120)
+def _prospect_titles_by_email() -> dict[str, str]:
+    try:
+        return titles_by_email()
+    except Exception:
+        return {}
+
+
+def _queue_followup(
+    email: str, subject: str, name: str = "", designation: str = ""
+) -> None:
     who = name or email
+    title = (designation or "").strip()
+    label = who
+    if title and title.lower() not in who.lower():
+        label = f"{who}, {title}" if name else title
     prior = subject or "our recent note"
     st.session_state.force_prompt = (
         f'Draft a polite follow-up email to {email}'
-        + (f" ({who})" if name and name.lower() not in email.lower() else "")
+        + (f" ({label})" if label and label.lower() not in email.lower() else "")
         + f' about "{prior}". Reference the prior outreach briefly and ask for a short call '
         f"or next step. Keep it concise."
     )
@@ -152,6 +167,7 @@ with tab_followups:
     clicks_f = _list_tracking("clicks", exclude_bots=False)
 
     send_rows_f = [r for r in (sends_f.get("rows") or []) if _is_draft_outreach(r)]
+    prospect_titles = _prospect_titles_by_email()
     open_rows_f = opens_f.get("rows") or []
     click_rows_f = clicks_f.get("rows") or []
     if exclude_bots_f:
@@ -183,6 +199,7 @@ with tab_followups:
             {
                 "recipient_email": srow.get("recipient_email") or "",
                 "recipient_name": srow.get("recipient_name") or "",
+                "designation": designation_for_row(srow, prospect_titles),
                 "subject": srow.get("subject") or "",
                 "campaign": srow.get("campaign") or "",
                 "source": srow.get("source") or "",
@@ -227,6 +244,7 @@ with tab_followups:
             cols[0].markdown(
                 f"**{r['recipient_email']}**"
                 + (f" · {r['recipient_name']}" if r.get("recipient_name") else "")
+                + (f"  \n{r['designation']}" if r.get("designation") else "")
                 + f"  \n{(r.get('subject') or '')[:100]}"
             )
             if cols[1].button("Follow up", key=f"fu_btn_{i}_{r['email_id'][:8]}"):
@@ -234,6 +252,7 @@ with tab_followups:
                     r["recipient_email"],
                     r["subject"],
                     r.get("recipient_name") or "",
+                    r.get("designation") or "",
                 )
 
 with tab_hot:
@@ -249,6 +268,7 @@ with tab_hot:
     cutoff = datetime.utcnow() - timedelta(days=days)
 
     send_rows = [r for r in (sends.get("rows") or []) if _is_draft_outreach(r)]
+    prospect_titles = _prospect_titles_by_email()
     send_by_eid = {_clean_eid(r.get("email_id")): r for r in send_rows if _clean_eid(r.get("email_id"))}
 
     open_rows = opens.get("rows") or []
@@ -275,6 +295,7 @@ with tab_hot:
             {
                 "recipient_email": email,
                 "recipient_name": srow.get("recipient_name") or "",
+                "designation": designation_for_row(srow, prospect_titles),
                 "subject": srow.get("subject") or "",
                 "campaign": srow.get("campaign") or "",
                 "source": srow.get("source") or "",
@@ -310,6 +331,7 @@ with tab_hot:
             {
                 "recipient_email": email,
                 "recipient_name": srow.get("recipient_name") or "",
+                "designation": designation_for_row(srow, prospect_titles),
                 "subject": srow.get("subject") or "",
                 "campaign": srow.get("campaign") or "",
                 "source": srow.get("source") or "",
@@ -343,6 +365,7 @@ with tab_hot:
                     for c in [
                         "recipient_email",
                         "recipient_name",
+                        "designation",
                         "subject",
                         "opens",
                         "clicks",
@@ -369,6 +392,7 @@ with tab_hot:
             cols[0].markdown(
                 f"**{row['recipient_email']}**"
                 + (f" · {row['recipient_name']}" if row.get("recipient_name") else "")
+                + (f"  \n{row['designation']}" if row.get("designation") else "")
                 + f"  \n{(row.get('subject') or '')[:100]}  \n"
                 f"Opens: {row['opens']} · Clicks: {row['clicks']} · Last open: {row.get('last_open') or '—'}"
             )
@@ -377,6 +401,7 @@ with tab_hot:
                     row["recipient_email"],
                     row.get("subject") or "",
                     row.get("recipient_name") or "",
+                    row.get("designation") or "",
                 )
 
 with tab_lookup:

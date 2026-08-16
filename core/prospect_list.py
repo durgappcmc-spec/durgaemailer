@@ -453,6 +453,44 @@ def all_prospects() -> list[dict[str, Any]]:
         return [sanitize_prospect(p) for p in _load()]
 
 
+def titles_by_email(
+    prospects: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, str]:
+    """email → job title from saved (or provided) prospects."""
+    out: dict[str, str] = {}
+    rows = prospects if prospects is not None else all_prospects()
+    for p in rows or []:
+        email = str(p.get("email") or "").strip().lower()
+        title = str(p.get("title") or p.get("designation") or "").strip()
+        if email and title and email not in out:
+            out[email] = title
+    return out
+
+
+def designation_for_row(
+    row: dict[str, Any] | None,
+    titles: Optional[dict[str, str]] = None,
+) -> str:
+    """Job title from a send/draft row, else Saved prospects lookup by email."""
+    row = row or {}
+    title = (
+        str(row.get("title") or "").strip()
+        or str(row.get("designation") or "").strip()
+        or str(row.get("recipient_title") or "").strip()
+    )
+    if title:
+        return title
+    email = ""
+    for key in ("recipient_email", "recipient", "to", "email"):
+        email = str(row.get(key) or "").strip().lower()
+        if email and "@" in email:
+            break
+        email = ""
+    if titles and email:
+        return str(titles.get(email) or "").strip()
+    return ""
+
+
 def _company_tokens(s: str) -> list[str]:
     stop = {
         "ltd",
