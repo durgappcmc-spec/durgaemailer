@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -11,6 +11,7 @@ import streamlit as st
 
 from config import APP_NAME, settings
 from core.auth_ui import logout_button, require_login
+from core.ist_time import format_ist, parse_tracking_dt
 from core.prospect_list import designation_for_row, titles_by_email
 
 st.set_page_config(page_title=f"Tracking · {APP_NAME}", page_icon="📬", layout="wide")
@@ -79,12 +80,7 @@ def _is_draft_outreach(row: dict) -> bool:
 
 
 def _parse_dt(val: str) -> datetime | None:
-    if not val:
-        return None
-    try:
-        return datetime.fromisoformat(str(val).replace("Z", "+00:00")).replace(tzinfo=None)
-    except Exception:
-        return None
+    return parse_tracking_dt(val)
 
 
 @st.cache_data(ttl=120)
@@ -158,7 +154,8 @@ with tab_overview:
 
 with tab_followups:
     st.caption(
-        "Opened (and optionally clicked) **draft sends** with recipient + subject — for follow-up outreach."
+        "Opened (and optionally clicked) **draft sends** with recipient + subject — for follow-up outreach. "
+        "First / last open times are Indian Standard Time."
     )
     include_unopened = st.toggle("Include tracked sends with no opens yet", value=False)
     exclude_bots_f = st.toggle("Exclude bot opens", value=True, key="fu_bots")
@@ -215,6 +212,9 @@ with tab_followups:
         key=lambda r: (r["opens"] > 0, r["clicks"], r["opens"], r["last_open"]),
         reverse=True,
     )
+    for r in fu_rows:
+        r["first_open"] = format_ist(r["first_open"]) if r["first_open"] else ""
+        r["last_open"] = format_ist(r["last_open"]) if r["last_open"] else ""
     opened_only = [r for r in fu_rows if r["opens"] > 0 or r["clicks"] > 0]
     c1, c2, c3 = st.columns(3)
     c1.metric("In list", len(fu_rows))
@@ -246,6 +246,11 @@ with tab_followups:
                 + (f" · {r['recipient_name']}" if r.get("recipient_name") else "")
                 + (f"  \n{r['designation']}" if r.get("designation") else "")
                 + f"  \n{(r.get('subject') or '')[:100]}"
+                + (
+                    f"  \nFirst open: {r['first_open']} · Last open: {r['last_open']}"
+                    if r.get("first_open") or r.get("last_open")
+                    else ""
+                )
             )
             if cols[1].button("Follow up", key=f"fu_btn_{i}_{r['email_id'][:8]}"):
                 _queue_followup(
@@ -257,7 +262,8 @@ with tab_followups:
 
 with tab_hot:
     st.caption(
-        "Opened draft sends with full email details. Create a follow-up draft in Chat in one click."
+        "Opened draft sends with full email details. Create a follow-up draft in Chat in one click. "
+        "First / last open times are Indian Standard Time."
     )
     days = st.slider("Days window", 1, 60, 14)
     min_opens = st.slider("Min opens", 1, 20, 1)
@@ -265,7 +271,7 @@ with tab_hot:
     sends = _list_tracking("sends")
     opens = _list_tracking("opens", exclude_bots=False)
     clicks = _list_tracking("clicks", exclude_bots=False)
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     send_rows = [r for r in (sends.get("rows") or []) if _is_draft_outreach(r)]
     prospect_titles = _prospect_titles_by_email()
@@ -351,6 +357,9 @@ with tab_hot:
         if v["opens"] >= min_opens or v["clicks"] > 0
     ]
     hot.sort(key=lambda x: (x["clicks"], x["opens"], x["last_open"]), reverse=True)
+    for row in hot:
+        row["first_open"] = format_ist(row["first_open"]) if row["first_open"] else ""
+        row["last_open"] = format_ist(row["last_open"]) if row["last_open"] else ""
     df = pd.DataFrame(hot)
     if df.empty:
         st.info(
@@ -394,7 +403,17 @@ with tab_hot:
                 + (f" · {row['recipient_name']}" if row.get("recipient_name") else "")
                 + (f"  \n{row['designation']}" if row.get("designation") else "")
                 + f"  \n{(row.get('subject') or '')[:100]}  \n"
-                f"Opens: {row['opens']} · Clicks: {row['clicks']} · Last open: {row.get('last_open') or '—'}"
+                f"Opens: {row['opens']} · Clicks: {row['clicks']}"
+                + (
+                    f" · First open: {row['first_open']}"
+                    if row.get("first_open")
+                    else ""
+                )
+                + (
+                    f" · Last open: {row['last_open']}"
+                    if row.get("last_open")
+                    else ""
+                )
             )
             if cols[1].button("Follow up", key=f"hot_fu_{i}_{row['email_id'][:8]}"):
                 _queue_followup(
