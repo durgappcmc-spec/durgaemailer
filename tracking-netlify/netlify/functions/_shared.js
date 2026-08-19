@@ -1,10 +1,13 @@
 // NOTE: Shared helpers for open/click Netlify functions. Node 18+ global fetch.
-const BOT_RE =
-  /GoogleImageProxy|YahooMailProxy|Mail\/\d|iPhone.*Mail|Macintosh.*Mail|Barracuda|Proofpoint|Mimecast|Symantec|MessageLabs|bot|crawler|spider|scanner|curl|wget|python-requests/i;
+const OPEN_BOT_RE =
+  /GoogleImageProxy|ggpht\.com|googleusercontent|YahooMailProxy|Googlebot|Google-PageRenderer|Google-Safety|AdsBot|APIs-Google|Feedfetcher|GoogleAssociationService|HeadlessChrome|Chrome-Lighthouse|SafeLinks|safelinks\.protection|Barracuda|Proofpoint|Mimecast|Symantec|MessageLabs|Outlook-iOS|Outlook-Android|\bbot\b|\bcrawler\b|\bspider\b|\bscanner\b|curl\/|wget\/|python-requests|Go-http-client|facebookexternalhit|Slackbot|Twitterbot|WhatsApp|Mail\/\d|iPhone.*Mail|Macintosh.*Mail/i;
 
-export function isLikelyBot(ua) {
+const CLICK_BOT_RE =
+  /GoogleImageProxy|ggpht\.com|googleusercontent|YahooMailProxy|Googlebot|Google-PageRenderer|Google-Safety|AdsBot|APIs-Google|Feedfetcher|GoogleAssociationService|HeadlessChrome|Chrome-Lighthouse|SafeLinks|safelinks\.protection|Barracuda|Proofpoint|Mimecast|Symantec|MessageLabs|\bbot\b|\bcrawler\b|\bspider\b|\bscanner\b|curl\/|wget\/|python-requests|Go-http-client/i;
+
+export function isLikelyBot(ua, { kind = "open" } = {}) {
   if (!ua) return true;
-  return BOT_RE.test(ua);
+  return kind === "click" ? CLICK_BOT_RE.test(ua) : OPEN_BOT_RE.test(ua);
 }
 
 export function clientIp(event) {

@@ -118,6 +118,63 @@ def test_visible_click_autolink_is_stripped():
     assert "click?id=" not in preview
 
 
+def test_filter_real_clicks_drops_gmail_prefetch_and_draft():
+    from core.tracking import filter_real_clicks, is_bot_flag, is_prefetch_user_agent
+
+    assert is_prefetch_user_agent("Mozilla/5.0 GoogleImageProxy/1.0")
+    assert is_prefetch_user_agent("Google-Safety")
+    assert is_prefetch_user_agent("")
+    assert not is_prefetch_user_agent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+    )
+    assert is_bot_flag("TRUE")
+    assert is_bot_flag(True)
+    assert not is_bot_flag("FALSE")
+    assert not is_bot_flag(False)
+
+    send_rows = [
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "sent_at": "2026-08-19T10:00:00Z",
+        }
+    ]
+    clicks = [
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "clicked_at": "2026-08-19T09:59:00Z",
+            "user_agent": "Mozilla/5.0 Chrome/120",
+            "is_bot": False,
+        },
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "clicked_at": "2026-08-19T12:00:00Z",
+            "user_agent": "Mozilla/5.0 Chrome/120",
+            "is_bot": False,
+        },
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "clicked_at": "2026-08-19T12:05:00Z",
+            "user_agent": "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0 (via ggpht.com GoogleImageProxy)",
+            "is_bot": False,
+        },
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "clicked_at": "2026-08-19T12:06:00Z",
+            "user_agent": "Google-Safety",
+            "is_bot": False,
+        },
+        {
+            "email_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "clicked_at": "2026-08-19T12:07:00Z",
+            "user_agent": "Mozilla/5.0 Chrome/120",
+            "is_bot": "TRUE",
+        },
+    ]
+    kept = filter_real_clicks(clicks, send_rows=send_rows, open_rows=[])
+    times = [c["clicked_at"] for c in kept]
+    assert times == ["2026-08-19T12:00:00Z"]
+
+
 @pytest.mark.parametrize("surface", ["bulk_grid", "chat_inspector", "drafts_inspector"])
 def test_save_path_reinjects(surface, monkeypatch, tmp_path):
     """Every draft save keeps the same tracking_id without a live open pixel."""

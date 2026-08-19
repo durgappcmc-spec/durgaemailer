@@ -13,6 +13,7 @@ from config import APP_NAME, settings
 from core.auth_ui import logout_button, require_login
 from core.ist_time import format_ist, parse_tracking_dt
 from core.prospect_list import designation_for_row, titles_by_email
+from core.tracking import filter_real_clicks, is_bot_flag, is_prefetch_user_agent
 
 st.set_page_config(page_title=f"Tracking · {APP_NAME}", page_icon="📬", layout="wide")
 if not require_login():
@@ -23,7 +24,7 @@ st.title("📬 Tracking")
 st.caption(
     "Shows opens/clicks for Relay **drafts you sent** from Gmail (and Relay sends). "
     "Tracking survives deploys in Google Sheets. "
-    "Gmail image proxy often marks opens as bots — keep Exclude bots on and trust clicks more."
+    "Gmail image proxy / draft preview is not counted as a click."
 )
 if st.button("Refresh data", type="secondary"):
     st.cache_data.clear()
@@ -127,13 +128,21 @@ with tab_overview:
     open_rows = opens.get("rows") or []
     click_rows = clicks.get("rows") or []
     if exclude_bots:
-        open_rows = [r for r in open_rows if not r.get("is_bot")]
-        click_rows = [r for r in click_rows if not r.get("is_bot")]
+        open_rows = [
+            r
+            for r in open_rows
+            if not is_bot_flag(r.get("is_bot"))
+            and not is_prefetch_user_agent(str(r.get("user_agent") or ""))
+        ]
+        click_rows = [r for r in click_rows if not is_bot_flag(r.get("is_bot"))]
 
     send_ids = {_clean_eid(r.get("email_id")) for r in send_rows}
     send_ids.discard("")
     open_rows = [r for r in open_rows if _clean_eid(r.get("email_id")) in send_ids]
     click_rows = [r for r in click_rows if _clean_eid(r.get("email_id")) in send_ids]
+    click_rows = filter_real_clicks(
+        click_rows, send_rows=send_rows, open_rows=opens.get("rows") or []
+    )
 
     n_sent = len(send_rows)
     n_opened = len({_clean_eid(r.get("email_id")) for r in open_rows if _clean_eid(r.get("email_id"))})
@@ -146,7 +155,8 @@ with tab_overview:
     m3.metric("Clicked", n_clicked, f"{(n_clicked / n_sent * 100) if n_sent else 0:.1f}%")
     m4.metric("Bot filter", "ON" if exclude_bots else "OFF")
     st.caption(
-        "Only draft-originated / recipient-tagged outreach. Apple Mail / Gmail prefetch can inflate opens."
+        "Only draft-originated / recipient-tagged outreach. "
+        "Gmail prefetch and opening a draft do not count as clicks."
     )
     for label, payload in [("sends", sends), ("opens", opens), ("clicks", clicks)]:
         if payload.get("error"):
@@ -168,8 +178,15 @@ with tab_followups:
     open_rows_f = opens_f.get("rows") or []
     click_rows_f = clicks_f.get("rows") or []
     if exclude_bots_f:
-        open_rows_f = [r for r in open_rows_f if not r.get("is_bot")]
-        click_rows_f = [r for r in click_rows_f if not r.get("is_bot")]
+        open_rows_f = [
+            r
+            for r in open_rows_f
+            if not is_bot_flag(r.get("is_bot"))
+            and not is_prefetch_user_agent(str(r.get("user_agent") or ""))
+        ]
+    click_rows_f = filter_real_clicks(
+        click_rows_f, send_rows=send_rows_f, open_rows=opens_f.get("rows") or []
+    )
 
     open_by: dict[str, list] = defaultdict(list)
     for r in open_rows_f:
@@ -282,8 +299,15 @@ with tab_hot:
     open_rows = opens.get("rows") or []
     click_rows = clicks.get("rows") or []
     if exclude_bots_h:
-        open_rows = [r for r in open_rows if not r.get("is_bot")]
-        click_rows = [r for r in click_rows if not r.get("is_bot")]
+        open_rows = [
+            r
+            for r in open_rows
+            if not is_bot_flag(r.get("is_bot"))
+            and not is_prefetch_user_agent(str(r.get("user_agent") or ""))
+        ]
+    click_rows = filter_real_clicks(
+        click_rows, send_rows=send_rows, open_rows=opens.get("rows") or []
+    )
 
     # Aggregate per email_id so subject stays attached to the opened send
     stats: dict[str, dict] = {}

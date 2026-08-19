@@ -208,7 +208,8 @@ _EMAIL_ATTACH_RE = re.compile(
     r"attach(\s|$)|attachment|attachments|"
     r"with\s+(the\s+)?(file|pdf|doc|document|deck)|"
     r"include\s+(the\s+)?(file|pdf|attachment)|"
-    r"attach(ed|ing)\b"
+    r"attach(ed|ing)\b|"
+    r"use\s+\S+\s+as\s+(an?\s+)?attachment"
     r")\b",
     re.I,
 )
@@ -270,12 +271,13 @@ def _wants_file_context(user_msg: str) -> bool:
 def _ask_for_upload(*, for_email_attach: bool = False) -> str:
     if for_email_attach:
         return (
-            "Please **upload the file** with the **paperclip** on the chat box "
-            "to attach it, then send the same draft/send/schedule request again."
+            "Please **upload a file** on the **📁 Files** page "
+            "(or with the **paperclip**), then name it in the "
+            "same draft request (e.g. `attach one-pager.pdf`)."
         )
     return (
-        "Please **upload the file** with the **paperclip** on the chat box "
-        "for context, then ask your question again."
+        "Please **upload a file** on the **📁 Files** page or with the "
+        "**paperclip** on the chat box, then ask your question again."
     )
 
 
@@ -629,6 +631,9 @@ def _build_draft_jobs(
         ignore_emails=list(payload.get("ignore_emails") or []),
     )
     block = plan.non_recipient_emails()
+    job_cc = payload.get("cc")
+    if job_cc is None and plan.cc:
+        job_cc = plan.cc
 
     jobs: list[dict[str, Any]] = []
 
@@ -675,6 +680,8 @@ def _build_draft_jobs(
         except Exception:
             pass
         skip.discard("")
+        # Keep addresses the user listed as To even if they are also the style template.
+        skip -= {a.lower() for a in directive_to_list(dirs)}
         ignore = {e.lower() for e in (dirs.get("ignore") or [])} | skip
         locked = [
             a
@@ -732,12 +739,18 @@ def _build_draft_jobs(
                 "campaign": campaign,
                 "source": source or "chat_mailbox_followup",
             }
-            if payload.get("attachments"):
-                job["attachments"] = payload["attachments"]
+            if payload.get("attachments") or payload.get("attachments_by_email"):
+                atts = _pick_job_attachments(
+                    email,
+                    payload.get("attachments"),
+                    payload.get("attachments_by_email") or {},
+                )
+                if atts:
+                    job["attachments"] = atts
             if payload.get("from_email"):
                 job["from_email"] = payload["from_email"]
-            if payload.get("cc") is not None:
-                job["cc"] = payload["cc"]
+            if job_cc is not None:
+                job["cc"] = job_cc
             jobs.append(job)
         if jobs:
             return jobs
@@ -758,12 +771,18 @@ def _build_draft_jobs(
                 "campaign": campaign,
                 "source": source or "prospect_batch",
             }
-            if payload.get("attachments"):
-                job["attachments"] = payload["attachments"]
+            if payload.get("attachments") or payload.get("attachments_by_email"):
+                atts = _pick_job_attachments(
+                    email,
+                    payload.get("attachments"),
+                    payload.get("attachments_by_email") or {},
+                )
+                if atts:
+                    job["attachments"] = atts
             if payload.get("from_email"):
                 job["from_email"] = payload["from_email"]
-            if payload.get("cc") is not None:
-                job["cc"] = payload["cc"]
+            if job_cc is not None:
+                job["cc"] = job_cc
             jobs.append(job)
         if jobs:
             return jobs
@@ -822,12 +841,18 @@ def _build_draft_jobs(
             "campaign": campaign,
             "source": source,
         }
-        if payload.get("attachments"):
-            job["attachments"] = payload["attachments"]
+        if payload.get("attachments") or payload.get("attachments_by_email"):
+            atts = _pick_job_attachments(
+                email,
+                payload.get("attachments"),
+                payload.get("attachments_by_email") or {},
+            )
+            if atts:
+                job["attachments"] = atts
         if payload.get("from_email"):
             job["from_email"] = payload["from_email"]
-        if payload.get("cc") is not None:
-            job["cc"] = payload["cc"]
+        if job_cc is not None:
+            job["cc"] = job_cc
         jobs.append(job)
     return jobs
 
@@ -940,6 +965,17 @@ def _gmail_attachment_payload(
     return out or None
 
 
+def _pick_job_attachments(
+    email: str,
+    default_atts: Optional[list[dict[str, Any]]],
+    by_email: Optional[dict[str, list[dict[str, Any]]]] = None,
+) -> Optional[list[dict[str, Any]]]:
+    """Per-recipient PDF when chat named different files for different To's."""
+    from core.pdf_library import pick_for_recipient
+
+    return pick_for_recipient(email, default=default_atts, by_email=by_email)
+
+
 def _attachments_for_email(
     user_msg: str,
     chat_attachments: Optional[list[dict[str, Any]]],
@@ -947,7 +983,9 @@ def _attachments_for_email(
     """Only attach binary files when the user explicitly asks to include them.
 
     Staged uploads are always available as drafting *context*; they are not
-    attached unless the user says attach/include the file.
+    attached unless the user says attach/include the file. Prefer
+    pdf_library.resolve_message_attachments so Files-page uploads can be
+    named per recipient.
     """
     if not chat_attachments:
         return None
@@ -1851,6 +1889,8 @@ def _content_urls(html_or_text: str) -> list[str]:
             return
         if "durgaemailer-tracking" in key or "/.netlify/functions/" in key:
             return
+        if "/t/c/" in key or "/t/o/" in key:
+            return
         seen.add(key)
         found.append(u)
 
@@ -2497,17 +2537,39 @@ def _answer_impl(
     prospects = (context or {}).get("prospects") or []
     chat_attachments = (context or {}).get("attachments") or []
     mailbox_messages = list((context or {}).get("mailbox_messages") or [])
-    # Binary attach only when user asks; staged files still feed document context.
-    email_atts = _attachments_for_email(user_msg, chat_attachments)
-    doc_context = document_context_from_attachments(chat_attachments)
+    from core.pdf_library import resolve_message_attachments
+
+    directives = parse_directives(user_msg or "")
+    resolved = resolve_message_attachments(
+        user_msg or "",
+        staged=chat_attachments,
+        named=list(directives.get("attachments") or []),
+        named_by_email=directives.get("attachments_by_email") or {},
+        wants_attach=_wants_email_attachment(user_msg or "")
+        or bool(directives.get("attachments"))
+        or bool(directives.get("attachments_by_email")),
+        wants_context=_wants_file_context(user_msg or ""),
+    )
+    atts_by_email = {
+        k: _gmail_attachment_payload(v)
+        for k, v in (resolved.get("by_email") or {}).items()
+        if _gmail_attachment_payload(v)
+    }
+    email_atts = _gmail_attachment_payload(resolved.get("default"))
+    doc_source = resolved.get("docs") or chat_attachments
+    doc_context = document_context_from_attachments(doc_source)
     used_docs = bool(doc_context.strip())
-    att_names = _attachment_names(chat_attachments)
+    att_names = list(
+        dict.fromkeys(
+            _attachment_names(chat_attachments)
+            + list(resolved.get("available") or [])
+        )
+    )
     consumed_attachments = False
     mailbox_out: list[dict[str, Any]] = []
     prospect_out: list[dict[str, Any]] = []
     cancelled = False
     draft_previews: list[dict[str, Any]] = []
-    directives = parse_directives(user_msg or "")
     draft_debug: dict[str, Any] = {
         "user_message": user_msg or "",
         "parsed_directives": {
@@ -2521,6 +2583,8 @@ def _answer_impl(
             "explicit_recipient_lock": bool(
                 directives.get("explicit_recipient_lock")
             ),
+            "attachments": directives.get("attachments") or [],
+            "attachments_by_email": directives.get("attachments_by_email") or {},
         },
         "recipients_final": [],
         "draft_path": "",
@@ -2528,17 +2592,9 @@ def _answer_impl(
             [p for p in prospects if (p.get("email") or "").strip()]
         ),
     }
-    if directives.get("attachments") and chat_attachments:
-        wanted = {str(n).lower() for n in directives["attachments"]}
-        extra = [
-            a
-            for a in chat_attachments
-            if str(a.get("name") or "").lower() in wanted
-            or any(w in str(a.get("name") or "").lower() for w in wanted)
-        ]
-        if extra:
-            email_atts = extra
-            consumed_attachments = True
+
+    def _atts_for_recipient(email: str) -> Optional[list[dict[str, Any]]]:
+        return _pick_job_attachments(email, email_atts, atts_by_email)
 
     def _stop_now() -> bool:
         nonlocal cancelled
@@ -2558,7 +2614,11 @@ def _answer_impl(
         }
         return
 
-    routing = route(_route_user_msg(user_msg, chat_attachments), history)
+    route_files = list(chat_attachments or [])
+    for n in resolved.get("available") or []:
+        if n and n not in _attachment_names(route_files):
+            route_files.append({"name": n})
+    routing = route(_route_user_msg(user_msg, route_files), history)
     sources: list[dict[str, Any]] = []
     meta_routing = routing
     need_file = False
@@ -2867,12 +2927,42 @@ def _answer_impl(
             )
             meta_routing = routing
     try:
-        # Email attach requested but no file staged → ask for upload (don't send yet)
-        if (
-            not chat_attachments
-            and _wants_email_attachment(user_msg)
-            and routing.startswith(("DRAFT_EMAIL", "SEND_EMAIL", "SCHEDULE_EMAIL"))
-        ):
+        # Email attach requested but no matching library/staged file
+        _mail_route = routing.startswith(
+            ("DRAFT_EMAIL", "SEND_EMAIL", "SCHEDULE_EMAIL")
+        )
+        _wants_att = (
+            _wants_email_attachment(user_msg)
+            or bool(directives.get("attachments"))
+            or bool(directives.get("attachments_by_email"))
+        )
+        _has_att = bool(email_atts or atts_by_email)
+        if _mail_route and _wants_att and not _has_att and not chat_attachments:
+            lib_names = list(resolved.get("available") or [])
+            unmatched = list(resolved.get("unmatched") or [])
+            if lib_names:
+                listed = ", ".join(f"`{n}`" for n in lib_names)
+                if unmatched:
+                    yield (
+                        "Couldn't find "
+                        + ", ".join(f"`{u}`" for u in unmatched)
+                        + f" in **Files**. Available: {listed}. "
+                        "Name the file in chat, e.g. `attach one-pager.pdf`."
+                    )
+                else:
+                    yield (
+                        f"Which file should I attach? Files: {listed}. "
+                        "Name it in chat, e.g. `attach one-pager.pdf` "
+                        "or `to jane@x.com attach brochure.pdf`."
+                    )
+                yield {
+                    "__meta__": {
+                        "routing": meta_routing,
+                        "sources": [],
+                        "consumed_attachments": False,
+                    }
+                }
+                return
             need_file = True
             yield _ask_for_upload(for_email_attach=True)
             yield {
@@ -2886,14 +2976,30 @@ def _answer_impl(
             }
             return
 
-        # General context from a file requested but nothing staged
+        # General context from a file requested but nothing staged / in library
         if (
             not chat_attachments
+            and not (resolved.get("docs") or [])
             and _wants_file_context(user_msg)
             and not routing.startswith(
                 ("DRAFT_EMAIL", "SEND_EMAIL", "SCHEDULE_EMAIL", "PROSPECT_", "GMAIL_")
             )
         ):
+            lib_names = list(resolved.get("available") or [])
+            if lib_names:
+                listed = ", ".join(f"`{n}`" for n in lib_names)
+                yield (
+                    f"Which file should I use? Files: {listed}. "
+                    "Name it in chat, e.g. `summarize one-pager.pdf`."
+                )
+                yield {
+                    "__meta__": {
+                        "routing": "CHAT_NEED_FILE",
+                        "sources": [],
+                        "consumed_attachments": False,
+                    }
+                }
+                return
             need_file = True
             yield _ask_for_upload(for_email_attach=False)
             yield {
@@ -3162,6 +3268,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                 }
                 if email_atts:
                     payload["attachments"] = email_atts
+                if atts_by_email:
+                    payload["attachments_by_email"] = atts_by_email
+                if email_atts or atts_by_email:
                     consumed_attachments = True
                 jobs = _build_draft_jobs(
                     payload,
@@ -3187,7 +3296,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         job,
                         from_email=headers["from_email"],
                         cc=headers["cc"],
-                        attachments=email_atts,
+                        attachments=_atts_for_recipient(
+                            str(job.get("recipient_email") or "")
+                        ),
                     )
                     try:
                         out, did_send = _deliver_job(
@@ -3623,7 +3734,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     addr, results, prospect_out
                                 ),
                                 plan=plan,
-                                attachments=email_atts,
+                                attachments=_atts_for_recipient(str(addr)),
                                 draft_previews=draft_previews,
                             ):
                                 yield chunk
@@ -3779,11 +3890,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         directives=dirs,
                         enrichment=result,
                         plan=plan,
-                        attachments=email_atts,
+                        attachments=_atts_for_recipient(str(draft_to)),
                         draft_previews=draft_previews,
                     ):
                         yield chunk
-                    if email_atts:
+                    if email_atts or atts_by_email:
                         consumed_attachments = True
                     if chat_attachments and not email_atts:
                         yield (
@@ -3911,16 +4022,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
             locked: list[str] = []
             if recipient_lock:
                 ignore_set = {e.lower() for e in (directives.get("ignore") or [])}
-                like_skip = ""
-                if like_ref and "@" in like_ref:
-                    like_skip = like_ref.lower()
-                tf = str(directives.get("template_from") or "").strip().lower()
                 locked = [
                     a
                     for a in directive_to_list(directives)
                     if a.lower() not in ignore_set
-                    and a.lower() != like_skip
-                    and a.lower() != tf
                 ]
                 n_session = len(_prospects_with_email(prospects))
                 draft_debug["recipients_final"] = locked
@@ -3940,11 +4045,11 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             addr, prospects, prospect_out
                         ),
                         plan=plan,
-                        attachments=email_atts,
+                        attachments=_atts_for_recipient(str(addr)),
                         draft_previews=draft_previews,
                     ):
                         yield chunk
-                if email_atts:
+                if email_atts or atts_by_email:
                     consumed_attachments = True
 
             # Resolve reference from mailbox list index (#2 / email 3)
@@ -4406,6 +4511,8 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         }
                         if email_atts:
                             payload["attachments"] = email_atts
+                        if atts_by_email:
+                            payload["attachments_by_email"] = atts_by_email
                         if plan.cc:
                             payload["cc"] = plan.cc
                         if plan.ignore_emails:
@@ -4829,7 +4936,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                     job,
                                     from_email=headers["from_email"],
                                     cc=headers["cc"],
-                                    attachments=email_atts,
+                                    attachments=_atts_for_recipient(
+                                        str(job.get("recipient_email") or "")
+                                    ),
                                 )
                                 job["source"] = "like_sent"
                                 out, did_send = _deliver_job(
@@ -4840,7 +4949,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 results.append({**out, "_did_send": did_send})
                             ok = [r for r in results if not r.get("error")]
                             fail = [r for r in results if r.get("error")]
-                            if ok and email_atts:
+                            if ok and (email_atts or atts_by_email):
                                 consumed_attachments = True
                             yield f"Done: **{len(ok)}** ok"
                             if fail:
@@ -4934,6 +5043,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                         payload["attachments"] = email_atts
                     elif "attachments" in payload:
                         payload.pop("attachments", None)
+                    if atts_by_email:
+                        payload["attachments_by_email"] = atts_by_email
+                    elif "attachments_by_email" in payload:
+                        payload.pop("attachments_by_email", None)
                     # Default personalized follow-up templates when missing
                     if payload.get("from_mailbox") or payload.get("use_mailbox"):
                         if not payload.get("subject") or payload.get("subject") in (
@@ -5036,7 +5149,9 @@ HTML only in html_body. No markdown. Do not include a signature block.
                                 job,
                                 from_email=headers["from_email"],
                                 cc=headers["cc"],
-                                attachments=email_atts,
+                                attachments=_atts_for_recipient(
+                                    str(job.get("recipient_email") or "")
+                                ),
                             )
                             out, did_send = _deliver_job(
                                 job, want_send=want_send, user_msg=user_msg
@@ -5046,7 +5161,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                             results.append({**out, "_did_send": did_send})
                         ok = [r for r in results if not r.get("error")]
                         fail = [r for r in results if r.get("error")]
-                        if ok and email_atts:
+                        if ok and (email_atts or atts_by_email):
                             consumed_attachments = True
                         yield f"Done: **{len(ok)}** ok"
                         if fail:
@@ -5125,7 +5240,10 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     recipient_name=job.get("recipient_name"),
                     campaign=job.get("campaign"),
                     source=job.get("source"),
-                    attachments=email_atts or None,
+                    attachments=_atts_for_recipient(
+                        str(job.get("recipient_email") or "")
+                    )
+                    or None,
                 )
                 yield f"Scheduled email to {job['recipient_email']} at {send_at}."
                 yield (
@@ -5137,7 +5255,7 @@ HTML only in html_body. No markdown. Do not include a signature block.
                     + "\n"
                 )
                 yield f"Result: {json.dumps(result, default=str)}"
-                if email_atts:
+                if email_atts or atts_by_email:
                     consumed_attachments = True
 
         else:

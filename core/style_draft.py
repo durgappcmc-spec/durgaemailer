@@ -70,8 +70,35 @@ _IGNORE_RE = re.compile(
     r"\bignore\s+(" + _EMAIL_RE.pattern + r")",
     re.I,
 )
+_ATTACH_FILE = (
+    r"[A-Za-z0-9._\-]+(?:[ ]+[A-Za-z0-9._\-]+)*\.[A-Za-z0-9]{1,8}"
+)
+_ATTACH_STEM = (
+    r"[A-Za-z0-9_\-]{3,}(?:[ ]+[A-Za-z0-9_\-]{2,}){0,4}"
+)
 _ATTACH_RE = re.compile(
-    r"\battach\s+([A-Za-z0-9._\- ]+\.[A-Za-z0-9]{1,8})",
+    r"\battach\s+(?:the\s+|file\s+)?(" + _ATTACH_FILE + r")",
+    re.I,
+)
+# Stem without extension: "attach the one-pager"
+_ATTACH_STEM_RE = re.compile(
+    r"\battach\s+(?:the\s+|file\s+)?(" + _ATTACH_STEM + r")"
+    r"(?=\s+(?:to\s+|for\s+|and\b|cc\b|bcc\b|ignore\b|$)|[,;])",
+    re.I,
+)
+_ATTACH_TO_EMAIL_RE = re.compile(
+    r"\battach\s+(?:the\s+|file\s+)?"
+    r"(" + _ATTACH_FILE + r"|" + _ATTACH_STEM + r")"
+    r"\s+(?:to|for)\s+(" + _EMAIL_RE.pattern + r")",
+    re.I,
+)
+_USE_AS_ATTACH_RE = re.compile(
+    r"\b(?:use|using|include)\s+(?:the\s+)?"
+    r"(" + _ATTACH_FILE + r")\s+as\s+(?:an?\s+)?attachment",
+    re.I,
+)
+_TEMPLATE_TO_PREFIX_RE = re.compile(
+    r"(?:like|similar|style|modeled|sent)(?:\s+(?:the\s+)?(?:one|email|mail))?(?:\s+sent)?\s+$",
     re.I,
 )
 _TEMPLATE_PATTERNS = [
@@ -167,6 +194,120 @@ def directive_to_list(directives: dict[str, Any]) -> list[str]:
     return out
 
 
+def _clean_file_token(raw: str) -> str:
+    token = (raw or "").strip().strip("\"'`.,;:()")
+    token = re.sub(
+        r"^(?:the|a|an|file|pdf|document|attachment)\s+",
+        "",
+        token,
+        flags=re.I,
+    ).strip()
+    token = re.sub(
+        r"\s+(?:as\s+an?\s+attachment|please|thanks|and)$",
+        "",
+        token,
+        flags=re.I,
+    ).strip()
+    return token
+
+
+def _is_template_to_prefix(prefix: str) -> bool:
+    return bool(_TEMPLATE_TO_PREFIX_RE.search(prefix or ""))
+
+
+def parse_attachment_refs(text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Filenames from chat, plus optional {email: [file, ...]} assignments.
+
+    `to jane@x.com attach a.pdf and to bob@y.com attach b.pdf` maps each PDF
+    to that recipient. A bare `attach brochure.pdf` applies to every To.
+    """
+    msg = text or ""
+    by_email: dict[str, list[str]] = {}
+
+    def _add(email: str, filename: str) -> None:
+        key = (email or "").strip().lower()
+        name = _clean_file_token(filename)
+        if not key or "@" not in key or not name:
+            return
+        cur = by_email.setdefault(key, [])
+        if name.lower() not in {x.lower() for x in cur}:
+            cur.append(name)
+
+    for m in _ATTACH_TO_EMAIL_RE.finditer(msg):
+        _add(m.group(2), m.group(1))
+
+    def _files_in(text: str) -> list[str]:
+        found: list[str] = []
+        seen_l: set[str] = set()
+        for rx in (_ATTACH_RE, _USE_AS_ATTACH_RE):
+            for m in rx.finditer(text or ""):
+                name = _clean_file_token(m.group(1))
+                key = name.lower()
+                if name and key not in seen_l:
+                    seen_l.add(key)
+                    found.append(name)
+        if not found:
+            for m in _ATTACH_STEM_RE.finditer(text or ""):
+                name = _clean_file_token(m.group(1))
+                if not name or "." in name:
+                    continue
+                key = name.lower()
+                if key in seen_l or key in {
+                    "the",
+                    "file",
+                    "pdf",
+                    "document",
+                    "attached",
+                }:
+                    continue
+                seen_l.add(key)
+                found.append(name)
+        return found
+
+    clauses: list[tuple[list[str], str]] = []
+    matches = [
+        m
+        for m in _TO_EMAIL_LIST_RE.finditer(msg)
+        if not _is_template_to_prefix(msg[max(0, m.start() - 40) : m.start()])
+    ]
+    if matches:
+        preamble = msg[: matches[0].start()]
+        if preamble.strip():
+            clauses.append(([], preamble))
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(msg)
+            emails = _EMAIL_RE.findall(m.group(1) or "")
+            clauses.append((emails, msg[m.start() : end]))
+    else:
+        clauses.append(([], msg))
+
+    assigned_names: set[str] = set()
+    for emails, clause in clauses:
+        files = _files_in(clause)
+        if emails and files:
+            for e in emails:
+                for f in files:
+                    _add(e, f)
+                    assigned_names.add(f.lower())
+
+    global_names: list[str] = []
+    seen: set[str] = set()
+    for name in _files_in(msg):
+        key = name.lower()
+        if key in assigned_names or key in seen:
+            continue
+        seen.add(key)
+        global_names.append(name)
+
+    all_named = list(global_names)
+    for names in by_email.values():
+        for n in names:
+            if n.lower() not in seen:
+                seen.add(n.lower())
+                all_named.append(n)
+    return all_named, by_email
+
+
 def parse_directives(text: str) -> dict[str, Any]:
     """Parse inline draft/enrich directives from one chat message.
 
@@ -232,11 +373,17 @@ def parse_directives(text: str) -> dict[str, Any]:
         return out
 
     to_final = _uniq(to_list)
+    explicit_set = {e.lower() for e in _uniq(to_specific)}
+
+    def _drop_accidental_template(addr: str, current: list[str]) -> list[str]:
+        key = (addr or "").strip().lower()
+        if not key or key in explicit_set:
+            return current
+        others = [e for e in current if e.lower() != key]
+        return others if others else current
+
     if template_from:
-        tf = template_from.lower()
-        others = [e for e in to_final if e.lower() != tf]
-        if others:
-            to_final = others
+        to_final = _drop_accidental_template(template_from, to_final)
     try:
         from agent.intent import parse_like_sent_request
 
@@ -245,9 +392,7 @@ def parse_directives(text: str) -> dict[str, Any]:
         if like_ref and "@" in like_ref:
             if not template_from:
                 template_from = like.get("reference") or ""
-            others = [e for e in to_final if e.lower() != like_ref]
-            if others:
-                to_final = others
+            to_final = _drop_accidental_template(like_ref, to_final)
     except Exception:
         pass
     to = to_final[0] if to_final else ""
@@ -266,7 +411,7 @@ def parse_directives(text: str) -> dict[str, Any]:
     for m in _BCC_RE.finditer(msg):
         bcc.extend(_EMAIL_RE.findall(m.group(1) or ""))
     ignore = [m.group(1) for m in _IGNORE_RE.finditer(msg)]
-    attachments = [m.group(1).strip() for m in _ATTACH_RE.finditer(msg)]
+    attachments, attachments_by_email = parse_attachment_refs(msg)
 
     result = {
         "to": to,
@@ -276,6 +421,7 @@ def parse_directives(text: str) -> dict[str, Any]:
         "ignore": _uniq(ignore),
         "template_from": template_from,
         "attachments": attachments,
+        "attachments_by_email": attachments_by_email,
         "linkedin_urls": linkedin_urls,
         "explicit_recipient_lock": bool(to_final),
         "bulk_flag": looks_like_bulk_request(msg),

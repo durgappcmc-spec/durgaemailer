@@ -63,6 +63,28 @@ def test_parse_directives_same_style_cc_attach():
     assert d["attachments"] and "one-pager.pdf" in d["attachments"][0].lower()
 
 
+def test_parse_directives_attach_per_recipient():
+    d = parse_directives(
+        "draft to jane@acme.com attach one-pager.pdf "
+        "and to bob@y.com attach deck.pdf"
+    )
+    by = {k.lower(): [x.lower() for x in v] for k, v in (d.get("attachments_by_email") or {}).items()}
+    assert "one-pager.pdf" in by["jane@acme.com"][0]
+    assert "deck.pdf" in by["bob@y.com"][0]
+    assert "jane@acme.com" in [e.lower() for e in d["to_list"]]
+    assert "bob@y.com" in [e.lower() for e in d["to_list"]]
+
+
+def test_parse_directives_attach_does_not_bind_style_template():
+    d = parse_directives(
+        "draft to jane@acme.com same style as sent to alice@acme.com "
+        "attach one-pager.pdf"
+    )
+    by = d.get("attachments_by_email") or {}
+    assert "alice@acme.com" not in {k.lower() for k in by}
+    assert d["attachments"] and "one-pager.pdf" in d["attachments"][0].lower()
+
+
 def test_parse_directives_warns_when_to_equals_template():
     d = parse_directives(
         "draft to alice@acme.com like the one sent to alice@acme.com"
@@ -391,4 +413,62 @@ def test_save_the_children_list_like_sent_does_not_drop_tos():
     assert got == expected
     assert "sheetal.srinivasamurthy@savethechildren.in" not in got
     assert jobs[0].get("cc") == plan.cc
+
+
+def test_explicit_to_keeps_like_sent_template_and_shared_pdf():
+    """User listed rakesh as To AND as the style template — keep him, attach PDF to all."""
+    from agent.router import _build_draft_jobs, _wants_email_attachment
+
+    expected = [
+        "rakesh.a@shriearlyeducation.com",
+        "varunranjith@sikshana.org",
+        "rashmi@risesun.co.in",
+        "saurabh@risesun.co.in",
+        "vishal.gulati@srf.com",
+        "zenyvankawala@risesun.co.in",
+    ]
+    msg = (
+        "draft an email to "
+        + ", ".join(expected)
+        + " and add in cc rahul and deepti and draft email like sent to "
+        "rakesh.a@shriearlyeducation.com and use 123_implementat.pdf as attachment"
+    )
+    d = parse_directives(msg)
+    tos = [e.lower() for e in d["to_list"]]
+    assert tos == expected
+    assert d["template_from"].lower() == "rakesh.a@shriearlyeducation.com"
+    names = [n.lower() for n in (d.get("attachments") or [])]
+    assert any("123_implementat.pdf" in n for n in names)
+    by = {k.lower(): [x.lower() for x in v] for k, v in (d.get("attachments_by_email") or {}).items()}
+    for addr in expected:
+        assert addr in by
+        assert any("123_implementat.pdf" in n for n in by[addr])
+    cc = [e.lower() for e in (d.get("cc") or [])]
+    assert "raahul.ppcm@gmail.com" in cc
+    assert "deepti.87.srivastava@gmail.com" in cc
+    assert _wants_email_attachment(msg)
+    plan = _heuristic_plan(msg)
+    assert [e.lower() for e in plan.to_emails] == expected
+    blob = b"%PDF-123%"
+    jobs = _build_draft_jobs(
+        {
+            "subject": "Hi",
+            "html_body": "<p>x</p>",
+            "attachments": [{"name": "123_implementat.pdf", "data": blob}],
+            "attachments_by_email": {
+                addr: [{"name": "123_implementat.pdf", "data": blob}]
+                for addr in expected
+            },
+        },
+        msg,
+        plan=plan,
+    )
+    got = [j["recipient_email"].lower() for j in jobs]
+    assert got == expected
+    for j in jobs:
+        names = [a.get("name") for a in (j.get("attachments") or [])]
+        assert names == ["123_implementat.pdf"]
+    job_cc = [e.lower() for e in (jobs[0].get("cc") or [])]
+    assert "raahul.ppcm@gmail.com" in job_cc
+    assert "deepti.87.srivastava@gmail.com" in job_cc
 

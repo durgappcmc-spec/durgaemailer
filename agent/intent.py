@@ -152,9 +152,11 @@ class IntentPlan:
         if fe:
             out.add(fe)
         out.add("csr@karunamedia.org")
-        # Sent-template address must never become the new draft's To
+        # Sent-template address is not a To unless the user also listed it as To.
         if self.like_sent_to and "@" in self.like_sent_to:
-            out.add(self.like_sent_to.lower())
+            key = self.like_sent_to.lower()
+            if key not in {e.lower() for e in self.to_emails}:
+                out.add(key)
         return out
 
 
@@ -258,16 +260,19 @@ def classify_email_roles(user_msg: str) -> EmailRoles:
         locked = list(dirs.get("to_list") or []) or (
             [dirs["to"]] if dirs.get("to") else []
         )
+        locked_set = {e.lower() for e in locked}
+        drop_template = (
+            {dirs["template_from"].lower()}
+            if dirs.get("template_from")
+            and dirs["template_from"].lower() not in locked_set
+            else set()
+        )
         to = _uniq(
             locked,
             exclude=ignore_set
             | {from_email.lower()}
             | {e.lower() for e in cc}
-            | (
-                {dirs["template_from"].lower()}
-                if dirs.get("template_from")
-                else set()
-            ),
+            | drop_template,
         )
 
     return EmailRoles(
@@ -1076,14 +1081,16 @@ def _heuristic_plan(user_msg: str) -> IntentPlan:
         re.search(r"\b(draft|create|compose|like|based|using)\b", msg, re.I)
     )
 
-    # Never treat the like-sent reference address as the new draft's To
+    # Never treat the like-sent reference as To unless the user listed it as To.
     to_emails = list(roles.to)
     if dirs.get("explicit_recipient_lock") or dirs.get("to"):
         to_emails = list(dirs.get("to_list") or []) or (
             [dirs["to"]] if dirs.get("to") else []
         )
     if like_sent_to and "@" in like_sent_to:
-        to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
+        keep = {e.lower() for e in (dirs.get("to_list") or [])}
+        if like_sent_to.lower() not in keep:
+            to_emails = [e for e in to_emails if e.lower() != like_sent_to.lower()]
 
     try:
         from connectors.zoominfo import extract_linkedin_urls as _li_urls
@@ -1319,11 +1326,13 @@ Return JSON:
         | {from_email.lower()}
         | {c.lower() for c in cc}
     )
-    # Template Sent recipient is never the new draft To
-    if base.like_sent_to and "@" in base.like_sent_to:
-        exclude.add(base.like_sent_to.lower())
-    to_emails = _uniq(llm_to + roles.to + base.to_emails, exclude=exclude)
     dirs_lock = parse_directives(user_msg)
+    # Template Sent recipient is not To unless the user also listed it as To.
+    if base.like_sent_to and "@" in base.like_sent_to:
+        keep = {e.lower() for e in (dirs_lock.get("to_list") or [])}
+        if base.like_sent_to.lower() not in keep:
+            exclude.add(base.like_sent_to.lower())
+    to_emails = _uniq(llm_to + roles.to + base.to_emails, exclude=exclude)
     if dirs_lock.get("explicit_recipient_lock"):
         to_emails = [
             e
@@ -1436,10 +1445,12 @@ Return JSON:
             like_sent_for = parse_explicit_draft_company(user_msg)
         like_sent_message_id = resolved.get("message_id") or like_sent_message_id
     if like_sent_to and "@" in like_sent_to:
-        to_emails = [
-            e for e in to_emails if e.lower() != like_sent_to.lower()
-        ]
-        exclude.add(like_sent_to.lower())
+        keep = {e.lower() for e in (dirs_lock.get("to_list") or [])}
+        if like_sent_to.lower() not in keep:
+            to_emails = [
+                e for e in to_emails if e.lower() != like_sent_to.lower()
+            ]
+            exclude.add(like_sent_to.lower())
 
     # Named company target (e.g. Sterlite) → never pull Magic Bus To from history
     explicit_company = parse_explicit_draft_company(user_msg) or (

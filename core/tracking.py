@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
@@ -284,3 +285,82 @@ def html_for_preview(html: str) -> str:
     """Draft/UI preview without Netlify tracking URLs visible or fetchable."""
     raw = strip_visible_tracking_urls(html or "")
     return strip_visible_tracking_urls(strip_tracking(raw))
+
+
+_PREFETCH_UA_RE = re.compile(
+    r"GoogleImageProxy|ggpht\.com|googleusercontent|"
+    r"YahooMailProxy|Googlebot|Google-PageRenderer|Google-Safety|"
+    r"AdsBot|APIs-Google|Feedfetcher|GoogleAssociationService|"
+    r"HeadlessChrome|Chrome-Lighthouse|"
+    r"SafeLinks|safelinks\.protection|"
+    r"Barracuda|Proofpoint|Mimecast|Symantec|MessageLabs|"
+    r"\bbot\b|\bcrawler\b|\bspider\b|\bscanner\b|"
+    r"curl/|wget/|python-requests|Go-http-client",
+    re.I,
+)
+
+
+def is_bot_flag(val: Any) -> bool:
+    """True for sheet/JSON bot flags (bool, 1, 'TRUE')."""
+    if val is True or val == 1:
+        return True
+    return str(val or "").strip().lower() in {"true", "1", "yes"}
+
+
+def is_prefetch_user_agent(ua: str | None) -> bool:
+    """True for Gmail/Google image-proxy, scanners, and empty UAs — not a person click."""
+    raw = (ua or "").strip()
+    if not raw:
+        return True
+    return bool(_PREFETCH_UA_RE.search(raw))
+
+
+def _parse_tracking_ts(val: Any) -> datetime | None:
+    raw = str(val or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def filter_real_clicks(
+    click_rows: list[dict[str, Any]] | None,
+    *,
+    send_rows: list[dict[str, Any]] | None = None,
+    open_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Drop Gmail prefetch, scanners, and clicks recorded before the email was sent.
+
+    Opening a Gmail draft, viewing Sent, or Gmail fetching a file/image proxy
+    must not count as a recipient click. `open_rows` is accepted for call-site
+    compatibility; prefetch is identified from user-agent / is_bot on the click.
+    """
+    del open_rows  # UA on the click row is the source of truth
+    sends = {
+        str(s.get("email_id") or "").strip(): s
+        for s in (send_rows or [])
+        if str(s.get("email_id") or "").strip()
+    }
+
+    kept: list[dict[str, Any]] = []
+    for row in click_rows or []:
+        if is_bot_flag(row.get("is_bot")) or is_prefetch_user_agent(
+            str(row.get("user_agent") or "")
+        ):
+            continue
+        eid = str(row.get("email_id") or "").strip()
+        cts = _parse_tracking_ts(row.get("clicked_at"))
+        send = sends.get(eid) or {}
+        sent_at = _parse_tracking_ts(send.get("sent_at"))
+        # Draft preview / Gmail file open before send
+        if sent_at and cts and cts < sent_at - timedelta(seconds=15):
+            continue
+        kept.append(row)
+    return kept

@@ -223,6 +223,8 @@ def chat_grounding_system(
     if attachment_names:
         rules += (
             f"\nUploaded files available: {', '.join(attachment_names)}. "
+            "Files on the **Files** page can be attached by name "
+            "(e.g. attach one-pager.pdf, or to jane@x.com attach brochure.pdf). "
             "Use extracted document text when relevant; do not invent file contents.\n"
         )
     if document_context.strip():

@@ -1,6 +1,7 @@
 # NOTE: Streaming UI captures __meta__ dicts separately from text chunks.
 # Stop / Edit / Clear sit in the composer bar above st.chat_input.
-# Files come only from st.chat_input paperclip; staged across turns until cleared/used.
+# Paperclip files are context (and attach if you say so). Files page holds
+# reusable attachments — name them in chat to attach per recipient.
 # Load path stays light: no Gmail sync / no heavy router import until the user sends.
 from __future__ import annotations
 
@@ -59,6 +60,13 @@ with st.sidebar:
         render_sidebar_signature_pref()
     except Exception:
         st.caption("Signature: Gmail account")
+    st.subheader("Files")
+    try:
+        from core.pdf_library import render_sidebar_pdf_library
+
+        render_sidebar_pdf_library()
+    except Exception as e:
+        st.caption(f"Files unavailable: {e}")
     st.subheader("Bulk jobs")
     try:
         from core import drive_db
@@ -93,6 +101,8 @@ with st.sidebar:
 st.title("💬 Chat")
 st.caption(
     "Paperclip = file **context** (not attached unless you say “attach the file”). "
+    "Reusable files live on **📁 Files** — name them in chat to attach "
+    "(e.g. `attach one-pager.pdf` or `to jane@x.com attach brochure.pdf`). "
     "Stop / Edit / Clear sit under the chat, next to where you type. "
     "Drafts from csr@karunamedia.org — `cc a@x.com and b@y.com`; `ignore addr@x.com` skips it."
 )
@@ -182,8 +192,8 @@ st.markdown(
 staged = st.session_state.staged_attachments or []
 if st.session_state.get("need_file"):
     st.info(
-        "Upload a file with the **paperclip** on the chat box, then send your "
-        "message again (or tap **Continue pending request** after attaching)."
+        "Upload a file on **📁 Files** (or with the **paperclip**), "
+        "then send your message again (or tap **Continue pending request** after attaching)."
     )
 
 if staged:

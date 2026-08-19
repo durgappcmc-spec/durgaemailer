@@ -6,7 +6,7 @@ export async function handler(event) {
   const headers = event.headers || {};
   const ua = headers["user-agent"] || headers["User-Agent"] || "";
   const ip = clientIp(event);
-  const is_bot = isLikelyBot(ua);
+  const is_bot = isLikelyBot(ua, { kind: "click" });
 
   const data = linkId
     ? await logToSheet({

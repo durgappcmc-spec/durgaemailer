@@ -42,9 +42,10 @@ st.markdown(
 
 1. **💬 Chat** — Ask research questions; Gemini searches Google natively and cites sources.
 2. **🎯 Prospects** — Search ZoomInfo (default) / Apollo / RocketReach; contacts auto-save to memory.
-3. **📅 Schedule** — Send/draft now (with attachments), or queue single/bulk/sequence emails.
-4. **📬 Tracking** — Opens, clicks, hot leads, and reply auto-pause from the shared Sheet.
-5. **📥 Inbox Extract** — Manual deep extract (optional). Gmail auto-syncs on app open.
-6. **🧠 Memory** — Chroma / file RAG over notes, ZoomInfo hits, and synced mailbox contacts.
+3. **📁 Files** — Upload decks and one-pagers; name them in Chat to attach to a draft.
+4. **📅 Schedule** — Send/draft now (with attachments), or queue single/bulk/sequence emails.
+5. **📬 Tracking** — Opens, clicks, hot leads, and reply auto-pause from the shared Sheet.
+6. **📥 Inbox Extract** — Manual deep extract (optional). Gmail auto-syncs on app open.
+7. **🧠 Memory** — Chroma / file RAG over notes, ZoomInfo hits, and synced mailbox contacts.
 """
 )
